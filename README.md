@@ -33,6 +33,37 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
    any error with the exact operating conditions around it. The charger's own
    `uptime_s` is stored with each sample for device-side cross-reference.
 
+## Data handling & resilience
+
+- **Storage** is a single SQLite file (`wallmonitor.db`, WAL mode) next to
+  where you run the app, or wherever `--db` points. Back up that one file and
+  you have your complete history. There is no retention limit; expect very
+  roughly 10–25 MB/day depending on how often a vehicle is attached. The
+  charger itself keeps no history — the monitor's database *is* the history,
+  starting from the first time it runs.
+- **Restarts are seamless.** On startup the poller reopens a still-open
+  charging session if the vehicle stayed plugged in, closes it out if the
+  vehicle left while the monitor was down, and clears any stale
+  "unreachable" alert from a previous run.
+- **Downtime is recorded, not hidden.** A graceful shutdown writes a
+  `monitor_stop` event; after a hard stop (power loss, host reboot for
+  updates), the next start compares the clock against the last recorded
+  activity and writes an explicit `monitor_gap` event with the exact window
+  and duration. A quiet stretch in the timeline is therefore always
+  distinguishable from an unmonitored one — useful when the app runs on an
+  always-on box that reboots itself periodically.
+- **Sensor glitches are quarantined.** Gen 3 firmware reports **255 (0xFF)**
+  for a temperature when a sensor read is momentarily invalid (commonly the
+  handle thermistor during connector state transitions). The raw JSON keeps
+  the sentinel for fidelity, but every interpreted surface — charts, live
+  tiles, and downsampled averages — treats ≥255 °C as "no reading" so a
+  phantom 255 °C spike (or a poisoned bucket average) never appears.
+- **Recorded event kinds:** session start/end, charging start/stop, EVSE
+  state changes (with community-reported state names), device alerts
+  raised/cleared, charger reboots (uptime went backwards), charger
+  unreachable/recovered, Wi-Fi disconnect/reconnect, internet lost/restored,
+  firmware version changes, and monitor start/stop/gap.
+
 ## Run
 
 ```bash
@@ -55,6 +86,11 @@ Then open <http://127.0.0.1:8480>. The UI binds to localhost by default; use
 
 Data lands in `wallmonitor.db` (override with `--db /path/to.db`). Back that
 one file up and you have your full history.
+
+The UI shows charger internals in plain language: "plug handle" is the
+connector that goes into the car (the temperature that matters for derating),
+"circuit board (PCBA)" is the main electronics board, and "processor (MCU)"
+is the charger's microcontroller.
 
 ## Options
 
