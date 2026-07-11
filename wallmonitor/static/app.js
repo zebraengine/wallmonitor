@@ -150,6 +150,9 @@ function timeTickFormat(t, spanS) {
 
 /* lineChart(box, {series, height, unit, digits, area, zeroBase, xFrom, xTo}) */
 function lineChart(box, opts) {
+  // Reserve the chart's height before clearing so a live re-render never
+  // collapses the page and yanks the scroll position around.
+  box.style.minHeight = `${opts.height || 210}px`;
   box.textContent = "";
   box.classList.add("chart-box");
   const series = (opts.series || []).map((s) => ({ ...s, points: s.points.filter((p) => p[1] != null && isFinite(p[1])) }));
@@ -175,10 +178,14 @@ function lineChart(box, opts) {
 
   const root = svg("svg", { viewBox: `0 0 ${width} ${height}`, width, height });
 
+  // Label precision follows the tick step, so ticks never collapse into
+  // duplicate rounded values (e.g. 0.5 steps labelled "1, 1, 0, -1, -1").
+  const yStep = yt.ticks.length > 1 ? yt.ticks[1] - yt.ticks[0] : 1;
+  const tickDigits = Math.max(0, Math.min(3, -Math.floor(Math.log10(yStep) + 1e-9)));
   for (const v of yt.ticks) {
     root.append(svg("line", { x1: M.l, x2: width - M.r, y1: Y(v), y2: Y(v), stroke: "var(--grid)", "stroke-width": 1 }));
     const label = svg("text", { x: M.l - 6, y: Y(v) + 3.5, "text-anchor": "end", class: "axis-text" });
-    label.textContent = fmtNum(v, opts.digits ?? 1);
+    label.textContent = fmtNum(v, tickDigits);
     label.classList.add("axis-text");
     root.append(label);
   }
@@ -708,9 +715,19 @@ async function viewAlerts(root, rangeKey = "7d") {
 
 /* ---------------- router ---------------- */
 
+let lastViewKey = "";
+
 async function render(view, arg) {
   if (cleanup) { try { cleanup(); } catch { /* noop */ } cleanup = null; }
+  // Re-rendering the same view (live session refresh) must not move the
+  // reader: hold the page height during the rebuild and restore the scroll
+  // position afterwards, so the browser never clamps the scroll to the top.
+  const viewKey = `${view}:${arg ?? ""}`;
+  const sameView = viewKey === lastViewKey;
+  lastViewKey = viewKey;
+  const scrollY = window.scrollY;
   const root = $("#view");
+  root.style.minHeight = sameView ? `${root.offsetHeight}px` : "";
   root.textContent = "";
   document.querySelectorAll(".tabs a").forEach((a) => {
     a.classList.toggle("active", a.dataset.view === (view === "session" ? "sessions" : view));
@@ -724,6 +741,8 @@ async function render(view, arg) {
   } catch (ex) {
     root.append(el("div", { class: "empty" }, `Failed to load: ${ex.message}`));
   }
+  if (sameView) window.scrollTo(0, scrollY);
+  root.style.minHeight = "";
 }
 
 function route() {
