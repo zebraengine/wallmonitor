@@ -179,6 +179,20 @@ async def test_web_api(db):
         await client.close()
 
 
+async def test_temp_sentinel_excluded_from_queries(db):
+    now = time.time()
+    for i, handle in enumerate([33.0, 255.0, 33.2]):
+        db.insert_vitals(now - 10 + i, {"handle_temp_c": handle, "pcba_temp_c": 35.0, "mcu_temp_c": 42.0}, None, 0.0)
+    rows = db.vitals_range(now - 20, now)
+    assert [r["handle_temp_c"] for r in rows] == [33.0, None, 33.2]
+    # Bucketed averages must ignore the sentinel, not blend it in.
+    bucketed = db.vitals_range(now - 20, now, max_points=1)
+    assert abs(bucketed[0]["handle_temp_c"] - 33.1) < 0.01
+    # The raw JSON keeps the original value for full fidelity.
+    latest = db.latest_vitals()
+    assert latest["handle_temp_c"] == 33.2
+
+
 async def test_monitor_gap_event_on_restart(db):
     # Simulate a previous run that stopped long ago, then a restart.
     old = time.time() - 3600

@@ -90,6 +90,9 @@ const eventSeverity = (k) => (EVENT_META[k] || [k, "muted"])[1];
 
 /* ------------- unified vitals sample (DB row or SSE message) ------------- */
 
+// 255 (0xFF) is the device's "sensor read invalid" sentinel for temperatures.
+const realTemp = (v) => (v != null && v >= 255 ? null : v);
+
 function fromDbRow(r) {
   return {
     ts: r.ts, power: r.total_power_w, maxPower: r.max_power_w,
@@ -97,7 +100,7 @@ function fromDbRow(r) {
     ia: r.current_a_a, ib: r.current_b_a, ic: r.current_c_a,
     va: r.voltage_a_v, vb: r.voltage_b_v, vc: r.voltage_c_v,
     gridV: r.grid_v, gridHz: r.grid_hz,
-    tPcba: r.pcba_temp_c, tHandle: r.handle_temp_c, tMcu: r.mcu_temp_c,
+    tPcba: realTemp(r.pcba_temp_c), tHandle: realTemp(r.handle_temp_c), tMcu: realTemp(r.mcu_temp_c),
     energy: r.session_energy_wh, connected: !!r.vehicle_connected,
     charging: !!r.contactor_closed, evse: r.evse_state, sessionId: r.session_id,
   };
@@ -110,7 +113,7 @@ function fromSse(m) {
     ia: d.currentA_a, ib: d.currentB_a, ic: d.currentC_a,
     va: d.voltageA_v, vb: d.voltageB_v, vc: d.voltageC_v,
     gridV: d.grid_v, gridHz: d.grid_hz,
-    tPcba: d.pcba_temp_c, tHandle: d.handle_temp_c, tMcu: d.mcu_temp_c,
+    tPcba: realTemp(d.pcba_temp_c), tHandle: realTemp(d.handle_temp_c), tMcu: realTemp(d.mcu_temp_c),
     energy: d.session_energy_wh, connected: !!d.vehicle_connected,
     charging: !!d.contactor_closed, evse: d.evse_state, sessionId: m.session_id,
     sessionS: d.session_s, alerts: d.current_alerts || [],

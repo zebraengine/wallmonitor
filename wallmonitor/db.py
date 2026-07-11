@@ -356,26 +356,35 @@ class Database:
         n = self._rows(
             "SELECT COUNT(*) AS n FROM vitals_samples WHERE ts >= ? AND ts <= ?", (t_from, t_to)
         )[0]["n"]
+        # The device reports 255 (0xFF) for a temperature when the sensor read
+        # is momentarily invalid (seen on the handle during connector state
+        # transitions). Raw JSON keeps the sentinel; interpreted queries
+        # return NULL instead so charts and averages are never poisoned.
+        temp = "CASE WHEN {c} >= 255 THEN NULL ELSE {c} END"
+        t_pcba, t_handle, t_mcu = (
+            temp.format(c=c) for c in ("pcba_temp_c", "handle_temp_c", "mcu_temp_c")
+        )
         if n <= max_points:
             return self._rows(
-                """SELECT ts, total_power_w, vehicle_current_a, current_a_a, current_b_a, current_c_a,
+                f"""SELECT ts, total_power_w, vehicle_current_a, current_a_a, current_b_a, current_c_a,
                           voltage_a_v, voltage_b_v, voltage_c_v, grid_v, grid_hz,
-                          pcba_temp_c, handle_temp_c, mcu_temp_c, session_energy_wh,
+                          {t_pcba} AS pcba_temp_c, {t_handle} AS handle_temp_c, {t_mcu} AS mcu_temp_c,
+                          session_energy_wh,
                           vehicle_connected, contactor_closed, evse_state, session_id
                    FROM vitals_samples WHERE ts >= ? AND ts <= ? ORDER BY ts""",
                 (t_from, t_to),
             )
         width = (t_to - t_from) / max_points
         return self._rows(
-            """SELECT MIN(ts) AS ts, AVG(total_power_w) AS total_power_w, MAX(total_power_w) AS max_power_w,
+            f"""SELECT MIN(ts) AS ts, AVG(total_power_w) AS total_power_w, MAX(total_power_w) AS max_power_w,
                       AVG(vehicle_current_a) AS vehicle_current_a,
                       AVG(current_a_a) AS current_a_a, AVG(current_b_a) AS current_b_a,
                       AVG(current_c_a) AS current_c_a,
                       AVG(voltage_a_v) AS voltage_a_v, AVG(voltage_b_v) AS voltage_b_v,
                       AVG(voltage_c_v) AS voltage_c_v,
                       AVG(grid_v) AS grid_v, AVG(grid_hz) AS grid_hz,
-                      AVG(pcba_temp_c) AS pcba_temp_c, AVG(handle_temp_c) AS handle_temp_c,
-                      AVG(mcu_temp_c) AS mcu_temp_c,
+                      AVG({t_pcba}) AS pcba_temp_c, AVG({t_handle}) AS handle_temp_c,
+                      AVG({t_mcu}) AS mcu_temp_c,
                       MAX(session_energy_wh) AS session_energy_wh,
                       MAX(vehicle_connected) AS vehicle_connected,
                       MAX(contactor_closed) AS contactor_closed,
