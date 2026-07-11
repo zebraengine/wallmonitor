@@ -391,7 +391,8 @@ async function viewLive(root) {
       statTile("Vehicle current", fmtNum(s.iv ?? (s.ia != null ? Math.max(s.ia, s.ib ?? 0, s.ic ?? 0) : null), 1), "A"),
       statTile("Grid", `${fmtNum(s.gridV, 1)}`, "V", `${fmtNum(s.gridHz, 3)} Hz`),
       statTile("Session energy", fmtNum((s.energy ?? 0) / 1000, 2), "kWh", s.sessionId ? `session #${s.sessionId}` : "no session"),
-      statTile("Handle temp", fmtNum(s.tHandle, 1), "°C", `PCBA ${fmtNum(s.tPcba, 1)} °C · MCU ${fmtNum(s.tMcu, 1)} °C`),
+      statTile("Plug handle temp", fmtNum(s.tHandle, 1), "°C",
+        `circuit board ${fmtNum(s.tPcba, 1)} °C · processor ${fmtNum(s.tMcu, 1)} °C`),
       statTile("EVSE state", "", null, ""),
     );
     const evseTile = tiles.lastChild;
@@ -527,8 +528,11 @@ async function viewSessionDetail(root, id) {
   const maxP = s.max_power_w ?? Math.max(0, ...samples.map((p) => p.power || 0));
   root.append(el("div", { class: "cards" },
     statTile("Plugged in", fmtDT(s.start_ts).slice(11), null, fmtDT(s.start_ts).slice(0, 10)),
-    statTile("Unplugged", ongoing ? "ongoing" : fmtDT(s.end_ts).slice(11), null, ongoing ? "" : fmtDT(s.end_ts).slice(0, 10)),
-    statTile("Duration", fmtDur((ongoing ? now : s.end_ts) - s.start_ts), null, `charging ${fmtDur(s.charging_s)}`),
+    ongoing
+      ? statTile("Status", "Plugged in", null, "session in progress")
+      : statTile("Unplugged", fmtDT(s.end_ts).slice(11), null, fmtDT(s.end_ts).slice(0, 10)),
+    statTile("Duration", fmtDur((ongoing ? now : s.end_ts) - s.start_ts), null,
+      s.charging_s != null ? `charging ${fmtDur(s.charging_s)}` : "charging time totals when the session ends"),
     statTile("Energy", fmtNum(energyKwh, 2), "kWh"),
     statTile("Peak power", fmtNum(maxP / 1000, 2), "kW", s.avg_power_w != null ? `avg ${fmtNum(s.avg_power_w / 1000, 2)} kW` : null),
     statTile("Samples", fmtNum(s.sample_count ?? samples.length, 0), null, "full fidelity retained")));
@@ -536,7 +540,7 @@ async function viewSessionDetail(root, id) {
   const power = chartCard("Power", "Total power over the session");
   const cur = chartCard("Phase currents", "Per-phase current");
   const volt = chartCard("Phase voltages", "Per-phase voltage");
-  const temp = chartCard("Temperatures", "PCBA, handle and MCU");
+  const temp = chartCard("Temperatures", "Plug handle, charger circuit board (PCBA), and processor (MCU)");
   root.append(power.card, el("div", { class: "grid-2" }, cur.card, volt.card), temp.card);
 
   const xFrom = s.start_ts, xTo = ongoing ? now : s.end_ts;
@@ -560,9 +564,9 @@ async function viewSessionDetail(root, id) {
   });
   lineChart(temp.box, {
     series: [
-      { name: "PCBA", color: C.s1, points: samples.map((p) => [p.ts, p.tPcba]) },
-      { name: "Handle", color: C.s2, points: samples.map((p) => [p.ts, p.tHandle]) },
-      { name: "MCU", color: C.s3, points: samples.map((p) => [p.ts, p.tMcu]) },
+      { name: "Circuit board (PCBA)", color: C.s1, points: samples.map((p) => [p.ts, p.tPcba]) },
+      { name: "Plug handle", color: C.s2, points: samples.map((p) => [p.ts, p.tHandle]) },
+      { name: "Processor (MCU)", color: C.s3, points: samples.map((p) => [p.ts, p.tMcu]) },
     ], unit: "°C", digits: 1, xFrom, xTo, height: 190,
   });
 
