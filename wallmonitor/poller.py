@@ -88,6 +88,7 @@ class Poller:
         self._session_id: int | None = None
         self._active_alerts: set[str] = set()
         self._offline = False
+        self._had_success = False
         self.last_poll_ok_ts: float | None = None
         self.last_poll_error: str | None = None
         self.started_ts = time.time()
@@ -169,6 +170,11 @@ class Poller:
             await asyncio.to_thread(self.db.clear_alert, ts, "Wall Connector unreachable", "monitor")
             await asyncio.to_thread(self.db.add_event, ts, "poll_recovered", {"endpoint": endpoint})
             self.bus.publish({"type": "event", "ts": ts, "kind": "poll_recovered", "detail": {"endpoint": endpoint}})
+        elif not self._had_success:
+            # First success of this run: clear any unreachable alert left
+            # active by a previous run that never recovered before exiting.
+            await asyncio.to_thread(self.db.clear_alert, ts, "Wall Connector unreachable", "monitor")
+        self._had_success = True
         try:
             await handler(ts, raw)
         except Exception:
