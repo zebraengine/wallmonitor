@@ -101,7 +101,18 @@ class Poller:
         await asyncio.to_thread(self._startup_reconcile, now)
         self._task = asyncio.create_task(self._run(), name="wallmonitor-poller")
 
+    # A hole longer than this since the last recorded activity is reported as
+    # a monitoring gap (covers hard reboots that never wrote monitor_stop).
+    GAP_THRESHOLD_S = 120.0
+
     def _startup_reconcile(self, now: float) -> None:
+        last = self.db.last_activity_ts()
+        if last is not None and now - last > self.GAP_THRESHOLD_S:
+            self.db.add_event(
+                now,
+                "monitor_gap",
+                {"offline_since": last, "gap_s": round(now - last, 1)},
+            )
         self.db.add_event(now, "monitor_start", {"host": self.cfg.host})
         # A session left open by a previous run: keep it only if the vehicle is
         # still connected once we get our first sample; remember it for now.

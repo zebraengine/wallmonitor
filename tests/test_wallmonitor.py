@@ -179,6 +179,32 @@ async def test_web_api(db):
         await client.close()
 
 
+async def test_monitor_gap_event_on_restart(db):
+    # Simulate a previous run that stopped long ago, then a restart.
+    old = time.time() - 3600
+    db.add_event(old, "monitor_start", None)
+    db.insert_vitals(old + 10, {"vehicle_connected": False, "uptime_s": 1}, None, 0.0)
+
+    sim_runner, port = await start_simulator()
+    cfg = Config(host=f"127.0.0.1:{port}", vitals_interval_idle=0.05, min_interval=0.01)
+    async with aiohttp.ClientSession() as client:
+        poller = Poller(cfg, db, EventBus(), client)
+        await poller.start()
+        try:
+            await _wait_for(lambda: db.counts()["vitals_samples"] >= 2)
+        finally:
+            await poller.stop()
+        await sim_runner.cleanup()
+
+    gaps = [e for e in db.events_range(0, time.time() + 1) if e["kind"] == "monitor_gap"]
+    assert len(gaps) == 1
+    import json as _json
+
+    detail = _json.loads(gaps[0]["detail"])
+    assert abs(detail["offline_since"] - (old + 10)) < 1
+    assert detail["gap_s"] > 3000
+
+
 async def test_backoff_on_unreachable_host(db, unused_tcp_port):
     cfg = Config(
         host=f"127.0.0.1:{unused_tcp_port}",

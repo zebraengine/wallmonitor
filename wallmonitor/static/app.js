@@ -83,6 +83,7 @@ const EVENT_META = {
   firmware_changed: ["Firmware version changed", "warning"],
   monitor_start: ["Monitor started", "muted"],
   monitor_stop: ["Monitor stopped", "muted"],
+  monitor_gap: ["Monitoring gap — service was off", "warning"],
 };
 const eventLabel = (k) => (EVENT_META[k] || [k, "muted"])[0];
 const eventSeverity = (k) => (EVENT_META[k] || [k, "muted"])[1];
@@ -603,6 +604,7 @@ function eventsTable(events) {
       try {
         const d = JSON.parse(ev.detail);
         if (ev.kind === "evse_state_change") detail = `${evseLabel(d.from)} → ${evseLabel(d.to)}`;
+        else if (ev.kind === "monitor_gap") detail = `no data since ${fmtDT(d.offline_since)} (${fmtDur(d.gap_s)})`;
         else detail = Object.entries(d).map(([k, v]) => `${k}: ${v}`).join(" · ");
       } catch { detail = String(ev.detail); }
     }

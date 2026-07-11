@@ -433,6 +433,16 @@ class Database:
             (t_from, t_to, limit),
         )
 
+    def last_activity_ts(self) -> float | None:
+        """Timestamp of the most recent recorded sample or event, if any."""
+        rows = self._rows(
+            """SELECT MAX(ts) AS ts FROM (
+                   SELECT MAX(ts) AS ts FROM vitals_samples
+                   UNION ALL SELECT MAX(ts) FROM events
+               )"""
+        )
+        return rows[0]["ts"] if rows and rows[0]["ts"] is not None else None
+
     def counts(self) -> dict[str, Any]:
         return {
             "vitals_samples": self._rows("SELECT COUNT(*) AS n FROM vitals_samples")[0]["n"],
