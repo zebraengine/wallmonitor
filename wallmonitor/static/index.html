@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wall Connector Monitor</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>&#9889;</text></svg>">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">&#9889; Wall Connector Monitor</div>
+  <nav class="tabs">
+    <a href="#/live" data-view="live">Live</a>
+    <a href="#/sessions" data-view="sessions">Sessions</a>
+    <a href="#/wifi" data-view="wifi">Wi-Fi health</a>
+    <a href="#/alerts" data-view="alerts">Alerts &amp; events</a>
+  </nav>
+  <div class="topstatus">
+    <span id="conn-dot" class="dot"></span>
+    <span id="conn-text">connecting&hellip;</span>
+    <span id="clock" class="clock"></span>
+  </div>
+</header>
+<div id="alert-banner"></div>
+<main id="view"></main>
+<footer class="foot">
+  <span id="foot-info"></span>
+  <span id="tz-note"></span>
+</footer>
+<script src="/static/app.js"></script>
+</body>
+</html>

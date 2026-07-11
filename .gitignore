@@ -1,0 +1,4 @@
+# Recorded telemetry databases live next to the app by default — never commit them.
+*.db
+*.db-shm
+*.db-wal
