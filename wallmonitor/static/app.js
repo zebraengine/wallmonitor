@@ -402,7 +402,8 @@ async function viewLive(root) {
     const evseTile = tiles.lastChild;
     evseTile.querySelector(".tile-value").textContent = evseLabel(s.evse);
     evseTile.querySelector(".tile-value").style.fontSize = "16px";
-    evseTile.querySelector(".tile-sub").textContent = "community-reported meaning; raw value in parentheses";
+    evseTile.querySelector(".tile-sub").textContent =
+      "label is unofficial — Tesla doesn't document these codes; (n) is the charger's raw value";
     if (st.version) {
       tiles.append(statTile("Firmware", "", null, ""));
       const t = tiles.lastChild;
