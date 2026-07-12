@@ -32,9 +32,14 @@ def _float_q(request: web.Request, name: str, default: float) -> float:
 def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Application:
     app = web.Application()
 
+    # Without cache headers browsers cache heuristically, so after an update
+    # they may keep running stale UI code until a manual hard refresh.
+    # no-cache forces revalidation on every load — trivial cost on a LAN.
+    no_cache = {"Cache-Control": "no-cache"}
+
     async def index(_request: web.Request) -> web.Response:
         html = resources.files(STATIC_PKG).joinpath("index.html").read_text()
-        return web.Response(text=html, content_type="text/html")
+        return web.Response(text=html, content_type="text/html", headers=no_cache)
 
     async def static_file(request: web.Request) -> web.Response:
         name = request.match_info["name"]
@@ -42,7 +47,7 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
             raise web.HTTPNotFound()
         content = resources.files(STATIC_PKG).joinpath(name).read_text()
         ctype = "application/javascript" if name.endswith(".js") else "text/css"
-        return web.Response(text=content, content_type=ctype)
+        return web.Response(text=content, content_type=ctype, headers=no_cache)
 
     async def api_status(_request: web.Request) -> web.Response:
         now = time.time()
