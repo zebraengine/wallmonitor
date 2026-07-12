@@ -89,6 +89,36 @@ const EVENT_META = {
 const eventLabel = (k) => (EVENT_META[k] || [k, "muted"])[0];
 const eventSeverity = (k) => (EVENT_META[k] || [k, "muted"])[1];
 
+/* ---------------- alert decoding ---------------- */
+
+// Loaded once from /api/alert-codes. Tesla doesn't document the numeric codes
+// the charger reports in current_alerts, so only verified entries are labeled;
+// everything else renders honestly as an undocumented code.
+let alertCodes = null;
+async function loadAlertCodes() {
+  if (alertCodes) return alertCodes;
+  try { alertCodes = await getJSON("/api/alert-codes"); } catch { alertCodes = { codes: {}, categories: [] }; }
+  return alertCodes;
+}
+
+const UNDOCUMENTED_HINT =
+  "undocumented code — open the Tesla app while this alert is active to see its name, then add it to alert_codes.json";
+
+function alertDisplay(alertStr, source) {
+  const s = String(alertStr);
+  const known = alertCodes && alertCodes.codes && alertCodes.codes[s];
+  if (known) {
+    return {
+      label: known.label,
+      sub: `code ${s} — ${known.description}${known.verified ? "" : " (community-reported, unverified)"}`,
+    };
+  }
+  const numeric = /^\d+$/.test(s);
+  if (numeric) return { label: `Alert code ${s}`, sub: UNDOCUMENTED_HINT };
+  // Monitor/wifi alerts (and any string alerts) are already human-readable.
+  return { label: s, sub: source === "device" ? UNDOCUMENTED_HINT : null };
+}
+
 /* ------------- unified vitals sample (DB row or SSE message) ------------- */
 
 // 255 (0xFF) is the device's "sensor read invalid" sentinel for temperatures.
@@ -543,9 +573,12 @@ function renderBanner(alerts) {
   holder.textContent = "";
   for (const a of alerts) {
     const sev = a.source === "device" ? "critical" : a.source === "wifi" ? "serious" : "critical";
+    const disp = alertDisplay(a.alert, a.source);
+    const label = el("span", {}, disp.label);
+    if (disp.sub) label.title = disp.sub;
     holder.append(el("div", { class: "banner " + sev },
       el("span", { class: "icon" }, "⚠"),
-      el("span", {}, `${a.alert}`),
+      label,
       el("span", { class: "when" }, `active since ${fmtDT(a.first_ts)}`)));
   }
 }
@@ -612,7 +645,8 @@ async function viewLive(root) {
         el("dt", {}, "Plugged in"), el("dd", {}, startTs ? `${fmtDT(startTs)} (${fmtDur(s.ts - startTs)} ago)` : "—"),
         el("dt", {}, "Energy this session"), el("dd", {}, `${fmtNum((s.energy ?? 0) / 1000, 2)} kWh`),
         el("dt", {}, "State"), el("dd", {}, evseLabel(s.evse)),
-        el("dt", {}, "Device alerts"), el("dd", {}, (s.alerts && s.alerts.length) ? s.alerts.join(", ") : "none")),
+        el("dt", {}, "Device alerts"), el("dd", {},
+          (s.alerts && s.alerts.length) ? s.alerts.map((a) => alertDisplay(a, "device").label).join(", ") : "none")),
       el("div", { class: "note" }, "Full history for this session appears under Sessions once it ends — or open it live: "),
       el("a", { href: `#/sessions/${s.sessionId}` }, "open session detail")));
   }
@@ -945,6 +979,10 @@ function eventsTable(events) {
         else if (ev.kind === "monitor_gap") detail = `no data since ${fmtDT(d.offline_since)} (${fmtDur(d.gap_s)})`;
         else if (ev.kind === "evse_not_ready_change")
           detail = `codes [${(d.from || []).join(", ")}] → [${(d.to || []).join(", ")}] (undocumented)`;
+        else if ((ev.kind === "alert_raised" || ev.kind === "alert_cleared") && d.alert != null) {
+          const disp = alertDisplay(d.alert, "device");
+          detail = disp.sub ? `${disp.label} · ${disp.sub}` : disp.label;
+        }
         else if (ev.kind === "session_start" && d.backdated_s)
           detail = `session_id: ${d.session_id} · start backdated ${fmtDur(d.backdated_s)} from the charger's session timer`;
         else detail = Object.entries(d).map(([k, v]) => `${k}: ${v}`).join(" · ");
@@ -1011,7 +1049,7 @@ async function viewAlerts(root, rangeKey = "7d") {
   const now = Date.now() / 1000;
   const from = now - rangeSeconds(rangeKey);
   root.append(el("h2", {}, "Alerts"));
-  const data = await getJSON(`/api/alerts?from=${from}&to=${now}`);
+  const [data] = await Promise.all([getJSON(`/api/alerts?from=${from}&to=${now}`), loadAlertCodes()]);
 
   const activeWrap = el("div", { class: "cards" });
   if (!data.active.length) {
@@ -1021,10 +1059,12 @@ async function viewAlerts(root, rangeKey = "7d") {
       el("div", { class: "tile-sub" }, "the charger reports no active alerts")));
   } else {
     for (const a of data.active) {
+      const disp = alertDisplay(a.alert, a.source);
       activeWrap.append(el("div", { class: "card" },
         el("div", { class: "tile-label" }, `${a.source} alert`),
-        el("div", { class: "tile-value" }, chipFor(a.source === "wifi" ? "serious" : "critical", a.alert)),
-        el("div", { class: "tile-sub" }, `since ${fmtDT(a.first_ts)} (${fmtDur(now - a.first_ts)})`)));
+        el("div", { class: "tile-value" }, chipFor(a.source === "wifi" ? "serious" : "critical", disp.label)),
+        el("div", { class: "tile-sub" },
+          `since ${fmtDT(a.first_ts)} (${fmtDur(now - a.first_ts)})` + (disp.sub ? ` · ${disp.sub}` : ""))));
     }
   }
   root.append(activeWrap);
@@ -1041,8 +1081,11 @@ async function viewAlerts(root, rangeKey = "7d") {
         el("th", {}, "Cleared"), el("th", { class: "num" }, "Duration"), el("th", {}, "Status"))));
     const tbody = el("tbody", {});
     for (const a of data.history) {
+      const disp = alertDisplay(a.alert, a.source);
+      const cell = el("td", {}, disp.label);
+      if (disp.sub) cell.title = disp.sub;
       tbody.append(el("tr", {},
-        el("td", {}, a.alert), el("td", {}, a.source),
+        cell, el("td", {}, a.source),
         el("td", {}, fmtDT(a.first_ts)),
         el("td", {}, a.cleared_ts ? fmtDT(a.cleared_ts) : "—"),
         el("td", { class: "num" }, fmtDur((a.cleared_ts ?? now) - a.first_ts)),
@@ -1052,6 +1095,29 @@ async function viewAlerts(root, rangeKey = "7d") {
     wrap.append(tbl);
   }
   root.append(wrap);
+
+  // Official fault categories (from Tesla's Gen 3 manual) as a reference —
+  // the numeric API codes themselves are undocumented by Tesla, so an
+  // unmapped code can be cross-read against the charger's LED blink pattern.
+  const cats = (alertCodes && alertCodes.categories) || [];
+  if (cats.length) {
+    root.append(el("h2", {}, "Alert reference — official fault categories"),
+      el("div", { class: "note" },
+        "Tesla documents Wall Connector faults by LED blink pattern, not by the numeric codes the local API reports. " +
+        "If an undocumented code appears here, check the charger's LED and the Tesla app (it names active alerts), " +
+        "then teach the monitor by adding the code to alert_codes.json."));
+    const rtbl = el("table", {},
+      el("thead", {}, el("tr", {}, el("th", {}, "LED"), el("th", {}, "Fault"), el("th", {}, "Meaning / action"))));
+    const rbody = el("tbody", {});
+    for (const c of cats) {
+      rbody.append(el("tr", {},
+        el("td", {}, c.led),
+        el("td", {}, c.label),
+        el("td", { style: "white-space:normal" }, c.description)));
+    }
+    rtbl.append(rbody);
+    root.append(el("div", { class: "tbl-wrap" }, rtbl));
+  }
 
   root.append(el("h2", {}, "Event timeline"),
     el("div", { class: "note" },
@@ -1121,7 +1187,7 @@ function tzNote() {
 
 window.addEventListener("hashchange", route);
 connectSSE();
-refreshStatus();
+loadAlertCodes().finally(refreshStatus);
 setInterval(refreshStatus, 10000);
 setInterval(tickClock, 1000);
 tickClock();

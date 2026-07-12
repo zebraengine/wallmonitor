@@ -26,7 +26,12 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
 5. **Alert & error monitoring** — device-reported `current_alerts` are diffed
    into raise/clear alert records with timestamps; charger reboots,
    unreachability, EVSE state changes, and Wi-Fi drops are all first-class
-   events with an active-alert banner across every page.
+   events with an active-alert banner across every page. Alert codes are run
+   through `wallmonitor/alert_codes.json` — Tesla doesn't document the numeric
+   codes the local API reports, so only verified entries are labeled; unknown
+   codes render honestly with guidance (the Tesla app names active alerts —
+   confirm a code there, then add it to the JSON). The Alerts page includes
+   Tesla's official LED fault categories as a reference.
 6. **One synchronized clock** — every sample, session boundary, alert, and
    event is stamped with the host's UTC time the moment it was observed, and
    rendered in your local timezone by one shared formatter, so you can line up
