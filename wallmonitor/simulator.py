@@ -112,6 +112,7 @@ class SimState:
             "config_status": 5,
             "evse_state": evse_state,
             "current_alerts": alerts,
+            "evse_not_ready_reasons": [] if charging else [1],
         }
         return data
 
@@ -185,9 +186,11 @@ def make_app(state: SimState | None = None) -> web.Application:
     return app
 
 
-async def start_simulator(port: int = 0, speedup: float = 1.0) -> tuple[web.AppRunner, int]:
+async def start_simulator(
+    port: int = 0, speedup: float = 1.0, start: float | None = None
+) -> tuple[web.AppRunner, int]:
     """Start the simulator on localhost. Returns (runner, bound_port)."""
-    runner = web.AppRunner(make_app(SimState(speedup=speedup)))
+    runner = web.AppRunner(make_app(SimState(speedup=speedup, start=start)))
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", port)
     await site.start()

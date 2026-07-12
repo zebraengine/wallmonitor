@@ -79,6 +79,7 @@ class Poller:
         self.db = db
         self.bus = bus
         self.wc = WallConnector(host=cfg.host, timeout=cfg.request_timeout, session=session)
+        self._verify_resumed = False
         # per-endpoint scheduling state: next due time and current backoff interval
         self._due: dict[str, float] = {"vitals": 0.0, "wifi": 0.0, "lifetime": 0.0, "version": 0.0}
         self._fail_streak: dict[str, int] = dict.fromkeys(self._due, 0)
@@ -117,6 +118,7 @@ class Poller:
         # A session left open by a previous run: keep it only if the vehicle is
         # still connected once we get our first sample; remember it for now.
         self._session_id = self.db.open_session_id()
+        self._verify_resumed = self._session_id is not None
         for alert in self.db.active_alerts():
             if alert["source"] == "device":
                 self._active_alerts.add(alert["alert"])
@@ -223,10 +225,41 @@ class Poller:
         connected = bool(raw.get("vehicle_connected"))
         was_connected = bool(prev.get("vehicle_connected")) if prev is not None else None
 
-        # Session lifecycle
+        # A session resumed across a monitor restart might actually be a
+        # different plug-in (car left and returned while we were down). The
+        # charger's session timer exposes that: if the implied start disagrees
+        # with the stored one by a lot, split into a new session.
+        if connected and self._session_id is not None and self._verify_resumed:
+            self._verify_resumed = False
+            session_s = raw.get("session_s")
+            if isinstance(session_s, (int, float)) and 0 <= session_s < 30 * 86400:
+                implied_start = ts - session_s
+                row = await asyncio.to_thread(self.db.session, self._session_id)
+                if row and implied_start - row["start_ts"] > 600:
+                    stale = self._session_id
+                    await asyncio.to_thread(self.db.close_session, stale, implied_start, "ended_during_monitor_gap")
+                    await self._event(ts, "session_end", {"session_id": stale, "reason": "ended_during_monitor_gap"})
+                    self._session_id = await asyncio.to_thread(self.db.start_session, implied_start)
+                    await self._event(
+                        ts, "session_start", {"session_id": self._session_id, "backdated_s": round(session_s, 1)}
+                    )
+        elif self._verify_resumed:
+            self._verify_resumed = False
+
+        # Session lifecycle. The charger reports session_s (seconds since
+        # plug-in), so a session already in progress when monitoring starts
+        # gets its true start time instead of "when we first saw it".
         if connected and self._session_id is None:
-            self._session_id = await asyncio.to_thread(self.db.start_session, ts)
-            await self._event(ts, "session_start", {"session_id": self._session_id})
+            session_s = raw.get("session_s")
+            if isinstance(session_s, (int, float)) and 0 <= session_s < 30 * 86400:
+                start_ts = ts - session_s
+            else:
+                start_ts = ts
+            self._session_id = await asyncio.to_thread(self.db.start_session, start_ts)
+            detail = {"session_id": self._session_id}
+            if start_ts < ts - 60:
+                detail["backdated_s"] = round(ts - start_ts, 1)
+            await self._event(ts, "session_start", detail)
         elif not connected and self._session_id is not None:
             sid = self._session_id
             self._session_id = None
@@ -244,6 +277,12 @@ class Poller:
             await self._event(
                 ts, "evse_state_change", {"from": prev.get("evse_state"), "to": raw.get("evse_state")}
             )
+
+        # Not-ready reason changes (newer firmware; undocumented codes)
+        reasons_now = sorted(raw.get("evse_not_ready_reasons") or [])
+        reasons_prev = sorted(prev.get("evse_not_ready_reasons") or []) if prev is not None else None
+        if reasons_prev is not None and reasons_now != reasons_prev:
+            await self._event(ts, "evse_not_ready_change", {"from": reasons_prev, "to": reasons_now})
 
         # Device alert diffing
         alerts_now = {str(a) for a in raw.get("current_alerts") or []}

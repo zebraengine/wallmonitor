@@ -364,13 +364,21 @@ class Database:
         t_pcba, t_handle, t_mcu = (
             temp.format(c=c) for c in ("pcba_temp_c", "handle_temp_c", "mcu_temp_c")
         )
+        # Handshake diagnostics live only in the raw JSON; json_extract makes
+        # them chartable retroactively for every sample ever recorded.
+        diag = """json_extract(raw, '$.pilot_high_v') AS pilot_high_v,
+                  json_extract(raw, '$.pilot_low_v') AS pilot_low_v,
+                  json_extract(raw, '$.prox_v') AS prox_v,
+                  COALESCE(json_extract(raw, '$.relay_k1_v'), json_extract(raw, '$.relay_coil_v')) AS relay_k1_v,
+                  json_extract(raw, '$.relay_k2_v') AS relay_k2_v"""
         if n <= max_points:
             return self._rows(
                 f"""SELECT ts, total_power_w, vehicle_current_a, current_a_a, current_b_a, current_c_a,
                           voltage_a_v, voltage_b_v, voltage_c_v, grid_v, grid_hz,
                           {t_pcba} AS pcba_temp_c, {t_handle} AS handle_temp_c, {t_mcu} AS mcu_temp_c,
                           session_energy_wh,
-                          vehicle_connected, contactor_closed, evse_state, session_id
+                          vehicle_connected, contactor_closed, evse_state, session_id,
+                          {diag}
                    FROM vitals_samples WHERE ts >= ? AND ts <= ? ORDER BY ts""",
                 (t_from, t_to),
             )
@@ -388,8 +396,32 @@ class Database:
                       MAX(session_energy_wh) AS session_energy_wh,
                       MAX(vehicle_connected) AS vehicle_connected,
                       MAX(contactor_closed) AS contactor_closed,
-                      MAX(evse_state) AS evse_state, MAX(session_id) AS session_id
+                      MAX(evse_state) AS evse_state, MAX(session_id) AS session_id,
+                      AVG(json_extract(raw, '$.pilot_high_v')) AS pilot_high_v,
+                      AVG(json_extract(raw, '$.pilot_low_v')) AS pilot_low_v,
+                      AVG(json_extract(raw, '$.prox_v')) AS prox_v,
+                      AVG(COALESCE(json_extract(raw, '$.relay_k1_v'), json_extract(raw, '$.relay_coil_v'))) AS relay_k1_v,
+                      AVG(json_extract(raw, '$.relay_k2_v')) AS relay_k2_v
                FROM vitals_samples WHERE ts >= ? AND ts <= ?
+               GROUP BY CAST((ts - ?) / ? AS INTEGER) ORDER BY ts""",
+            (t_from, t_to, t_from, width),
+        )
+
+    def lifetime_range(self, t_from: float, t_to: float, max_points: int = 3000) -> list[dict]:
+        """Lifetime counter samples in a range (counters are monotonic, so
+        buckets keep the last/max value)."""
+        n = self._rows("SELECT COUNT(*) AS n FROM lifetime_samples WHERE ts >= ? AND ts <= ?", (t_from, t_to))[0]["n"]
+        if n <= max_points:
+            return self._rows(
+                """SELECT ts, energy_wh, charge_starts, charging_time_s
+                   FROM lifetime_samples WHERE ts >= ? AND ts <= ? ORDER BY ts""",
+                (t_from, t_to),
+            )
+        width = (t_to - t_from) / max_points
+        return self._rows(
+            """SELECT MAX(ts) AS ts, MAX(energy_wh) AS energy_wh,
+                      MAX(charge_starts) AS charge_starts, MAX(charging_time_s) AS charging_time_s
+               FROM lifetime_samples WHERE ts >= ? AND ts <= ?
                GROUP BY CAST((ts - ?) / ? AS INTEGER) ORDER BY ts""",
             (t_from, t_to, t_from, width),
         )

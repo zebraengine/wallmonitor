@@ -85,6 +85,13 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
         rows = await asyncio.to_thread(db.wifi_range, t_from, t_to)
         return web.json_response({"from": t_from, "to": t_to, "samples": rows})
 
+    async def api_lifetime(request: web.Request) -> web.Response:
+        now = time.time()
+        t_from = _float_q(request, "from", now - 90 * 24 * 3600)
+        t_to = _float_q(request, "to", now)
+        rows = await asyncio.to_thread(db.lifetime_range, t_from, t_to)
+        return web.json_response({"from": t_from, "to": t_to, "samples": rows})
+
     async def api_sessions(request: web.Request) -> web.Response:
         now = time.time()
         t_from = _float_q(request, "from", now - 90 * 24 * 3600)
@@ -154,6 +161,7 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
     app.router.add_get("/api/status", api_status)
     app.router.add_get("/api/vitals", api_vitals)
     app.router.add_get("/api/wifi", api_wifi)
+    app.router.add_get("/api/lifetime", api_lifetime)
     app.router.add_get("/api/sessions", api_sessions)
     app.router.add_get("/api/sessions/{id}", api_session_detail)
     app.router.add_get("/api/alerts", api_alerts)
