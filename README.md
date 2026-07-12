@@ -109,6 +109,30 @@ is the charger's microcontroller.
 
 A hard floor of 1 s per endpoint is enforced regardless of flags.
 
+## Run as a service (Ubuntu / systemd)
+
+For an always-on box, `deploy/install-service.sh` installs wallmonitor as a
+systemd service that starts on boot, restarts on failure, and survives
+unattended OS updates (any downtime shows up as a `monitor_gap` event in the
+timeline):
+
+```bash
+cd monitor
+sudo ./deploy/install-service.sh --host 192.168.1.50 --split-phase
+```
+
+The service runs as your (non-root) user with `--bind 0.0.0.0` by default so
+other machines your firewall permits can reach the UI. Options mirror the app
+flags (`--port`, `--bind`, `--db`, `--demo`, `--user`); `--uninstall` removes
+the service and leaves code and database untouched. Requires
+[uv](https://docs.astral.sh/uv/) installed for the service user.
+
+Check on it with `systemctl status wallmonitor` or follow logs with
+`journalctl -u wallmonitor -f`.
+
+There is no authentication in the app — your firewall (e.g. UniFi zone
+policies) is the access control for the UI.
+
 ## Tests
 
 ```bash
