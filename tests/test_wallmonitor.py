@@ -193,6 +193,71 @@ async def test_temp_sentinel_excluded_from_queries(db):
     assert latest["handle_temp_c"] == 33.2
 
 
+async def test_session_start_backdated_from_charger_timer(db):
+    # Start the poller mid-charge: the simulator reports session_s ~135 (sim
+    # seconds since plug-in) at 60x, so the first session must be backdated.
+    sim_runner, port = await start_simulator(speedup=60.0, start=time.time() - 175.0 / 60.0)
+    cfg = Config(host=f"127.0.0.1:{port}", vitals_interval_active=0.05, vitals_interval_idle=0.05, min_interval=0.01)
+    async with aiohttp.ClientSession() as client:
+        poller = Poller(cfg, db, EventBus(), client)
+        await poller.start()
+        try:
+            await _wait_for(lambda: db.counts()["sessions"] >= 1)
+        finally:
+            await poller.stop()
+        await sim_runner.cleanup()
+    session = db.sessions_range(0, time.time() + 1)[-1]
+    first_sample = db._rows("SELECT MIN(ts) AS ts FROM vitals_samples WHERE session_id = ?", (session["id"],))[0]["ts"]
+    assert first_sample is not None
+    # session_s was ~135 at first observation, so start_ts predates it by minutes.
+    assert session["start_ts"] < first_sample - 60
+    events = db.events_range(0, time.time() + 1, kinds=["session_start"])
+    import json as _json
+
+    details = [_json.loads(e["detail"]) for e in events if e["detail"]]
+    assert any(d.get("backdated_s", 0) > 60 for d in details)
+
+
+async def test_not_ready_reason_change_event(db):
+    sim_runner, port = await start_simulator(speedup=60.0)
+    cfg = Config(host=f"127.0.0.1:{port}", vitals_interval_active=0.05, vitals_interval_idle=0.05, min_interval=0.01)
+    async with aiohttp.ClientSession() as client:
+        poller = Poller(cfg, db, EventBus(), client)
+        await poller.start()
+        try:
+            # Simulator reports [1] while not charging and [] while charging,
+            # so a full idle→charging transition must produce a change event.
+            await _wait_for(
+                lambda: db.events_range(0, time.time() + 1, kinds=["evse_not_ready_change"]) or None, timeout=20.0
+            )
+        finally:
+            await poller.stop()
+        await sim_runner.cleanup()
+
+
+async def test_lifetime_api_and_diag_fields(db):
+    now = time.time()
+    for i in range(5):
+        db.insert_lifetime(now - 400 + i * 60, {"energy_wh": 1000 + i * 500, "charge_starts": 10, "charging_time_s": 100})
+    db.insert_vitals(now, {"pilot_high_v": 8.6, "pilot_low_v": -11.8, "prox_v": 1.2, "relay_k1_v": 11.9, "relay_k2_v": 0.0}, None, 0.0)
+
+    rows = db.lifetime_range(now - 3600, now)
+    assert len(rows) == 5 and rows[-1]["energy_wh"] == 3000
+
+    vit = db.vitals_range(now - 60, now + 1)
+    assert vit[0]["pilot_high_v"] == 8.6
+    assert vit[0]["relay_k1_v"] == 11.9
+
+    app = make_app(db, EventBus(), None)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        data = await (await client.get("/api/lifetime")).json()
+        assert len(data["samples"]) == 5
+    finally:
+        await client.close()
+
+
 async def test_monitor_gap_event_on_restart(db):
     # Simulate a previous run that stopped long ago, then a restart.
     old = time.time() - 3600

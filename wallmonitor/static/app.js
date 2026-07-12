@@ -73,6 +73,7 @@ const EVENT_META = {
   alert_raised: ["Alert raised", "critical"],
   alert_cleared: ["Alert cleared", "good"],
   evse_state_change: ["EVSE state change", "muted"],
+  evse_not_ready_change: ["Not-ready reasons changed", "muted"],
   charger_reboot: ["Charger rebooted", "serious"],
   poll_error: ["Charger unreachable", "critical"],
   poll_recovered: ["Charger reachable again", "good"],
@@ -103,6 +104,8 @@ function fromDbRow(r) {
     tPcba: realTemp(r.pcba_temp_c), tHandle: realTemp(r.handle_temp_c), tMcu: realTemp(r.mcu_temp_c),
     energy: r.session_energy_wh, connected: !!r.vehicle_connected,
     charging: !!r.contactor_closed, evse: r.evse_state, sessionId: r.session_id,
+    pilotHigh: r.pilot_high_v, pilotLow: r.pilot_low_v, prox: r.prox_v,
+    relayK1: r.relay_k1_v, relayK2: r.relay_k2_v,
   };
 }
 function fromSse(m) {
@@ -117,6 +120,9 @@ function fromSse(m) {
     energy: d.session_energy_wh, connected: !!d.vehicle_connected,
     charging: !!d.contactor_closed, evse: d.evse_state, sessionId: m.session_id,
     sessionS: d.session_s, alerts: d.current_alerts || [],
+    notReady: d.evse_not_ready_reasons || [],
+    pilotHigh: d.pilot_high_v, pilotLow: d.pilot_low_v, prox: d.prox_v,
+    relayK1: d.relay_k1_v ?? d.relay_coil_v, relayK2: d.relay_k2_v,
   };
 }
 
@@ -282,6 +288,85 @@ function lineChart(box, opts) {
   }
 }
 
+/* barChart(box, {bars: [{label, value}], unit, digits, height}) — columns with
+   rounded caps, square baseline, per-bar hover tooltip. */
+function barChart(box, opts) {
+  box.style.minHeight = `${opts.height || 220}px`;
+  box.textContent = "";
+  box.classList.add("chart-box");
+  const bars = opts.bars || [];
+  if (!bars.length) {
+    box.append(el("div", { class: "empty" }, "No data in this range yet — the chart fills in as history accumulates"));
+    return;
+  }
+  const height = opts.height || 220;
+  const width = Math.max(320, box.clientWidth || 800);
+  const M = { l: 48, r: 14, t: 12, b: 24 };
+  const pw = width - M.l - M.r, ph = height - M.t - M.b;
+  const yt = niceTicks(0, Math.max(...bars.map((b) => b.value), 0.001), 4);
+  const Y = (v) => M.t + ph - (v / (yt.max || 1)) * ph;
+  const root = svg("svg", { viewBox: `0 0 ${width} ${height}`, width, height });
+
+  const yStep = yt.ticks.length > 1 ? yt.ticks[1] - yt.ticks[0] : 1;
+  const tickDigits = Math.max(0, Math.min(3, -Math.floor(Math.log10(yStep) + 1e-9)));
+  for (const v of yt.ticks) {
+    if (v < 0) continue;
+    root.append(svg("line", { x1: M.l, x2: width - M.r, y1: Y(v), y2: Y(v), stroke: "var(--grid)", "stroke-width": 1 }));
+    const lbl = svg("text", { x: M.l - 6, y: Y(v) + 3.5, "text-anchor": "end", class: "axis-text" });
+    lbl.textContent = fmtNum(v, tickDigits);
+    root.append(lbl);
+  }
+  root.append(svg("line", { x1: M.l, x2: width - M.r, y1: M.t + ph, y2: M.t + ph, stroke: "var(--baseline)", "stroke-width": 1 }));
+
+  const slot = pw / bars.length;
+  const bw = Math.min(24, Math.max(3, slot - 2));
+  const color = COLORS().s1;
+  const tip = el("div", { class: "tooltip" });
+  const baseY = M.t + ph;
+  const labelEvery = Math.max(1, Math.ceil(bars.length / Math.floor(pw / 60)));
+
+  bars.forEach((b, i) => {
+    const x = M.l + slot * i + (slot - bw) / 2;
+    const topY = Y(b.value);
+    const h = Math.max(0, baseY - topY);
+    const r = Math.min(4, bw / 2, h);
+    const d = h <= 0
+      ? ""
+      : `M${x},${baseY} L${x},${topY + r} Q${x},${topY} ${x + r},${topY} L${x + bw - r},${topY} ` +
+        `Q${x + bw},${topY} ${x + bw},${topY + r} L${x + bw},${baseY} Z`;
+    const rect = d ? svg("path", { d, fill: color }) : null;
+    if (rect) root.append(rect);
+    if (i % labelEvery === 0) {
+      const xl = svg("text", { x: x + bw / 2, y: height - 6, "text-anchor": "middle", class: "axis-text" });
+      xl.textContent = b.label;
+      root.append(xl);
+    }
+    // Hit target spans the full slot height, wider than the mark.
+    const hit = svg("rect", { x: M.l + slot * i, y: M.t, width: slot, height: ph, fill: "transparent" });
+    hit.addEventListener("pointermove", () => {
+      if (rect) rect.setAttribute("fill-opacity", "0.8");
+      tip.textContent = "";
+      tip.append(el("div", { class: "tt-time" }, b.label));
+      const row = el("div", { class: "tt-row" });
+      const sw = el("span", { class: "swatch" }); sw.style.background = color;
+      row.append(sw, el("span", { class: "tt-name" }, opts.seriesName || ""),
+        el("span", { class: "tt-val" }, `${fmtNum(b.value, opts.digits ?? 1)}${opts.unit ? " " + opts.unit : ""}`));
+      tip.append(row);
+      tip.style.display = "block";
+      const bwPx = box.clientWidth;
+      tip.style.left = `${Math.min(bwPx - 150, Math.max(0, ((x + bw / 2) / width) * bwPx + 10))}px`;
+      tip.style.top = "8px";
+    });
+    hit.addEventListener("pointerleave", () => {
+      if (rect) rect.removeAttribute("fill-opacity");
+      tip.style.display = "none";
+    });
+    root.append(hit);
+  });
+
+  box.append(root, tip);
+}
+
 function chartCard(title, sub) {
   const box = el("div", { class: "chart-box" });
   const card = el("div", { class: "chart-card" },
@@ -402,7 +487,12 @@ async function viewLive(root) {
     const evseTile = tiles.lastChild;
     evseTile.querySelector(".tile-value").textContent = evseLabel(s.evse);
     evseTile.querySelector(".tile-value").style.fontSize = "16px";
+    let notReady = s.notReady;
+    if (notReady == null && st.vitals && st.vitals.raw) {
+      try { notReady = JSON.parse(st.vitals.raw).evse_not_ready_reasons || []; } catch { notReady = []; }
+    }
     evseTile.querySelector(".tile-sub").textContent =
+      (notReady && notReady.length ? `not-ready reason codes: ${notReady.join(", ")} — ` : "") +
       "label is unofficial — Tesla doesn't document these codes; (n) is the charger's raw value";
     if (st.version) {
       tiles.append(statTile("Firmware", "", null, ""));
@@ -517,6 +607,53 @@ function chipFor(sev, text) {
   return el("span", { class: `schip ${sev}` }, el("span", { class: "sdot" }), text);
 }
 
+async function viewEnergy(root, rangeKey = "30d") {
+  const now = Date.now() / 1000;
+  const from = now - rangeSeconds(rangeKey);
+  root.append(el("h2", {}, "Charger lifetime"));
+
+  const st = live.status || await getJSON("/api/status");
+  const lt = st.lifetime;
+  const tiles = el("div", { class: "cards" });
+  if (lt) {
+    tiles.append(
+      statTile("Energy delivered", fmtNum(lt.energy_wh / 1e6, 2), "MWh", "over the charger's whole life"),
+      statTile("Charge sessions", fmtNum(lt.charge_starts, 0), null, `${fmtNum(lt.connector_cycles, 0)} plug-in cycles`),
+      statTile("Time charging", fmtNum(lt.charging_time_s / 3600, 0), "h", `uptime ${fmtNum(lt.uptime_s / 86400, 0)} days`),
+      statTile("Thermal foldbacks", fmtNum(lt.thermal_foldbacks, 0), null, "times charging was slowed by heat"),
+      statTile("Lifetime alerts", fmtNum(lt.alert_count, 0), null),
+      statTile("Contactor cycles", fmtNum(lt.contactor_cycles, 0), null, `${fmtNum(lt.contactor_cycles_loaded, 0)} under load`),
+    );
+  } else {
+    tiles.append(el("div", { class: "card" }, el("div", { class: "empty" }, "No lifetime data recorded yet.")));
+  }
+  root.append(tiles);
+
+  root.append(el("h2", {}, "Energy per day"));
+  root.append(presetRow(RANGE_PRESETS.slice(3), rangeKey, (k) => render("energy", k)));
+  const daily = chartCard("Daily energy delivered",
+    "From the charger's cumulative counter, sampled every minute — days before monitoring began can't be reconstructed");
+  root.append(daily.card);
+
+  const data = await getJSON(`/api/lifetime?from=${from}&to=${now}`);
+  const byDay = new Map();
+  for (const s of data.samples) {
+    if (s.energy_wh == null) continue;
+    const key = fmtDT(s.ts).slice(0, 10);
+    const cur = byDay.get(key);
+    if (!cur) byDay.set(key, { min: s.energy_wh, max: s.energy_wh });
+    else { cur.min = Math.min(cur.min, s.energy_wh); cur.max = Math.max(cur.max, s.energy_wh); }
+  }
+  const bars = [...byDay.entries()].map(([day, v]) => ({ label: day.slice(5), value: (v.max - v.min) / 1000 }));
+  barChart(daily.box, { bars, unit: "kWh", digits: 1, seriesName: "Energy", height: 240 });
+  const total = bars.reduce((a, b) => a + b.value, 0);
+  if (bars.length) {
+    root.append(el("div", { class: "note" },
+      `${fmtNum(total, 1)} kWh across ${bars.length} recorded day${bars.length > 1 ? "s" : ""} ` +
+      `(avg ${fmtNum(total / bars.length, 1)} kWh/day)`));
+  }
+}
+
 async function viewSessionDetail(root, id) {
   const C = COLORS();
   const data = await getJSON(`/api/sessions/${id}`);
@@ -531,8 +668,13 @@ async function viewSessionDetail(root, id) {
 
   const energyKwh = (s.energy_wh ?? (samples.length ? samples[samples.length - 1].energy : 0) ?? 0) / 1000;
   const maxP = s.max_power_w ?? Math.max(0, ...samples.map((p) => p.power || 0));
+  // The plug-in time can predate monitoring (derived from the charger's own
+  // session timer); charts still start at the first observed sample.
+  const firstSeen = samples.length ? samples[0].ts : s.start_ts;
+  const backdated = firstSeen - s.start_ts > 120;
   root.append(el("div", { class: "cards" },
-    statTile("Plugged in", fmtDT(s.start_ts).slice(11), null, fmtDT(s.start_ts).slice(0, 10)),
+    statTile("Plugged in", fmtDT(s.start_ts).slice(11), null,
+      fmtDT(s.start_ts).slice(0, 10) + (backdated ? ` — from charger's timer; monitoring since ${fmtT(firstSeen)}` : "")),
     ongoing
       ? statTile("Status", "Plugged in", null, "session in progress")
       : statTile("Unplugged", fmtDT(s.end_ts).slice(11), null, fmtDT(s.end_ts).slice(0, 10)),
@@ -546,9 +688,12 @@ async function viewSessionDetail(root, id) {
   const cur = chartCard("Phase currents", "Per-phase current");
   const volt = chartCard("Phase voltages", "Per-phase voltage");
   const temp = chartCard("Temperatures", "Plug handle, charger circuit board (PCBA), and processor (MCU)");
-  root.append(power.card, el("div", { class: "grid-2" }, cur.card, volt.card), temp.card);
+  const pilot = chartCard("Pilot & proximity", "J1772 handshake signals — flaky values here often precede charging errors");
+  const relay = chartCard("Relay voltages", "Contactor coil drive");
+  root.append(power.card, el("div", { class: "grid-2" }, cur.card, volt.card), temp.card,
+    el("div", { class: "grid-2" }, pilot.card, relay.card));
 
-  const xFrom = s.start_ts, xTo = ongoing ? now : s.end_ts;
+  const xFrom = backdated ? firstSeen : s.start_ts, xTo = ongoing ? now : s.end_ts;
   lineChart(power.box, {
     series: [{ name: "Power (W)", color: C.s1, points: samples.map((p) => [p.ts, p.power]) }],
     unit: "W", digits: 0, area: true, zeroBase: true, xFrom, xTo, height: 240,
@@ -573,6 +718,19 @@ async function viewSessionDetail(root, id) {
       { name: "Plug handle", color: C.s2, points: samples.map((p) => [p.ts, p.tHandle]) },
       { name: "Processor (MCU)", color: C.s3, points: samples.map((p) => [p.ts, p.tMcu]) },
     ], unit: "°C", digits: 1, xFrom, xTo, height: 190,
+  });
+  lineChart(pilot.box, {
+    series: [
+      { name: "Pilot high", color: C.s1, points: samples.map((p) => [p.ts, p.pilotHigh]) },
+      { name: "Pilot low", color: C.s2, points: samples.map((p) => [p.ts, p.pilotLow]) },
+      { name: "Proximity", color: C.s3, points: samples.map((p) => [p.ts, p.prox]) },
+    ], unit: "V", digits: 1, xFrom, xTo, height: 190,
+  });
+  lineChart(relay.box, {
+    series: [
+      { name: "Relay K1", color: C.s1, points: samples.map((p) => [p.ts, p.relayK1]) },
+      { name: "Relay K2", color: C.s2, points: samples.map((p) => [p.ts, p.relayK2]) },
+    ], unit: "V", digits: 1, zeroBase: true, xFrom, xTo, height: 190,
   });
 
   root.append(el("h2", {}, "Events during this session"));
@@ -609,6 +767,10 @@ function eventsTable(events) {
         const d = JSON.parse(ev.detail);
         if (ev.kind === "evse_state_change") detail = `${evseLabel(d.from)} → ${evseLabel(d.to)}`;
         else if (ev.kind === "monitor_gap") detail = `no data since ${fmtDT(d.offline_since)} (${fmtDur(d.gap_s)})`;
+        else if (ev.kind === "evse_not_ready_change")
+          detail = `codes [${(d.from || []).join(", ")}] → [${(d.to || []).join(", ")}] (undocumented)`;
+        else if (ev.kind === "session_start" && d.backdated_s)
+          detail = `session_id: ${d.session_id} · start backdated ${fmtDur(d.backdated_s)} from the charger's session timer`;
         else detail = Object.entries(d).map(([k, v]) => `${k}: ${v}`).join(" · ");
       } catch { detail = String(ev.detail); }
     }
@@ -746,6 +908,7 @@ async function render(view, arg) {
     if (view === "live") cleanup = await viewLive(root);
     else if (view === "sessions") await viewSessions(root, arg);
     else if (view === "session") cleanup = await viewSessionDetail(root, arg);
+    else if (view === "energy") await viewEnergy(root, arg);
     else if (view === "wifi") await viewWifi(root, arg);
     else if (view === "alerts") await viewAlerts(root, arg);
   } catch (ex) {
@@ -759,7 +922,7 @@ function route() {
   const hash = location.hash || "#/live";
   const parts = hash.replace(/^#\//, "").split("/");
   if (parts[0] === "sessions" && parts[1]) render("session", parts[1]);
-  else if (["live", "sessions", "wifi", "alerts"].includes(parts[0])) render(parts[0]);
+  else if (["live", "sessions", "energy", "wifi", "alerts"].includes(parts[0])) render(parts[0]);
   else render("live");
 }
 
