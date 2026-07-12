@@ -367,6 +367,104 @@ function barChart(box, opts) {
   box.append(root, tip);
 }
 
+/* timeBrush(box, {samples, range, win, onChange}) — an overview strip of the
+   session's power with a draggable selection window. Drag the handles to
+   resize, drag the middle to pan, drag on empty track to select fresh.
+   onChange(win|null) fires as the user drags; null = full range. */
+function timeBrush(box, opts) {
+  const HEIGHT = 64;
+  box.textContent = "";
+  box.classList.add("chart-box");
+  box.style.minHeight = `${HEIGHT}px`;
+  const width = Math.max(320, box.clientWidth || 800);
+  const M = { l: 48, r: 14 };
+  const pw = width - M.l - M.r;
+  const [tFrom, tTo] = opts.range;
+  const span = Math.max(1, tTo - tFrom);
+  const X = (t) => M.l + ((t - tFrom) / span) * pw;
+  const T = (x) => tFrom + ((x - M.l) / pw) * span;
+  const clampT = (t) => Math.min(tTo, Math.max(tFrom, t));
+  const MIN_WIN = Math.min(15, span / 4);
+  const color = COLORS().s1;
+
+  const root = svg("svg", { viewBox: `0 0 ${width} ${HEIGHT}`, width, height: HEIGHT, style: "touch-action:none" });
+  root.append(svg("rect", { x: M.l, y: 4, width: pw, height: HEIGHT - 8, fill: "transparent", stroke: "var(--grid)", "stroke-width": 1 }));
+
+  // overview: total power as a compact area
+  const pts = (opts.samples || []).map((p) => [p.ts, p.power]).filter((p) => p[1] != null && isFinite(p[1]));
+  if (pts.length > 1) {
+    const vMax = Math.max(...pts.map((p) => p[1]), 1);
+    const Y = (v) => (HEIGHT - 10) - (Math.max(0, v) / vMax) * (HEIGHT - 18);
+    const d = pts.map((p, i) => `${i ? "L" : "M"}${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join("");
+    root.append(svg("path", {
+      d: d + `L${X(pts[pts.length - 1][0]).toFixed(1)},${HEIGHT - 10}L${X(pts[0][0]).toFixed(1)},${HEIGHT - 10}Z`,
+      fill: color, "fill-opacity": 0.12, stroke: "none",
+    }));
+    root.append(svg("path", { d, fill: "none", stroke: color, "stroke-width": 1.5, "stroke-linejoin": "round" }));
+  }
+
+  // selection window
+  const winRect = svg("rect", { y: 4, height: HEIGHT - 8, fill: color, "fill-opacity": 0.14, stroke: color, "stroke-width": 1.5, rx: 3 });
+  const hL = svg("rect", { y: HEIGHT / 2 - 12, width: 7, height: 24, rx: 3, fill: color, style: "cursor:ew-resize" });
+  const hR = svg("rect", { y: HEIGHT / 2 - 12, width: 7, height: 24, rx: 3, fill: color, style: "cursor:ew-resize" });
+  root.append(winRect, hL, hR);
+
+  let win = opts.win ? [...opts.win] : null;
+  function draw() {
+    const [a, b] = win || [tFrom, tTo];
+    const xa = X(a), xb = X(b);
+    winRect.setAttribute("x", xa);
+    winRect.setAttribute("width", Math.max(1, xb - xa));
+    winRect.setAttribute("stroke-opacity", win ? 1 : 0.35);
+    winRect.setAttribute("fill-opacity", win ? 0.14 : 0.04);
+    winRect.style.cursor = win ? "grab" : "crosshair";
+    hL.setAttribute("x", xa - 3.5);
+    hR.setAttribute("x", xb - 3.5);
+    hL.style.display = hR.style.display = win ? "" : "none";
+  }
+  draw();
+
+  let mode = null, grabT = 0, winAtGrab = null;
+  function pxT(ev) {
+    const r = root.getBoundingClientRect();
+    return T(((ev.clientX - r.left) / r.width) * width);
+  }
+  root.addEventListener("pointerdown", (ev) => {
+    const t = pxT(ev);
+    root.setPointerCapture(ev.pointerId);
+    if (win && ev.target === hL) mode = "l";
+    else if (win && ev.target === hR) mode = "r";
+    else if (win && t > win[0] && t < win[1]) { mode = "move"; grabT = t; winAtGrab = [...win]; }
+    else { mode = "new"; grabT = clampT(t); win = [grabT, grabT]; }
+    ev.preventDefault();
+  });
+  root.addEventListener("pointermove", (ev) => {
+    if (!mode) return;
+    const t = clampT(pxT(ev));
+    if (mode === "l") win[0] = Math.min(t, win[1] - MIN_WIN);
+    else if (mode === "r") win[1] = Math.max(t, win[0] + MIN_WIN);
+    else if (mode === "move") {
+      const dt = t - grabT;
+      const w = winAtGrab[1] - winAtGrab[0];
+      let a = winAtGrab[0] + dt;
+      a = Math.min(Math.max(a, tFrom), tTo - w);
+      win = [a, a + w];
+    } else if (mode === "new") {
+      win = grabT < t ? [grabT, t] : [t, grabT];
+    }
+    draw();
+  });
+  root.addEventListener("pointerup", () => {
+    if (!mode) return;
+    if (mode === "new" && win && win[1] - win[0] < MIN_WIN) win = null; // a click clears
+    mode = null;
+    draw();
+    opts.onChange(win ? [...win] : null);
+  });
+
+  box.append(root);
+}
+
 function chartCard(title, sub) {
   const box = el("div", { class: "chart-box" });
   const card = el("div", { class: "chart-card" },
@@ -667,45 +765,33 @@ async function viewSessionDetail(root, id) {
   const pilot = chartCard("Pilot & proximity", "J1772 handshake signals — flaky values here often precede charging errors");
   const relay = chartCard("Relay voltages", "Contactor coil drive");
   const eventsWrap = el("div", {});
+  const brush = chartCard("Time window",
+    "Drag across the strip to zoom every chart and the event list into that window — drag the edges to resize, the middle to pan, click once to reset");
+  const brushInfo = el("div", { class: "note" });
+  brush.card.append(brushInfo);
   root.append(
     heading,
     el("div", { class: "filters" }, el("a", { class: "chip", href: "#/sessions" }, "← all sessions")),
     tiles,
+    brush.card,
     power.card, el("div", { class: "grid-2" }, cur.card, volt.card), temp.card,
     el("div", { class: "grid-2" }, pilot.card, relay.card),
     el("h2", {}, "Events during this session"),
     eventsWrap);
 
   let ongoing = false;
+  // Time-window state: win = [t0, t1] or null (full session). Windowing is
+  // pure view filtering — nothing is deleted — and a windowed view re-fetches
+  // that range at high resolution for a deeper dive than the whole-session
+  // downsample can show.
+  let win = null;
+  let fullSamples = [];
+  let fullEvents = [];
+  let sessionRange = [0, 1];
+  let winSeq = 0;
+  let winTimer = null;
 
-  async function refresh() {
-    const data = await getJSON(`/api/sessions/${id}`); // fetch completes before any DOM change
-    const s = data.session;
-    ongoing = s.end_ts == null;
-    const now = Date.now() / 1000;
-    const samples = data.samples.map(fromDbRow);
-
-    heading.replaceChildren(`Session #${s.id} `, ongoing ? chipFor("good", "live") : chipFor("muted", "ended"));
-
-    const energyKwh = (s.energy_wh ?? (samples.length ? samples[samples.length - 1].energy : 0) ?? 0) / 1000;
-    const maxP = s.max_power_w ?? Math.max(0, ...samples.map((p) => p.power || 0));
-    // The plug-in time can predate monitoring (derived from the charger's own
-    // session timer); charts still start at the first observed sample.
-    const firstSeen = samples.length ? samples[0].ts : s.start_ts;
-    const backdated = firstSeen - s.start_ts > 120;
-    tiles.replaceChildren(
-      statTile("Plugged in", fmtDT(s.start_ts).slice(11), null,
-        fmtDT(s.start_ts).slice(0, 10) + (backdated ? ` — from charger's timer; monitoring since ${fmtT(firstSeen)}` : "")),
-      ongoing
-        ? statTile("Status", "Plugged in", null, "session in progress")
-        : statTile("Unplugged", fmtDT(s.end_ts).slice(11), null, fmtDT(s.end_ts).slice(0, 10)),
-      statTile("Duration", fmtDur((ongoing ? now : s.end_ts) - s.start_ts), null,
-        s.charging_s != null ? `charging ${fmtDur(s.charging_s)}` : "charging time totals when the session ends"),
-      statTile("Energy", fmtNum(energyKwh, 2), "kWh"),
-      statTile("Peak power", fmtNum(maxP / 1000, 2), "kW", s.avg_power_w != null ? `avg ${fmtNum(s.avg_power_w / 1000, 2)} kW` : null),
-      statTile("Samples", fmtNum(s.sample_count ?? samples.length, 0), null, "full fidelity retained"));
-
-    const xFrom = backdated ? firstSeen : s.start_ts, xTo = ongoing ? now : s.end_ts;
+  function renderCharts(samples, xFrom, xTo) {
     lineChart(power.box, {
       series: [{ name: "Power (W)", color: C.s1, points: samples.map((p) => [p.ts, p.power]) }],
       unit: "W", digits: 0, area: true, zeroBase: true, xFrom, xTo, height: 240,
@@ -744,8 +830,81 @@ async function viewSessionDetail(root, id) {
         { name: "Relay K2", color: C.s2, points: samples.map((p) => [p.ts, p.relayK2]) },
       ], unit: "V", digits: 1, zeroBase: true, xFrom, xTo, height: 190,
     });
+  }
 
-    eventsWrap.replaceChildren(eventsTable(data.events));
+  function renderEvents() {
+    const evs = win ? fullEvents.filter((e) => e.ts >= win[0] && e.ts <= win[1]) : fullEvents;
+    eventsWrap.replaceChildren(eventsTable(evs));
+  }
+
+  function updateBrushInfo() {
+    brushInfo.textContent = win
+      ? `Window: ${fmtDT(win[0])} → ${fmtT(win[1])} (${fmtDur(win[1] - win[0])}) — full-resolution data for this range`
+      : "Showing the full session";
+  }
+
+  function renderBrush() {
+    timeBrush(brush.box, { samples: fullSamples, range: sessionRange, win, onChange: onBrushChange });
+    updateBrushInfo();
+  }
+
+  async function applyWindow() {
+    const seq = ++winSeq;
+    if (!win) {
+      renderCharts(fullSamples, sessionRange[0], sessionRange[1]);
+      renderEvents();
+      return;
+    }
+    // Immediate feedback from data already in hand…
+    renderCharts(fullSamples.filter((p) => p.ts >= win[0] && p.ts <= win[1]), win[0], win[1]);
+    renderEvents();
+    // …then upgrade to full-resolution samples for the window.
+    try {
+      const d = await getJSON(`/api/vitals?from=${win[0]}&to=${win[1]}&points=1500`);
+      if (seq !== winSeq || !win) return;
+      renderCharts(d.samples.map(fromDbRow), win[0], win[1]);
+    } catch { /* keep the client-filtered render */ }
+  }
+
+  function onBrushChange(w) {
+    win = w;
+    updateBrushInfo();
+    clearTimeout(winTimer);
+    winTimer = setTimeout(applyWindow, 200);
+  }
+
+  async function refresh() {
+    const data = await getJSON(`/api/sessions/${id}`); // fetch completes before any DOM change
+    const s = data.session;
+    ongoing = s.end_ts == null;
+    const now = Date.now() / 1000;
+    const samples = data.samples.map(fromDbRow);
+
+    heading.replaceChildren(`Session #${s.id} `, ongoing ? chipFor("good", "live") : chipFor("muted", "ended"));
+
+    const energyKwh = (s.energy_wh ?? (samples.length ? samples[samples.length - 1].energy : 0) ?? 0) / 1000;
+    const maxP = s.max_power_w ?? Math.max(0, ...samples.map((p) => p.power || 0));
+    // The plug-in time can predate monitoring (derived from the charger's own
+    // session timer); charts still start at the first observed sample.
+    const firstSeen = samples.length ? samples[0].ts : s.start_ts;
+    const backdated = firstSeen - s.start_ts > 120;
+    tiles.replaceChildren(
+      statTile("Plugged in", fmtDT(s.start_ts).slice(11), null,
+        fmtDT(s.start_ts).slice(0, 10) + (backdated ? ` — from charger's timer; monitoring since ${fmtT(firstSeen)}` : "")),
+      ongoing
+        ? statTile("Status", "Plugged in", null, "session in progress")
+        : statTile("Unplugged", fmtDT(s.end_ts).slice(11), null, fmtDT(s.end_ts).slice(0, 10)),
+      statTile("Duration", fmtDur((ongoing ? now : s.end_ts) - s.start_ts), null,
+        s.charging_s != null ? `charging ${fmtDur(s.charging_s)}` : "charging time totals when the session ends"),
+      statTile("Energy", fmtNum(energyKwh, 2), "kWh"),
+      statTile("Peak power", fmtNum(maxP / 1000, 2), "kW", s.avg_power_w != null ? `avg ${fmtNum(s.avg_power_w / 1000, 2)} kW` : null),
+      statTile("Samples", fmtNum(s.sample_count ?? samples.length, 0), null, "full fidelity retained"));
+
+    fullSamples = samples;
+    fullEvents = data.events;
+    sessionRange = [backdated ? firstSeen : s.start_ts, ongoing ? now : s.end_ts];
+    renderBrush();
+    await applyWindow();
   }
 
   await refresh();
