@@ -142,10 +142,12 @@ async def test_web_api(db):
         res = await client.get("/")
         assert res.status == 200
         assert "Wall Connector Monitor" in await res.text()
+        assert res.headers.get("Cache-Control") == "no-cache"
 
         for name in ("app.js", "style.css"):
             res = await client.get(f"/static/{name}")
             assert res.status == 200
+            assert res.headers.get("Cache-Control") == "no-cache"
 
         status = await (await client.get("/api/status")).json()
         assert status["vitals"]["total_power_w"] == 11040.0
