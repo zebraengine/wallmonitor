@@ -656,94 +656,111 @@ async function viewEnergy(root, rangeKey = "30d") {
 
 async function viewSessionDetail(root, id) {
   const C = COLORS();
-  const data = await getJSON(`/api/sessions/${id}`);
-  const s = data.session;
-  const ongoing = s.end_ts == null;
-  const now = Date.now() / 1000;
-  const samples = data.samples.map(fromDbRow);
-
-  root.append(el("h2", {}, `Session #${s.id} `, ongoing ? chipFor("good", "live") : chipFor("muted", "ended")));
-  root.append(el("div", { class: "filters" },
-    el("a", { class: "chip", href: "#/sessions" }, "← all sessions")));
-
-  const energyKwh = (s.energy_wh ?? (samples.length ? samples[samples.length - 1].energy : 0) ?? 0) / 1000;
-  const maxP = s.max_power_w ?? Math.max(0, ...samples.map((p) => p.power || 0));
-  // The plug-in time can predate monitoring (derived from the charger's own
-  // session timer); charts still start at the first observed sample.
-  const firstSeen = samples.length ? samples[0].ts : s.start_ts;
-  const backdated = firstSeen - s.start_ts > 120;
-  root.append(el("div", { class: "cards" },
-    statTile("Plugged in", fmtDT(s.start_ts).slice(11), null,
-      fmtDT(s.start_ts).slice(0, 10) + (backdated ? ` — from charger's timer; monitoring since ${fmtT(firstSeen)}` : "")),
-    ongoing
-      ? statTile("Status", "Plugged in", null, "session in progress")
-      : statTile("Unplugged", fmtDT(s.end_ts).slice(11), null, fmtDT(s.end_ts).slice(0, 10)),
-    statTile("Duration", fmtDur((ongoing ? now : s.end_ts) - s.start_ts), null,
-      s.charging_s != null ? `charging ${fmtDur(s.charging_s)}` : "charging time totals when the session ends"),
-    statTile("Energy", fmtNum(energyKwh, 2), "kWh"),
-    statTile("Peak power", fmtNum(maxP / 1000, 2), "kW", s.avg_power_w != null ? `avg ${fmtNum(s.avg_power_w / 1000, 2)} kW` : null),
-    statTile("Samples", fmtNum(s.sample_count ?? samples.length, 0), null, "full fidelity retained")));
-
+  // The skeleton is built once; live refreshes fetch first and then update
+  // content in place, so the page never blanks or flashes mid-update.
+  const heading = el("h2", {}, `Session #${id}`);
+  const tiles = el("div", { class: "cards" });
   const power = chartCard("Power", "Total power over the session");
   const cur = chartCard("Phase currents", "Per-phase current");
   const volt = chartCard("Phase voltages", "Per-phase voltage");
   const temp = chartCard("Temperatures", "Plug handle, charger circuit board (PCBA), and processor (MCU)");
   const pilot = chartCard("Pilot & proximity", "J1772 handshake signals — flaky values here often precede charging errors");
   const relay = chartCard("Relay voltages", "Contactor coil drive");
-  root.append(power.card, el("div", { class: "grid-2" }, cur.card, volt.card), temp.card,
-    el("div", { class: "grid-2" }, pilot.card, relay.card));
+  const eventsWrap = el("div", {});
+  root.append(
+    heading,
+    el("div", { class: "filters" }, el("a", { class: "chip", href: "#/sessions" }, "← all sessions")),
+    tiles,
+    power.card, el("div", { class: "grid-2" }, cur.card, volt.card), temp.card,
+    el("div", { class: "grid-2" }, pilot.card, relay.card),
+    el("h2", {}, "Events during this session"),
+    eventsWrap);
 
-  const xFrom = backdated ? firstSeen : s.start_ts, xTo = ongoing ? now : s.end_ts;
-  lineChart(power.box, {
-    series: [{ name: "Power (W)", color: C.s1, points: samples.map((p) => [p.ts, p.power]) }],
-    unit: "W", digits: 0, area: true, zeroBase: true, xFrom, xTo, height: 240,
-  });
-  lineChart(cur.box, {
-    series: [
-      { name: "Phase A", color: C.s1, points: samples.map((p) => [p.ts, p.ia]) },
-      { name: "Phase B", color: C.s2, points: samples.map((p) => [p.ts, p.ib]) },
-      { name: "Phase C", color: C.s3, points: samples.map((p) => [p.ts, p.ic]) },
-    ], unit: "A", digits: 1, zeroBase: true, xFrom, xTo, height: 190,
-  });
-  lineChart(volt.box, {
-    series: [
-      { name: "Phase A", color: C.s1, points: samples.map((p) => [p.ts, p.va]) },
-      { name: "Phase B", color: C.s2, points: samples.map((p) => [p.ts, p.vb]) },
-      { name: "Phase C", color: C.s3, points: samples.map((p) => [p.ts, p.vc]) },
-    ], unit: "V", digits: 1, xFrom, xTo, height: 190,
-  });
-  lineChart(temp.box, {
-    series: [
-      { name: "Circuit board (PCBA)", color: C.s1, points: samples.map((p) => [p.ts, p.tPcba]) },
-      { name: "Plug handle", color: C.s2, points: samples.map((p) => [p.ts, p.tHandle]) },
-      { name: "Processor (MCU)", color: C.s3, points: samples.map((p) => [p.ts, p.tMcu]) },
-    ], unit: "°C", digits: 1, xFrom, xTo, height: 190,
-  });
-  lineChart(pilot.box, {
-    series: [
-      { name: "Pilot high", color: C.s1, points: samples.map((p) => [p.ts, p.pilotHigh]) },
-      { name: "Pilot low", color: C.s2, points: samples.map((p) => [p.ts, p.pilotLow]) },
-      { name: "Proximity", color: C.s3, points: samples.map((p) => [p.ts, p.prox]) },
-    ], unit: "V", digits: 1, xFrom, xTo, height: 190,
-  });
-  lineChart(relay.box, {
-    series: [
-      { name: "Relay K1", color: C.s1, points: samples.map((p) => [p.ts, p.relayK1]) },
-      { name: "Relay K2", color: C.s2, points: samples.map((p) => [p.ts, p.relayK2]) },
-    ], unit: "V", digits: 1, zeroBase: true, xFrom, xTo, height: 190,
-  });
+  let ongoing = false;
 
-  root.append(el("h2", {}, "Events during this session"));
-  root.append(eventsTable(data.events));
+  async function refresh() {
+    const data = await getJSON(`/api/sessions/${id}`); // fetch completes before any DOM change
+    const s = data.session;
+    ongoing = s.end_ts == null;
+    const now = Date.now() / 1000;
+    const samples = data.samples.map(fromDbRow);
+
+    heading.replaceChildren(`Session #${s.id} `, ongoing ? chipFor("good", "live") : chipFor("muted", "ended"));
+
+    const energyKwh = (s.energy_wh ?? (samples.length ? samples[samples.length - 1].energy : 0) ?? 0) / 1000;
+    const maxP = s.max_power_w ?? Math.max(0, ...samples.map((p) => p.power || 0));
+    // The plug-in time can predate monitoring (derived from the charger's own
+    // session timer); charts still start at the first observed sample.
+    const firstSeen = samples.length ? samples[0].ts : s.start_ts;
+    const backdated = firstSeen - s.start_ts > 120;
+    tiles.replaceChildren(
+      statTile("Plugged in", fmtDT(s.start_ts).slice(11), null,
+        fmtDT(s.start_ts).slice(0, 10) + (backdated ? ` — from charger's timer; monitoring since ${fmtT(firstSeen)}` : "")),
+      ongoing
+        ? statTile("Status", "Plugged in", null, "session in progress")
+        : statTile("Unplugged", fmtDT(s.end_ts).slice(11), null, fmtDT(s.end_ts).slice(0, 10)),
+      statTile("Duration", fmtDur((ongoing ? now : s.end_ts) - s.start_ts), null,
+        s.charging_s != null ? `charging ${fmtDur(s.charging_s)}` : "charging time totals when the session ends"),
+      statTile("Energy", fmtNum(energyKwh, 2), "kWh"),
+      statTile("Peak power", fmtNum(maxP / 1000, 2), "kW", s.avg_power_w != null ? `avg ${fmtNum(s.avg_power_w / 1000, 2)} kW` : null),
+      statTile("Samples", fmtNum(s.sample_count ?? samples.length, 0), null, "full fidelity retained"));
+
+    const xFrom = backdated ? firstSeen : s.start_ts, xTo = ongoing ? now : s.end_ts;
+    lineChart(power.box, {
+      series: [{ name: "Power (W)", color: C.s1, points: samples.map((p) => [p.ts, p.power]) }],
+      unit: "W", digits: 0, area: true, zeroBase: true, xFrom, xTo, height: 240,
+    });
+    lineChart(cur.box, {
+      series: [
+        { name: "Phase A", color: C.s1, points: samples.map((p) => [p.ts, p.ia]) },
+        { name: "Phase B", color: C.s2, points: samples.map((p) => [p.ts, p.ib]) },
+        { name: "Phase C", color: C.s3, points: samples.map((p) => [p.ts, p.ic]) },
+      ], unit: "A", digits: 1, zeroBase: true, xFrom, xTo, height: 190,
+    });
+    lineChart(volt.box, {
+      series: [
+        { name: "Phase A", color: C.s1, points: samples.map((p) => [p.ts, p.va]) },
+        { name: "Phase B", color: C.s2, points: samples.map((p) => [p.ts, p.vb]) },
+        { name: "Phase C", color: C.s3, points: samples.map((p) => [p.ts, p.vc]) },
+      ], unit: "V", digits: 1, xFrom, xTo, height: 190,
+    });
+    lineChart(temp.box, {
+      series: [
+        { name: "Circuit board (PCBA)", color: C.s1, points: samples.map((p) => [p.ts, p.tPcba]) },
+        { name: "Plug handle", color: C.s2, points: samples.map((p) => [p.ts, p.tHandle]) },
+        { name: "Processor (MCU)", color: C.s3, points: samples.map((p) => [p.ts, p.tMcu]) },
+      ], unit: "°C", digits: 1, xFrom, xTo, height: 190,
+    });
+    lineChart(pilot.box, {
+      series: [
+        { name: "Pilot high", color: C.s1, points: samples.map((p) => [p.ts, p.pilotHigh]) },
+        { name: "Pilot low", color: C.s2, points: samples.map((p) => [p.ts, p.pilotLow]) },
+        { name: "Proximity", color: C.s3, points: samples.map((p) => [p.ts, p.prox]) },
+      ], unit: "V", digits: 1, xFrom, xTo, height: 190,
+    });
+    lineChart(relay.box, {
+      series: [
+        { name: "Relay K1", color: C.s1, points: samples.map((p) => [p.ts, p.relayK1]) },
+        { name: "Relay K2", color: C.s2, points: samples.map((p) => [p.ts, p.relayK2]) },
+      ], unit: "V", digits: 1, zeroBase: true, xFrom, xTo, height: 190,
+    });
+
+    eventsWrap.replaceChildren(eventsTable(data.events));
+  }
+
+  await refresh();
 
   if (ongoing) {
-    const onMsg = (msg) => { if (msg.type === "vitals" || msg.type === "event") render("session", id); };
-    // Re-render at most every 5s while live.
+    // Refresh in place at most every 5s while live; stop once the session ends.
     let timer = null;
     const throttled = (msg) => {
       if (msg.type !== "vitals" && msg.type !== "event") return;
       if (timer) return;
-      timer = setTimeout(() => { timer = null; render("session", id); }, 5000);
+      timer = setTimeout(async () => {
+        timer = null;
+        try { await refresh(); } catch { /* transient fetch failure; next tick retries */ }
+        if (!ongoing) { live.listeners.delete(throttled); }
+      }, 5000);
     };
     live.listeners.add(throttled);
     return () => { live.listeners.delete(throttled); if (timer) clearTimeout(timer); };
