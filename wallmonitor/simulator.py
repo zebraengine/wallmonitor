@@ -82,7 +82,8 @@ class SimState:
             session_energy = 3 * 230.0 * 14.0 * (CYCLE[2][1] / 3600.0)
         alerts = []
         if cycle_n >= self.alert_after_cycles and name == "charging" and 60 < into < 120:
-            alerts = ["Alert_ThermalFoldback"]
+            # Real firmware reports numeric alert IDs (e.g. [27]).
+            alerts = [27]
         evse_state = {"idle": 1, "connected": 4, "charging": 9, "complete": 11}[name]
         handle_temp = 20.0 + (12.0 * min(1.0, into / 120.0) if charging else 0.0) + rng.uniform(-0.3, 0.3)
         data = {

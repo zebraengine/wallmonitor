@@ -1,0 +1,63 @@
+{
+  "_about": [
+    "Decoding data for Wall Connector Gen 3 alerts as reported by the local API's",
+    "current_alerts field. Tesla does not document these codes; on modern firmware",
+    "they are numeric IDs (e.g. [27]). Entries here must be VERIFIED before they",
+    "are labeled: the reliable method is to open the Tesla app while an alert is",
+    "active on your charger — the app names active alerts — and record the code",
+    "the local API showed at the same moment. Unverified guesses do not belong in",
+    "this file; a wrong label is worse than a raw number.",
+    "Each code entry: {label, description, source, verified}."
+  ],
+  "codes": {},
+  "categories": [
+    {
+      "led": "Solid red",
+      "label": "Internal error",
+      "description": "Charging disabled. Power-cycle the breaker for 5 seconds; contact Tesla if it persists.",
+      "source": "Tesla Gen 3 Wall Connector manual, Error Codes"
+    },
+    {
+      "led": "1 red blink",
+      "label": "Ground fault (earth fault circuit interruption)",
+      "description": "Unsafe current path detected; charging disabled. Inspect handle, cable, connector, and vehicle charge port for damage or water ingress.",
+      "source": "Tesla Gen 3 Wall Connector manual, Error Codes"
+    },
+    {
+      "led": "2 red blinks",
+      "label": "Earth assurance fault",
+      "description": "High ground resistance detected; charging disabled. Verify the ground connection and physical connections in the supply.",
+      "source": "Tesla Gen 3 Wall Connector manual, Error Codes"
+    },
+    {
+      "led": "3 red blinks",
+      "label": "High temperature",
+      "description": "Charging limited or disabled due to heat. Check the faceplate and cable handle for excessive warmth; verify conductor sizing and terminal torque.",
+      "source": "Tesla Gen 3 Wall Connector manual, Error Codes"
+    },
+    {
+      "led": "4 red blinks",
+      "label": "Internet connection lost",
+      "description": "Online features disabled; charging still works. Check Wi-Fi signal and router; update Wi-Fi settings if credentials changed.",
+      "source": "Tesla Gen 3 Wall Connector manual, Error Codes"
+    },
+    {
+      "led": "5 red blinks",
+      "label": "Power-sharing communication issue",
+      "description": "Charging reduced. Re-link power-sharing Wall Connectors via the commissioning process.",
+      "source": "Tesla Gen 3 Wall Connector manual, Error Codes"
+    },
+    {
+      "led": "6 red blinks",
+      "label": "Overvoltage / poor grid quality",
+      "description": "Charging disabled. Verify supply voltage; have an electrician check terminal readings.",
+      "source": "Tesla Gen 3 Wall Connector manual, Error Codes"
+    },
+    {
+      "led": "7 red blinks",
+      "label": "Vehicle overcurrent",
+      "description": "The vehicle drew more current than allowed. Reduce the vehicle's charge current setting.",
+      "source": "Tesla Gen 3 Wall Connector manual, Error Codes"
+    }
+  ]
+}

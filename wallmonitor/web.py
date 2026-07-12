@@ -49,6 +49,10 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
         ctype = "application/javascript" if name.endswith(".js") else "text/css"
         return web.Response(text=content, content_type=ctype, headers=no_cache)
 
+    async def api_alert_codes(_request: web.Request) -> web.Response:
+        data = resources.files("wallmonitor").joinpath("alert_codes.json").read_text()
+        return web.Response(text=data, content_type="application/json", headers=no_cache)
+
     async def api_status(_request: web.Request) -> web.Response:
         now = time.time()
         latest = await asyncio.to_thread(db.latest_vitals)
@@ -163,6 +167,7 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
 
     app.router.add_get("/", index)
     app.router.add_get("/static/{name}", static_file)
+    app.router.add_get("/api/alert-codes", api_alert_codes)
     app.router.add_get("/api/status", api_status)
     app.router.add_get("/api/vitals", api_vitals)
     app.router.add_get("/api/wifi", api_wifi)

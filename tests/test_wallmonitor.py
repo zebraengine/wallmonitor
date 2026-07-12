@@ -260,6 +260,34 @@ async def test_lifetime_api_and_diag_fields(db):
         await client.close()
 
 
+async def test_device_alert_decoding_pipeline(db):
+    # Jump the simulator to cycle 2, ~70s into charging, where it raises alert [27].
+    sim_runner, port = await start_simulator(speedup=60.0, start=time.time() - 480.0 / 60.0)
+    cfg = Config(host=f"127.0.0.1:{port}", vitals_interval_active=0.05, vitals_interval_idle=0.05, min_interval=0.01)
+    async with aiohttp.ClientSession() as client:
+        poller = Poller(cfg, db, EventBus(), client)
+        await poller.start()
+        try:
+            await _wait_for(lambda: [a for a in db.active_alerts() if a["source"] == "device"] or None, timeout=15.0)
+        finally:
+            await poller.stop()
+        await sim_runner.cleanup()
+    device_alerts = [a for a in db.alerts_range(0, time.time() + 1) if a["source"] == "device"]
+    assert device_alerts and device_alerts[0]["alert"] == "27"
+
+    app = make_app(db, EventBus(), None)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        res = await client.get("/api/alert-codes")
+        assert res.status == 200
+        body = await res.json()
+        assert "codes" in body and "categories" in body
+        assert len(body["categories"]) >= 7
+    finally:
+        await client.close()
+
+
 async def test_monitor_gap_event_on_restart(db):
     # Simulate a previous run that stopped long ago, then a restart.
     old = time.time() - 3600
