@@ -124,6 +124,12 @@ function alertDisplay(alertStr, source) {
 // 255 (0xFF) is the device's "sensor read invalid" sentinel for temperatures.
 const realTemp = (v) => (v != null && v >= 255 ? null : v);
 
+// Community-observed (not Tesla-published) circuit-board temperature at which
+// the Gen 3 begins throttling charge current. Shown as a reference line so
+// headroom is visible; ambient-driven foldback in hot installs is the usual
+// cause of a real event. See the Alerts page notes.
+const PCBA_THROTTLE_C = 95;
+
 function fromDbRow(r) {
   return {
     ts: r.ts, power: r.total_power_w, maxPower: r.max_power_w,
@@ -212,6 +218,13 @@ function lineChart(box, opts) {
   let yMin = Math.min(...allPts.map((p) => p[1]));
   let yMax = Math.max(...allPts.map((p) => p[1]));
   if (opts.zeroBase) yMin = Math.min(0, yMin);
+  // Reference lines (e.g. a thermal-foldback threshold) are drawn in-frame so
+  // the headroom between the live value and the limit is visible at a glance.
+  const refLines = opts.refLines || [];
+  for (const r of refLines) {
+    if (r.value > yMax) yMax = r.value;
+    if (r.value < yMin) yMin = r.value;
+  }
   const yt = niceTicks(yMin, yMax, 4);
   const X = (t) => M.l + ((t - xFrom) / spanS) * pw;
   const Y = (v) => M.t + ph - ((v - yt.min) / (yt.max - yt.min || 1)) * ph;
@@ -248,6 +261,21 @@ function lineChart(box, opts) {
       root.append(svg("path", { d: areaD, fill: s.color, "fill-opacity": 0.1, stroke: "none" }));
     }
     root.append(svg("path", { d, fill: "none", stroke: s.color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+  }
+
+  // Reference/threshold lines sit above the data, below the crosshair: a thin
+  // warning-toned solid line with a right-anchored label.
+  for (const r of refLines) {
+    const y = Y(r.value);
+    if (y < M.t || y > M.t + ph) continue;
+    root.append(svg("line", {
+      x1: M.l, x2: width - M.r, y1: y, y2: y,
+      stroke: "var(--status-warning)", "stroke-width": 1, "stroke-opacity": 0.7,
+    }));
+    const rl = svg("text", { x: width - M.r, y: y - 4, "text-anchor": "end", class: "axis-text" });
+    rl.textContent = r.label;
+    rl.setAttribute("fill", "var(--status-warning)");
+    root.append(rl);
   }
 
   const cross = svg("line", { x1: 0, x2: 0, y1: M.t, y2: M.t + ph, stroke: "var(--baseline)", "stroke-width": 1, visibility: "hidden" });
@@ -795,7 +823,9 @@ async function viewSessionDetail(root, id) {
   const power = chartCard("Power", "Total power over the session");
   const cur = chartCard("Phase currents", "Per-phase current");
   const volt = chartCard("Phase voltages", "Per-phase voltage");
-  const temp = chartCard("Temperatures", "Plug handle, charger circuit board (PCBA), and processor (MCU)");
+  const temp = chartCard("Temperatures",
+    `Plug handle, charger circuit board (PCBA), and processor (MCU). The ≈${PCBA_THROTTLE_C}°C line marks the ` +
+    "community-observed PCBA throttle point (Tesla doesn't publish exact thresholds); ambient-driven foldback in hot installs is the usual real cause.");
   const pilot = chartCard("Pilot & proximity", "J1772 handshake signals — flaky values here often precede charging errors");
   const relay = chartCard("Relay voltages", "Contactor coil drive");
   const eventsWrap = el("div", {});
@@ -850,6 +880,7 @@ async function viewSessionDetail(root, id) {
         { name: "Plug handle", color: C.s2, points: samples.map((p) => [p.ts, p.tHandle]) },
         { name: "Processor (MCU)", color: C.s3, points: samples.map((p) => [p.ts, p.tMcu]) },
       ], unit: "°C", digits: 1, xFrom, xTo, height: 190,
+      refLines: [{ value: PCBA_THROTTLE_C, label: `≈${PCBA_THROTTLE_C}°C PCBA throttle (approx.)` }],
     });
     lineChart(pilot.box, {
       series: [
