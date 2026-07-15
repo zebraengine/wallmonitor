@@ -284,6 +284,11 @@ async def test_device_alert_decoding_pipeline(db):
         body = await res.json()
         assert "codes" in body and "categories" in body
         assert len(body["categories"]) >= 7
+        # Code 40 was confirmed in the Tesla app against an active alert:
+        # "High temperature detected; charging is limited".
+        code40 = body["codes"]["40"]
+        assert code40["verified"] is True
+        assert "temperature" in code40["label"].lower()
     finally:
         await client.close()
 

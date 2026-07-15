@@ -9,7 +9,14 @@
     "this file; a wrong label is worse than a raw number.",
     "Each code entry: {label, description, source, verified}."
   ],
-  "codes": {},
+  "codes": {
+    "40": {
+      "label": "High temperature detected",
+      "description": "High temperature detected; charging is limited. The charger reduces current until it cools. Check the faceplate and cable handle for excessive warmth and rule out wiring issues (conductor sizing, terminal torque); in a hot garage this can simply be ambient heat, and it clears on its own once temperatures drop.",
+      "source": "Tesla app > Wall Connector Troubleshooting, confirmed against an active alert on 2026-07-14 (matches the manual's 'High temperature' fault category)",
+      "verified": true
+    }
+  },
   "categories": [
     {
       "led": "Solid red",
