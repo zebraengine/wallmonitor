@@ -99,7 +99,15 @@ def _fit_exponential(points: list[tuple[float, float]]) -> tuple[float, float, f
 
 
 def _steady_current_prefix(samples: list[dict]) -> list[dict]:
-    """Longest prefix of charging samples whose current stays near its median."""
+    """The session's first steady-current run.
+
+    The reference current is the median of the first 10 minutes of charging,
+    not of the whole session: a session that derates midway spends most of
+    its samples at the reduced current, and a whole-session median would put
+    the initial full-rate ramp — the part with the thermal signal — outside
+    the band. Leading samples still ramping up to the plateau are skipped
+    rather than treated as the end of the run.
+    """
     charging = [
         s
         for s in samples
@@ -107,14 +115,17 @@ def _steady_current_prefix(samples: list[dict]) -> list[dict]:
     ]
     if not charging:
         return []
-    i_med = median(s["vehicle_current_a"] for s in charging)
-    band = max(2.0, 0.1 * i_med)
+    t0 = charging[0]["ts"]
+    i_ref = median(s["vehicle_current_a"] for s in charging if s["ts"] - t0 <= 600)
+    band = max(2.0, 0.1 * i_ref)
     prefix: list[dict] = []
     for s in charging:
-        if abs(s["vehicle_current_a"] - i_med) > band:
-            break
+        if abs(s["vehicle_current_a"] - i_ref) > band:
+            if prefix:
+                break  # the steady run ended (derate or charge stop)
+            continue  # still ramping up to the plateau
         prefix.append(s)
-        if s["ts"] - charging[0]["ts"] > 1800:  # first 30 min is where the ramp lives
+        if s["ts"] - prefix[0]["ts"] > 1800:  # first 30 min is where the ramp lives
             break
     return prefix
 
@@ -134,18 +145,22 @@ def _ambient_before(db: Database, start_ts: float) -> float | None:
     return median(idle) - IDLE_OFFSET_C
 
 
-def fit_history(db: Database, now: float, lookback_days: float = 120.0) -> ThermalParams:
-    """Fit tau and rise_ref from recorded sessions; defaults where data is thin."""
+def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list[dict]:
+    """Per-session fits, oldest first: one dict per session whose charging
+    ramp passed the quality gates. rise_ref_c is None when there was no
+    stable pre-session idle to estimate ambient from."""
     sessions = [
         s
         for s in db.sessions_range(now - lookback_days * 86400, now)
         if s.get("end_ts") and (s.get("charging_s") or 0) >= MIN_SEGMENT_S
     ][:40]
-    taus: list[float] = []
-    rises: list[float] = []
-    rmses: list[float] = []
+    fits: list[dict] = []
     for sess in sessions:
-        samples = db.vitals_range(sess["start_ts"] - 1, sess["end_ts"] + 1, 5000)
+        # Only the first ~45 min matters (the ramp), and the narrow window
+        # keeps a multi-hour session under the bucket-averaging threshold so
+        # the fit sees raw-resolution samples.
+        t_hi = min(sess["end_ts"], sess["start_ts"] + 2700)
+        samples = db.vitals_range(sess["start_ts"] - 1, t_hi + 1, 5000)
         prefix = _steady_current_prefix(samples)
         seg = [(s["ts"], s["handle_temp_c"]) for s in prefix if s.get("handle_temp_c") is not None]
         if len(seg) < MIN_SEGMENT_SAMPLES or seg[-1][0] - seg[0][0] < MIN_SEGMENT_S:
@@ -158,14 +173,35 @@ def fit_history(db: Database, now: float, lookback_days: float = 120.0) -> Therm
         tau_s, t_inf, rmse = fit
         if rmse > MAX_FIT_RMSE_C or t_inf <= seg[0][1] + 3.0:
             continue
-        taus.append(tau_s / 60.0)
-        rmses.append(rmse)
+        i_med = median(s["vehicle_current_a"] for s in prefix)
         ambient = _ambient_before(db, sess["start_ts"])
+        rise = None
         if ambient is not None:
-            i_med = median(s["vehicle_current_a"] for s in prefix)
             rise = (t_inf - ambient) * (REF_CURRENT_A / i_med) ** 2
-            if RISE_RANGE_C[0] <= rise <= RISE_RANGE_C[1]:
-                rises.append(rise)
+            if not (RISE_RANGE_C[0] <= rise <= RISE_RANGE_C[1]):
+                rise = None
+        fits.append(
+            {
+                "session_id": sess["id"],
+                "start_ts": sess["start_ts"],
+                "tau_min": round(tau_s / 60.0, 2),
+                "rise_ref_c": round(rise, 2) if rise is not None else None,
+                "rmse_c": round(rmse, 3),
+                "current_a": round(i_med, 1),
+            }
+        )
+    fits.sort(key=lambda f: f["start_ts"])
+    return fits
+
+
+def fit_history(db: Database, now: float, lookback_days: float = 120.0,
+                fits: list[dict] | None = None) -> ThermalParams:
+    """Aggregate per-session fits into model parameters; defaults where thin."""
+    if fits is None:
+        fits = fit_sessions(db, now, lookback_days)
+    taus = [f["tau_min"] for f in fits]
+    rises = [f["rise_ref_c"] for f in fits if f["rise_ref_c"] is not None]
+    rmses = [f["rmse_c"] for f in fits]
     return ThermalParams(
         tau_min=median(taus) if taus else DEFAULT_TAU_MIN,
         rise_ref_c=median(rises) if rises else DEFAULT_RISE_REF_C,
@@ -173,6 +209,46 @@ def fit_history(db: Database, now: float, lookback_days: float = 120.0) -> Therm
         rise_fits=len(rises),
         fit_rmse_c=median(rmses) if rmses else None,
     )
+
+
+# ---------------- degradation watch ----------------
+
+# A loose lug or degrading contact shows up as extra resistance: more heat
+# rise for the same current. Prediction alone hides that (the rolling median
+# just follows it), so the drift watch compares recent sessions against the
+# earlier baseline and flags a sustained increase.
+DRIFT_RECENT_N = 3
+DRIFT_MIN_BASELINE_N = 3
+DRIFT_WARN_C = 2.5
+DRIFT_ALERT = "Handle heat rise increasing (check connector/wiring)"
+
+
+def detect_drift(fits: list[dict]) -> dict | None:
+    """Compare the last few sessions' fitted rise against the baseline.
+
+    Returns None while there is too little history to judge; otherwise a
+    verdict dict with the medians compared. Only rise (not tau) is watched:
+    added contact resistance changes how much heat is made, not how fast the
+    handle mass warms.
+    """
+    rises = [(f["start_ts"], f["rise_ref_c"]) for f in fits if f["rise_ref_c"] is not None]
+    rises.sort(key=lambda r: r[0])
+    if len(rises) < DRIFT_RECENT_N + DRIFT_MIN_BASELINE_N:
+        return None
+    recent = [r for _, r in rises[-DRIFT_RECENT_N:]]
+    baseline = [r for _, r in rises[:-DRIFT_RECENT_N]]
+    recent_med = median(recent)
+    baseline_med = median(baseline)
+    delta = recent_med - baseline_med
+    return {
+        "drifting": delta >= DRIFT_WARN_C,
+        "recent_rise_c": round(recent_med, 2),
+        "baseline_rise_c": round(baseline_med, 2),
+        "delta_c": round(delta, 2),
+        "recent_n": len(recent),
+        "baseline_n": len(baseline),
+        "threshold_c": DRIFT_WARN_C,
+    }
 
 
 def _minutes_to_trip(t_now: float, t_inf: float, tau_min: float) -> float | None:

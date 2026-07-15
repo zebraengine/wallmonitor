@@ -30,6 +30,7 @@ from tesla_wall_connector import WallConnector
 from tesla_wall_connector.exceptions import WallConnectorError
 from tesla_wall_connector.wifi_status import WifiStatus
 
+from . import thermal
 from .config import Config
 from .db import Database
 
@@ -266,6 +267,7 @@ class Poller:
             reason = "vehicle_disconnected" if was_connected else "not_connected_on_startup"
             await asyncio.to_thread(self.db.close_session, sid, ts, reason)
             await self._event(ts, "session_end", {"session_id": sid, "reason": reason})
+            await self._check_thermal_drift(ts)
 
         # Contactor transitions (actual charging on/off)
         if prev is not None and bool(raw.get("contactor_closed")) != bool(prev.get("contactor_closed")):
@@ -343,6 +345,28 @@ class Poller:
             )
         if latest is None or json.loads(latest["raw"]) != raw:
             await asyncio.to_thread(self.db.insert_version, ts, raw)
+
+    async def _check_thermal_drift(self, ts: float) -> None:
+        """After a session closes: refit history and raise/clear the
+        degradation alert. Drift only changes when a session completes, so
+        this is the one place it needs evaluating."""
+        try:
+            drift = await asyncio.to_thread(
+                lambda: thermal.detect_drift(thermal.fit_sessions(self.db, ts))
+            )
+        except Exception:
+            log.exception("thermal drift check failed")
+            return
+        if drift is None:
+            return
+        if drift["drifting"]:
+            _, newly = await asyncio.to_thread(self.db.raise_alert, ts, thermal.DRIFT_ALERT, "monitor")
+            if newly:
+                await self._event(ts, "thermal_drift", drift)
+        else:
+            cleared = await asyncio.to_thread(self.db.clear_alert, ts, thermal.DRIFT_ALERT, "monitor")
+            if cleared:
+                await self._event(ts, "thermal_drift_cleared", drift)
 
     async def _event(self, ts: float, kind: str, detail: dict | None) -> None:
         await asyncio.to_thread(self.db.add_event, ts, kind, detail)

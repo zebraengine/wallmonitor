@@ -140,9 +140,9 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
         rows = await asyncio.to_thread(db.events_range, t_from, t_to, kind_list)
         return web.json_response({"events": rows})
 
-    # Model parameters drift only as new sessions land, so the (SQLite-heavy)
+    # Model parameters change only as new sessions land, so the (SQLite-heavy)
     # history fit is cached; the live prediction is computed on every call.
-    thermal_fit: dict = {"params": None, "ts": 0.0}
+    thermal_fit: dict = {"params": None, "fits": [], "ts": 0.0}
 
     async def api_thermal(request: web.Request) -> web.Response:
         now = time.time()
@@ -151,10 +151,19 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
             or now - thermal_fit["ts"] > 6 * 3600
             or "refit" in request.query
         ):
-            thermal_fit["params"] = await asyncio.to_thread(thermal.fit_history, db, now)
+            fits = await asyncio.to_thread(thermal.fit_sessions, db, now)
+            thermal_fit["fits"] = fits
+            thermal_fit["params"] = thermal.fit_history(db, now, fits=fits)
             thermal_fit["ts"] = now
         result = await asyncio.to_thread(thermal.predict, db, now, thermal_fit["params"])
-        return web.json_response({"server_ts": now, **result})
+        return web.json_response(
+            {
+                "server_ts": now,
+                **result,
+                "drift": thermal.detect_drift(thermal_fit["fits"]),
+                "session_fits": thermal_fit["fits"],
+            }
+        )
 
     async def api_stream(request: web.Request) -> web.StreamResponse:
         response = web.StreamResponse(

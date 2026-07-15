@@ -85,6 +85,8 @@ const EVENT_META = {
   monitor_start: ["Monitor started", "muted"],
   monitor_stop: ["Monitor stopped", "muted"],
   monitor_gap: ["Monitoring gap — service was off", "warning"],
+  thermal_drift: ["Handle heat rise increasing vs baseline", "serious"],
+  thermal_drift_cleared: ["Handle heat rise back to baseline", "good"],
 };
 const eventLabel = (k) => (EVENT_META[k] || [k, "muted"])[0];
 const eventSeverity = (k) => (EVENT_META[k] || [k, "muted"])[1];
@@ -751,12 +753,25 @@ async function viewLive(root) {
     } else {
       lines.push("No recent samples to forecast from.");
     }
+    // Degradation watch: same fits, watched over time. Rising heat at the
+    // same current means added resistance somewhere in the current path.
+    const drift = d.drift;
+    let driftLine = null;
+    if (drift && drift.drifting) {
+      driftLine = el("div", { class: "note" },
+        chipFor("serious", "heat rise increasing"),
+        ` Recent sessions average +${fmtNum(drift.recent_rise_c, 1)} °C at ${fmtNum(m.ref_current_a, 0)} A vs a ` +
+        `+${fmtNum(drift.baseline_rise_c, 1)} °C baseline (Δ ${fmtNum(drift.delta_c, 1)} °C). More heat at the same current ` +
+        `means added resistance — inspect the handle and charge-port pins, and have the terminal torque checked.`);
+    }
     const modelNote = `Model: τ ≈ ${fmtNum(m.tau_min, 1)} min, +${fmtNum(m.rise_ref_c, 0)} °C at ${fmtNum(m.ref_current_a, 0)} A — ` +
       (m.fitted ? `fitted from ${m.tau_fits} recorded session ramp${m.tau_fits === 1 ? "" : "s"}.`
-                : "defaults from the verified alert-40 event; refits automatically as sessions accumulate.");
+                : "defaults from the verified alert-40 event; refits automatically as sessions accumulate.") +
+      (drift && !drift.drifting ? ` Heat rise stable across the last ${drift.recent_n + drift.baseline_n} fitted sessions.` : "");
     thermalCard.append(el("div", { class: "chart-card" },
       el("div", { class: "chart-title" }, "Thermal derate forecast", chip ? " " : null, chip),
       ...lines.map((t) => el("div", { class: "note" }, t)),
+      driftLine,
       el("div", { class: "chart-sub" }, modelNote)));
   }
 
@@ -1154,10 +1169,15 @@ async function viewWifi(root, rangeKey = "24h") {
 }
 
 async function viewAlerts(root, rangeKey = "7d") {
+  const C = COLORS();
   const now = Date.now() / 1000;
   const from = now - rangeSeconds(rangeKey);
   root.append(el("h2", {}, "Alerts"));
-  const [data] = await Promise.all([getJSON(`/api/alerts?from=${from}&to=${now}`), loadAlertCodes()]);
+  const [data, th] = await Promise.all([
+    getJSON(`/api/alerts?from=${from}&to=${now}`),
+    getJSON("/api/thermal").catch(() => null),
+    loadAlertCodes(),
+  ]);
 
   const activeWrap = el("div", { class: "cards" });
   if (!data.active.length) {
@@ -1176,6 +1196,30 @@ async function viewAlerts(root, rangeKey = "7d") {
     }
   }
   root.append(activeWrap);
+
+  // Degradation watch: fitted heat rise per session at reference current.
+  // Prediction uses the rolling median, which would silently follow a slow
+  // increase; this trend is where a developing contact/wiring problem shows.
+  const fits = ((th && th.session_fits) || []).filter((f) => f.rise_ref_c != null);
+  if (fits.length >= 2) {
+    const drift = th.drift;
+    const rise = chartCard("Handle heat rise per session",
+      `Fitted steady-state rise above ambient, normalized to ${fmtNum(th.model.ref_current_a, 0)} A. ` +
+      "A sustained climb at the same current means added resistance in the current path — inspect before it becomes heat.");
+    root.append(rise.card);
+    lineChart(rise.box, {
+      series: [{ name: "Rise (°C)", color: C.s1, points: fits.map((f) => [f.start_ts, f.rise_ref_c]) }],
+      unit: "°C", digits: 1, height: 180,
+    });
+    if (drift) {
+      rise.card.append(el("div", { class: "note" },
+        drift.drifting
+          ? `Recent median +${fmtNum(drift.recent_rise_c, 1)} °C vs baseline +${fmtNum(drift.baseline_rise_c, 1)} °C ` +
+            `(Δ ${fmtNum(drift.delta_c, 1)} °C ≥ ${fmtNum(drift.threshold_c, 1)} °C threshold) — a monitor alert is active.`
+          : `Stable: recent median +${fmtNum(drift.recent_rise_c, 1)} °C vs baseline +${fmtNum(drift.baseline_rise_c, 1)} °C ` +
+            `(alert threshold Δ ≥ ${fmtNum(drift.threshold_c, 1)} °C).`));
+    }
+  }
 
   root.append(el("h2", {}, "Alert history"));
   root.append(presetRow(RANGE_PRESETS.slice(2), rangeKey, (k) => render("alerts", k)));
