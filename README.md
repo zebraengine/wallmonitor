@@ -77,7 +77,9 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
   tiles, and downsampled averages — treats ≥255 °C as "no reading" so a
   phantom 255 °C spike (or a poisoned bucket average) never appears.
 - **Recorded event kinds:** session start/end, charging start/stop, EVSE
-  state changes (with community-reported state names), device alerts
+  state changes (states 9/11 named from telemetry verified against contactor
+  and power — the community-reported names for those two are swapped — the
+  rest community-reported), device alerts
   raised/cleared, charger reboots (uptime went backwards), charger
   unreachable/recovered, Wi-Fi disconnect/reconnect, internet lost/restored,
   firmware version changes, and monitor start/stop/gap.
