@@ -58,11 +58,19 @@ const COLORS = () => ({
   s1: CSSVAR("--series-1"), s2: CSSVAR("--series-2"), s3: CSSVAR("--series-3"), s5: CSSVAR("--series-5"),
 });
 
+// Tesla doesn't document evse_state. States 9 and 11 are verified against
+// this monitor's own telemetry on firmware 26.18.0: every state-11 sample
+// carries the charging load (contactor closed, full power) and every state-9
+// sample has the contactor open at ~0 W — the community lists 9 as "Charging"
+// and 11 as "Charging paused", i.e. swapped. The rest remain community-
+// reported and unverified; notably state 8 never appeared even during a real
+// thermal derate (the charger stayed in 11 and signaled via alert 40 only).
 const EVSE_STATES = {
   0: "Booting", 1: "Standby — no vehicle", 2: "Vehicle detected", 3: "Ready",
   4: "Vehicle connected", 5: "Scheduled charging", 6: "Negotiating", 7: "Error",
-  8: "Charging (de-rated)", 9: "Charging", 10: "Charging finished", 11: "Charging paused",
+  8: "Charging (de-rated)", 9: "Connected, not charging", 10: "Charging finished", 11: "Charging",
 };
+const EVSE_VERIFIED = new Set([9, 11]);
 const evseLabel = (v) => v == null ? "—" : `${EVSE_STATES[v] || "State"} (${v})`;
 
 const EVENT_META = {
@@ -658,7 +666,9 @@ async function viewLive(root) {
     }
     evseTile.querySelector(".tile-sub").textContent =
       (notReady && notReady.length ? `not-ready reason codes: ${notReady.join(", ")} — ` : "") +
-      "label is unofficial — Tesla doesn't document these codes; (n) is the charger's raw value";
+      (EVSE_VERIFIED.has(s.evse)
+        ? "label verified from this charger's own telemetry; (n) is the charger's raw value"
+        : "label is community-reported, unverified — Tesla doesn't document these codes; (n) is the charger's raw value");
     if (st.version) {
       tiles.append(statTile("Firmware", "", null, ""));
       const t = tiles.lastChild;
