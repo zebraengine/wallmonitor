@@ -403,6 +403,43 @@ async def test_thermal_predict_idle_forecast(db):
         cool.close()
 
 
+async def test_thermal_drift_detection(db):
+    now = time.time()
+    # Four healthy sessions, then three running hotter at the same current —
+    # the signature of added resistance in the current path.
+    rises = [36.0, 36.5, 35.8, 36.2, 42.0, 41.5, 42.3]
+    for i, rise in enumerate(rises):
+        _seed_thermal_session(db, now - (len(rises) - i) * 7200, ambient_c=25.0, rise_ref_c=rise)
+    fits = thermal.fit_sessions(db, now)
+    assert len(fits) == len(rises)
+    drift = thermal.detect_drift(fits)
+    assert drift is not None and drift["drifting"] is True
+    assert 4.0 < drift["delta_c"] < 8.0
+
+    # Prediction params follow the median (this is why drift needs its own watch).
+    params = thermal.fit_history(db, now, fits=fits)
+    assert params.fitted
+
+    # Too little history: no verdict either way.
+    assert thermal.detect_drift(fits[:4]) is None
+
+
+async def test_thermal_drift_poller_alert(db):
+    now = time.time()
+    rises = [36.0, 36.5, 35.8, 36.2, 42.0, 41.5, 42.3]
+    for i, rise in enumerate(rises):
+        _seed_thermal_session(db, now - (len(rises) - i) * 7200, ambient_c=25.0, rise_ref_c=rise)
+    cfg = Config(host="127.0.0.1:1")
+    bus = EventBus()
+    async with aiohttp.ClientSession() as client:
+        poller = Poller(cfg, db, bus, client)
+        await poller._check_thermal_drift(now)
+    alerts = db.active_alerts()
+    assert any(a["alert"] == thermal.DRIFT_ALERT and a["source"] == "monitor" for a in alerts)
+    events = db.events_range(now - 1, now + 1)
+    assert any(e["kind"] == "thermal_drift" for e in events)
+
+
 async def test_thermal_suggest_max_current():
     params = thermal.ThermalParams()
     assert thermal.suggest_max_current(35.4, params) == 42.0
@@ -424,6 +461,7 @@ async def test_thermal_api_endpoint(db):
         assert body["model"]["fitted"] is False
         assert body["model"]["tau_min"] == thermal.DEFAULT_TAU_MIN
         assert body["model"]["trip_c"] == thermal.TRIP_HANDLE_C
+        assert body["drift"] is None and body["session_fits"] == []
 
         _seed_idle(db, time.time() - 900, time.time(), ambient_c=22.0)
         res = await client.get("/api/thermal?refit=1")

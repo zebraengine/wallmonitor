@@ -44,6 +44,10 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
    charge started now would trip. When a derate is coming it also suggests
    the highest vehicle charge-current cap that stays under the limit —
    a steady capped rate charges faster than full rate folding back to 50%.
+   The same per-session fits feed a **degradation watch**: rising heat at
+   unchanged current means added resistance (loose lug, degrading contact),
+   so when recent sessions' fitted rise climbs past the baseline the poller
+   raises a monitor alert and the Alerts page charts the per-session trend.
    Exposed at `/api/thermal`.
 7. **One synchronized clock** — every sample, session boundary, alert, and
    event is stamped with the host's UTC time the moment it was observed, and
