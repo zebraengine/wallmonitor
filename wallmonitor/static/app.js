@@ -1203,11 +1203,18 @@ async function viewAlerts(root, rangeKey = "7d") {
   } else {
     for (const a of data.active) {
       const disp = alertDisplay(a.alert, a.source);
-      activeWrap.append(el("div", { class: "card" },
+      // Verified descriptions can run to a paragraph; inline only the first
+      // sentence (the official alert text) and keep the full description in
+      // the hover tooltip, like the banner and history table. The card spans
+      // the grid row so a lone active alert doesn't render as a tall column.
+      const firstSentence = disp.sub ? disp.sub.split(". ")[0] : null;
+      const card = el("div", { class: "card wide" },
         el("div", { class: "tile-label" }, `${a.source} alert`),
         el("div", { class: "tile-value" }, chipFor(a.source === "wifi" ? "serious" : "critical", disp.label)),
         el("div", { class: "tile-sub" },
-          `since ${fmtDT(a.first_ts)} (${fmtDur(now - a.first_ts)})` + (disp.sub ? ` · ${disp.sub}` : ""))));
+          `since ${fmtDT(a.first_ts)} (${fmtDur(now - a.first_ts)})` + (firstSentence ? ` · ${firstSentence}` : "")));
+      if (disp.sub) card.title = disp.sub;
+      activeWrap.append(card);
     }
   }
   root.append(activeWrap);
