@@ -1,11 +1,13 @@
 """End-to-end tests: simulator → poller → DB → web API."""
 
 import asyncio
+import math
 import time
 
 import aiohttp
 import pytest
 
+from wallmonitor import thermal
 from wallmonitor.config import Config
 from wallmonitor.db import Database
 from wallmonitor.poller import EventBus, Poller
@@ -317,6 +319,119 @@ async def test_monitor_gap_event_on_restart(db):
     detail = _json.loads(gaps[0]["detail"])
     assert abs(detail["offline_since"] - (old + 10)) < 1
     assert detail["gap_s"] > 3000
+
+
+def _seed_idle(db, t_from, t_to, ambient_c, dt=10.0):
+    ts = t_from
+    while ts < t_to:
+        db.insert_vitals(ts, {
+            "vehicle_connected": 0, "contactor_closed": 0, "vehicle_current_a": 0.0,
+            "handle_temp_c": round(ambient_c + thermal.IDLE_OFFSET_C, 2),
+            "pcba_temp_c": 38.0, "mcu_temp_c": 46.0,
+        }, None, 0.0)
+        ts += dt
+
+
+def _seed_thermal_session(db, start_ts, ambient_c, tau_s=720.0, rise_ref_c=36.0,
+                          amps=48.6, charge_s=1500.0, dt=10.0):
+    """Idle lead-in plus a charging ramp that follows the first-order model."""
+    _seed_idle(db, start_ts - 1800, start_ts, ambient_c, dt)
+    sid = db.start_session(start_ts)
+    t0_temp = ambient_c + thermal.IDLE_OFFSET_C
+    t_inf = ambient_c + rise_ref_c * (amps / thermal.REF_CURRENT_A) ** 2
+    ts = start_ts
+    while ts <= start_ts + charge_s:
+        temp = t_inf - (t_inf - t0_temp) * math.exp(-(ts - start_ts) / tau_s)
+        db.insert_vitals(ts, {
+            "vehicle_connected": 1, "contactor_closed": 1, "vehicle_current_a": amps,
+            "handle_temp_c": round(temp, 3), "pcba_temp_c": 55.0, "mcu_temp_c": 50.0,
+        }, sid, amps * 233.0)
+        ts += dt
+    db.close_session(sid, start_ts + charge_s, "vehicle_disconnected")
+    return sid
+
+
+async def test_thermal_fit_recovers_model(db):
+    now = time.time()
+    _seed_thermal_session(db, now - 3600, ambient_c=35.4)
+    params = thermal.fit_history(db, now)
+    assert params.fitted and params.tau_fits == 1 and params.rise_fits == 1
+    assert abs(params.tau_min - 12.0) < 1.5
+    assert abs(params.rise_ref_c - 36.0) < 3.0
+
+
+async def test_thermal_predict_charging_trajectory(db):
+    now = time.time()
+    start = now - 600  # 10 minutes into a hot-day session, mid-ramp
+    _seed_thermal_session(db, start, ambient_c=35.4, charge_s=600.0)
+    params = thermal.ThermalParams()  # defaults; prediction should still land
+    out = thermal.predict(db, now, params)
+    assert out["state"] == "charging"
+    f = out["forecast"]
+    assert f["basis"] == "trajectory"
+    assert f["will_trip"] is True
+    # Analytic time-to-trip from the seeded model is ~8.8 min.
+    assert 5.0 < f["minutes_to_trip"] < 13.0
+    assert f["steady_state_c"] > thermal.TRIP_HANDLE_C
+    # Seeded ambient 35.4 C implies a ~42 A cap avoids the trip entirely.
+    assert f["suggested_max_a"] is not None
+    assert abs(f["suggested_max_a"] - 42.0) <= 1.0
+
+
+async def test_thermal_predict_idle_forecast(db):
+    now = time.time()
+    _seed_idle(db, now - 1200, now, ambient_c=35.4)
+    params = thermal.ThermalParams()
+    out = thermal.predict(db, now, params)
+    assert out["state"] == "idle"
+    assert abs(out["ambient_c"] - 35.4) < 0.3
+    assert out["ambient_stable"] is True
+    f = out["forecast"]
+    assert f["will_trip"] is True  # 35.4 + 36 rise is well past the 65 C trip
+    assert 12.0 < f["minutes_to_trip"] < 30.0
+    assert abs(f["safe_ambient_max_c"] - 29.0) < 0.1
+    assert f["suggested_max_a"] == 42.0  # floor(48*sqrt((63-35.4)/36))
+
+    # A cool garage never trips at full rate, so there is no cap to suggest.
+    cool = Database(":memory:")
+    try:
+        _seed_idle(cool, now - 1200, now, ambient_c=20.0)
+        out = thermal.predict(cool, now, params)
+        assert out["forecast"]["will_trip"] is False
+        assert out["forecast"]["suggested_max_a"] is None
+    finally:
+        cool.close()
+
+
+async def test_thermal_suggest_max_current():
+    params = thermal.ThermalParams()
+    assert thermal.suggest_max_current(35.4, params) == 42.0
+    assert thermal.suggest_max_current(45.0, params) == 33.0
+    assert thermal.suggest_max_current(20.0, params) is None  # full rate already safe
+    assert thermal.suggest_max_current(64.0, params) is None  # no rate avoids the trip
+
+
+async def test_thermal_api_endpoint(db):
+    app = make_app(db, EventBus(), None)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        res = await client.get("/api/thermal")
+        assert res.status == 200
+        body = await res.json()
+        # Empty DB: defaults reported honestly, nothing to forecast.
+        assert body["state"] == "no_data"
+        assert body["model"]["fitted"] is False
+        assert body["model"]["tau_min"] == thermal.DEFAULT_TAU_MIN
+        assert body["model"]["trip_c"] == thermal.TRIP_HANDLE_C
+
+        _seed_idle(db, time.time() - 900, time.time(), ambient_c=22.0)
+        res = await client.get("/api/thermal?refit=1")
+        body = await res.json()
+        assert body["state"] == "idle"
+        assert body["forecast"]["will_trip"] is False
+    finally:
+        await client.close()
 
 
 async def test_backoff_on_unreachable_host(db, unused_tcp_port):
