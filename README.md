@@ -32,7 +32,17 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
    codes render honestly with guidance (the Tesla app names active alerts —
    confirm a code there, then add it to the JSON). The Alerts page includes
    Tesla's official LED fault categories as a reference.
-6. **One synchronized clock** — every sample, session boundary, alert, and
+6. **Thermal derate forecast** — the Gen 3 raises alert 40 ("high temperature
+   detected") when its plug-handle sensor hits 65 °C, halving charge current
+   for the rest of the session. The handle warms along a first-order lag whose
+   parameters (`wallmonitor/thermal.py`) are fitted per-install from your own
+   recorded session ramps (with defaults from a telemetry-verified alert-40
+   event), and the idle handle sits ~2 °C above ambient, so the charger doubles
+   as its own thermometer. The Live page forecasts: during charging, whether
+   and when the current session will derate (from the handle's live
+   trajectory); when idle, the estimated ambient and whether a full-rate
+   charge started now would trip. Exposed at `/api/thermal`.
+7. **One synchronized clock** — every sample, session boundary, alert, and
    event is stamped with the host's UTC time the moment it was observed, and
    rendered in your local timezone by one shared formatter, so you can line up
    any error with the exact operating conditions around it. The charger's own

@@ -129,6 +129,9 @@ const realTemp = (v) => (v != null && v >= 255 ? null : v);
 // headroom is visible; ambient-driven foldback in hot installs is the usual
 // cause of a real event. See the Alerts page notes.
 const PCBA_THROTTLE_C = 95;
+// Handle temperature that raises alert 40 and halves charge current
+// (observed on firmware 26.18.0 — see alert_codes.json).
+const HANDLE_TRIP_C = 65;
 
 function fromDbRow(r) {
   return {
@@ -619,9 +622,10 @@ async function viewLive(root) {
   const C = COLORS();
   const tiles = el("div", { class: "cards" });
   const sessionCard = el("div", {});
+  const thermalCard = el("div", {});
   const power = chartCard("Power", "Total power drawn by the vehicle — live");
   const currents = chartCard("Phase currents", "Per-phase current at the charger — live");
-  root.append(tiles, sessionCard, power.card, currents.card);
+  root.append(tiles, sessionCard, thermalCard, power.card, currents.card);
 
   // Seed the rolling buffer with the last 15 minutes from the DB.
   const now = Date.now() / 1000;
@@ -697,9 +701,67 @@ async function viewLive(root) {
     });
   }
 
+  const cToF = (c) => (c * 9) / 5 + 32;
+
+  function renderThermal(d) {
+    thermalCard.textContent = "";
+    const f = d.forecast, m = d.model || {};
+    let chip = null;
+    const lines = [];
+    if (d.state === "charging" && f && f.will_trip != null) {
+      if (f.will_trip && f.minutes_to_trip <= 0.5) {
+        chip = chipFor("critical", "at the derate threshold now");
+      } else if (f.will_trip) {
+        chip = chipFor("warning", `derate expected ≈ ${fmtT(f.trip_ts).slice(0, 5)} (in ~${fmtNum(f.minutes_to_trip, 0)} min)`);
+        lines.push(`Handle is at ${fmtNum(d.handle_c, 1)} °C and heading to ~${fmtNum(f.steady_state_c, 1)} °C — ` +
+          `alert 40 raises at ${fmtNum(m.trip_c, 0)} °C and halves the charge current for the rest of the session.`);
+      } else {
+        chip = chipFor("good", "no derate expected");
+        lines.push(`Handle is at ${fmtNum(d.handle_c, 1)} °C, settling near ~${fmtNum(f.steady_state_c, 1)} °C — ` +
+          `below the ${fmtNum(m.trip_c, 0)} °C alert-40 threshold.`);
+      }
+      lines.push(f.basis === "trajectory"
+        ? "Based on the handle's temperature trajectory over the last few minutes."
+        : "Based on pre-session ambient and charge current — refines as the session warms up.");
+    } else if (d.state === "charging") {
+      lines.push("Charging just started — the forecast needs a few minutes of steady data.");
+    } else if (d.state === "idle" && f) {
+      const amb = `${fmtNum(d.ambient_c, 1)} °C (${fmtNum(cToF(d.ambient_c), 0)} °F)`;
+      if (f.will_trip) {
+        chip = chipFor("warning", "hot enough to derate");
+        lines.push(`Ambient at the charger ≈ ${amb}. A full-rate (${fmtNum(m.ref_current_a, 0)} A) charge started now ` +
+          `would hit the ${fmtNum(m.trip_c, 0)} °C handle limit in ~${fmtNum(f.minutes_to_trip, 0)} min and drop to half current.`);
+      } else {
+        chip = chipFor("good", "full-rate charging safe");
+        lines.push(`Ambient at the charger ≈ ${amb}. A full-rate (${fmtNum(m.ref_current_a, 0)} A) charge would settle ` +
+          `near ~${fmtNum(f.steady_state_c, 1)} °C, below the ${fmtNum(m.trip_c, 0)} °C limit — derates start above ` +
+          `~${fmtNum(f.safe_ambient_max_c, 0)} °C (${fmtNum(cToF(f.safe_ambient_max_c), 0)} °F) ambient.`);
+      }
+      if (d.ambient_stable === false) lines.push("Handle is still cooling from recent charging, so the ambient estimate reads high.");
+    } else if (d.state === "connected") {
+      lines.push("Vehicle connected but not charging — the forecast resumes when current flows.");
+    } else {
+      lines.push("No recent samples to forecast from.");
+    }
+    const modelNote = `Model: τ ≈ ${fmtNum(m.tau_min, 1)} min, +${fmtNum(m.rise_ref_c, 0)} °C at ${fmtNum(m.ref_current_a, 0)} A — ` +
+      (m.fitted ? `fitted from ${m.tau_fits} recorded session ramp${m.tau_fits === 1 ? "" : "s"}.`
+                : "defaults from the verified alert-40 event; refits automatically as sessions accumulate.");
+    thermalCard.append(el("div", { class: "chart-card" },
+      el("div", { class: "chart-title" }, "Thermal derate forecast", chip ? " " : null, chip),
+      ...lines.map((t) => el("div", { class: "note" }, t)),
+      el("div", { class: "chart-sub" }, modelNote)));
+  }
+
+  async function loadThermal() {
+    try { renderThermal(await getJSON("/api/thermal")); } catch { /* keep last card */ }
+  }
+  loadThermal();
+  const thermalTimer = setInterval(loadThermal, 60000);
+
   if (buf.length) { renderTiles(buf[buf.length - 1]); renderSessionCard(buf[buf.length - 1]); }
   renderCharts();
 
+  let lastCharging = null;
   const onMsg = (msg) => {
     if (msg.type !== "vitals") return;
     const s = fromSse(msg);
@@ -709,9 +771,13 @@ async function viewLive(root) {
     renderTiles(s);
     renderSessionCard(s);
     renderCharts();
+    // Refresh the forecast immediately when charging starts or stops rather
+    // than waiting out the poll interval.
+    if (lastCharging !== null && s.charging !== lastCharging) loadThermal();
+    lastCharging = s.charging;
   };
   live.listeners.add(onMsg);
-  return () => live.listeners.delete(onMsg);
+  return () => { live.listeners.delete(onMsg); clearInterval(thermalTimer); };
 }
 
 const RANGE_PRESETS = [
@@ -824,8 +890,8 @@ async function viewSessionDetail(root, id) {
   const cur = chartCard("Phase currents", "Per-phase current");
   const volt = chartCard("Phase voltages", "Per-phase voltage");
   const temp = chartCard("Temperatures",
-    `Plug handle, charger circuit board (PCBA), and processor (MCU). The ≈${PCBA_THROTTLE_C}°C line marks the ` +
-    "community-observed PCBA throttle point (Tesla doesn't publish exact thresholds); ambient-driven foldback in hot installs is the usual real cause.");
+    `Plug handle, charger circuit board (PCBA), and processor (MCU). At ${HANDLE_TRIP_C}°C on the handle, alert 40 raises ` +
+    `and current is halved (observed on this firmware); the ≈${PCBA_THROTTLE_C}°C line is the community-observed PCBA throttle point.`);
   const pilot = chartCard("Pilot & proximity", "J1772 handshake signals — flaky values here often precede charging errors");
   const relay = chartCard("Relay voltages", "Contactor coil drive");
   const eventsWrap = el("div", {});
@@ -880,7 +946,10 @@ async function viewSessionDetail(root, id) {
         { name: "Plug handle", color: C.s2, points: samples.map((p) => [p.ts, p.tHandle]) },
         { name: "Processor (MCU)", color: C.s3, points: samples.map((p) => [p.ts, p.tMcu]) },
       ], unit: "°C", digits: 1, xFrom, xTo, height: 190,
-      refLines: [{ value: PCBA_THROTTLE_C, label: `≈${PCBA_THROTTLE_C}°C PCBA throttle (approx.)` }],
+      refLines: [
+        { value: HANDLE_TRIP_C, label: `${HANDLE_TRIP_C}°C handle → alert 40 derate` },
+        { value: PCBA_THROTTLE_C, label: `≈${PCBA_THROTTLE_C}°C PCBA throttle (approx.)` },
+      ],
     });
     lineChart(pilot.box, {
       series: [

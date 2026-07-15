@@ -14,6 +14,7 @@ from importlib import resources
 
 from aiohttp import web
 
+from . import thermal
 from .db import Database
 from .poller import EventBus, Poller
 
@@ -139,6 +140,22 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
         rows = await asyncio.to_thread(db.events_range, t_from, t_to, kind_list)
         return web.json_response({"events": rows})
 
+    # Model parameters drift only as new sessions land, so the (SQLite-heavy)
+    # history fit is cached; the live prediction is computed on every call.
+    thermal_fit: dict = {"params": None, "ts": 0.0}
+
+    async def api_thermal(request: web.Request) -> web.Response:
+        now = time.time()
+        if (
+            thermal_fit["params"] is None
+            or now - thermal_fit["ts"] > 6 * 3600
+            or "refit" in request.query
+        ):
+            thermal_fit["params"] = await asyncio.to_thread(thermal.fit_history, db, now)
+            thermal_fit["ts"] = now
+        result = await asyncio.to_thread(thermal.predict, db, now, thermal_fit["params"])
+        return web.json_response({"server_ts": now, **result})
+
     async def api_stream(request: web.Request) -> web.StreamResponse:
         response = web.StreamResponse(
             headers={
@@ -175,6 +192,7 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
     app.router.add_get("/api/sessions", api_sessions)
     app.router.add_get("/api/sessions/{id}", api_session_detail)
     app.router.add_get("/api/alerts", api_alerts)
+    app.router.add_get("/api/thermal", api_thermal)
     app.router.add_get("/api/events", api_events)
     app.router.add_get("/api/stream", api_stream)
     return app
