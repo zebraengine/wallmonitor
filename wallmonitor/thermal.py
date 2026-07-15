@@ -99,7 +99,15 @@ def _fit_exponential(points: list[tuple[float, float]]) -> tuple[float, float, f
 
 
 def _steady_current_prefix(samples: list[dict]) -> list[dict]:
-    """Longest prefix of charging samples whose current stays near its median."""
+    """The session's first steady-current run.
+
+    The reference current is the median of the first 10 minutes of charging,
+    not of the whole session: a session that derates midway spends most of
+    its samples at the reduced current, and a whole-session median would put
+    the initial full-rate ramp — the part with the thermal signal — outside
+    the band. Leading samples still ramping up to the plateau are skipped
+    rather than treated as the end of the run.
+    """
     charging = [
         s
         for s in samples
@@ -107,14 +115,17 @@ def _steady_current_prefix(samples: list[dict]) -> list[dict]:
     ]
     if not charging:
         return []
-    i_med = median(s["vehicle_current_a"] for s in charging)
-    band = max(2.0, 0.1 * i_med)
+    t0 = charging[0]["ts"]
+    i_ref = median(s["vehicle_current_a"] for s in charging if s["ts"] - t0 <= 600)
+    band = max(2.0, 0.1 * i_ref)
     prefix: list[dict] = []
     for s in charging:
-        if abs(s["vehicle_current_a"] - i_med) > band:
-            break
+        if abs(s["vehicle_current_a"] - i_ref) > band:
+            if prefix:
+                break  # the steady run ended (derate or charge stop)
+            continue  # still ramping up to the plateau
         prefix.append(s)
-        if s["ts"] - charging[0]["ts"] > 1800:  # first 30 min is where the ramp lives
+        if s["ts"] - prefix[0]["ts"] > 1800:  # first 30 min is where the ramp lives
             break
     return prefix
 
@@ -145,7 +156,11 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
     ][:40]
     fits: list[dict] = []
     for sess in sessions:
-        samples = db.vitals_range(sess["start_ts"] - 1, sess["end_ts"] + 1, 5000)
+        # Only the first ~45 min matters (the ramp), and the narrow window
+        # keeps a multi-hour session under the bucket-averaging threshold so
+        # the fit sees raw-resolution samples.
+        t_hi = min(sess["end_ts"], sess["start_ts"] + 2700)
+        samples = db.vitals_range(sess["start_ts"] - 1, t_hi + 1, 5000)
         prefix = _steady_current_prefix(samples)
         seg = [(s["ts"], s["handle_temp_c"]) for s in prefix if s.get("handle_temp_c") is not None]
         if len(seg) < MIN_SEGMENT_SAMPLES or seg[-1][0] - seg[0][0] < MIN_SEGMENT_S:

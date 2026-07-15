@@ -403,6 +403,40 @@ async def test_thermal_predict_idle_forecast(db):
         cool.close()
 
 
+async def test_thermal_fit_survives_ramp_and_midsession_derate(db):
+    # Regression: real sessions start with a current ramp (worsened by bucket
+    # averaging) and can derate to 50% midway. A whole-session median current
+    # put the full-rate ramp outside the steady band and produced zero fits.
+    now = time.time()
+    start = now - 4 * 3600
+    _seed_idle(db, start - 1800, start, ambient_c=35.4)
+    sid = db.start_session(start)
+    tau_s, rise, amps = 720.0, 36.0, 48.6
+    t_inf = 35.4 + rise * (amps / 48.0) ** 2
+    ts, temp0 = start, 37.4
+    while ts <= start + 3 * 3600:
+        into = ts - start
+        if into < 60:
+            current = amps * into / 60.0  # ramp-up
+        elif into < 1200:
+            current = amps  # full rate for 20 min...
+        else:
+            current = amps / 2  # ...then derated for hours (most samples)
+        temp = t_inf - (t_inf - temp0) * math.exp(-into / tau_s) if into < 1200 else 60.0
+        db.insert_vitals(ts, {
+            "vehicle_connected": 1, "contactor_closed": 1, "vehicle_current_a": round(current, 2),
+            "handle_temp_c": round(temp, 3), "pcba_temp_c": 55.0, "mcu_temp_c": 50.0,
+        }, sid, current * 233.0)
+        ts += 10.0
+    db.close_session(sid, start + 3 * 3600, "vehicle_disconnected")
+
+    fits = thermal.fit_sessions(db, now)
+    assert len(fits) == 1, "the full-rate ramp before the derate must fit"
+    assert abs(fits[0]["tau_min"] - 12.0) < 1.5
+    assert abs(fits[0]["current_a"] - amps) < 1.0
+    assert fits[0]["rise_ref_c"] is not None and abs(fits[0]["rise_ref_c"] - rise) < 3.0
+
+
 async def test_thermal_drift_detection(db):
     now = time.time()
     # Four healthy sessions, then three running hotter at the same current —
