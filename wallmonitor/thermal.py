@@ -252,11 +252,16 @@ def detect_drift(fits: list[dict]) -> dict | None:
 
 
 def _minutes_to_trip(t_now: float, t_inf: float, tau_min: float) -> float | None:
-    """Minutes until the handle reaches the trip point, or None if it never will."""
-    if t_now >= TRIP_HANDLE_C:
-        return 0.0
+    """Minutes until the handle reaches the trip point, or None if it never will.
+
+    The steady-state check comes first: a handle currently at/above the trip
+    point but settling below it (cooling after a current cut or a derate) is
+    recovering, not tripping.
+    """
     if t_inf <= TRIP_HANDLE_C + 0.2:
         return None
+    if t_now >= TRIP_HANDLE_C:
+        return 0.0
     return tau_min * math.log((t_inf - t_now) / (t_inf - TRIP_HANDLE_C))
 
 
@@ -342,7 +347,9 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
                 return out
             t_inf = ambient + params.rise_ref_c * (current / REF_CURRENT_A) ** 2
             forecast["basis"] = "model"
-        t_inf = max(t_inf, last["handle_temp_c"] - 0.5)
+        # No flooring of t_inf at the current temperature: a steady state
+        # below the handle is real, not noise — it's what cooling toward a
+        # lower equilibrium looks like after a current cut or a derate.
         minutes = _minutes_to_trip(last["handle_temp_c"], t_inf, tau_min)
         forecast.update(
             {

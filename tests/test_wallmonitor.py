@@ -378,6 +378,51 @@ async def test_thermal_predict_charging_trajectory(db):
     assert abs(f["suggested_max_a"] - 42.0) <= 1.0
 
 
+async def test_thermal_predict_cooling_after_current_cut(db):
+    # Live-validated scenario: heat at full rate to near the trip point, then
+    # cut current — the handle decays toward a lower equilibrium. The steady
+    # state must be allowed to sit below the current handle temperature
+    # (an earlier clamp floored it at handle-0.5, hiding the cool-down).
+    now = time.time()
+    tau_s, ambient = 720.0, 35.0
+    sid = db.start_session(now - 1320)
+    t_hot = ambient + 36.0 * (48.6 / 48.0) ** 2
+    ts = now - 1320
+    while ts < now - 420:
+        temp = t_hot - (t_hot - 37.0) * math.exp(-(ts - (now - 1320)) / tau_s)
+        db.insert_vitals(ts, {
+            "vehicle_connected": 1, "contactor_closed": 1, "vehicle_current_a": 48.6,
+            "handle_temp_c": round(temp, 3), "pcba_temp_c": 55.0, "mcu_temp_c": 50.0,
+        }, sid, 11300.0)
+        ts += 10.0
+    peak = temp
+    t_low = ambient + 36.0 * (30.0 / 48.0) ** 2
+    while ts <= now:
+        temp = t_low + (peak - t_low) * math.exp(-(ts - (now - 420)) / tau_s)
+        db.insert_vitals(ts, {
+            "vehicle_connected": 1, "contactor_closed": 1, "vehicle_current_a": 30.0,
+            "handle_temp_c": round(temp, 3), "pcba_temp_c": 55.0, "mcu_temp_c": 50.0,
+        }, sid, 7000.0)
+        ts += 10.0
+
+    out = thermal.predict(db, now, thermal.ThermalParams())
+    assert out["state"] == "charging"
+    f = out["forecast"]
+    assert f["basis"] == "trajectory"
+    assert f["will_trip"] is False
+    # Cooling toward ~49 C while the handle still reads ~56 C.
+    assert f["steady_state_c"] < out["handle_c"] - 3.0
+    assert abs(f["steady_state_c"] - t_low) < 3.0
+
+
+async def test_thermal_minutes_to_trip_ordering():
+    # Settling below the trip point wins over "currently above it": a handle
+    # at 66 C cooling toward 47 C is recovering from a derate, not tripping.
+    assert thermal._minutes_to_trip(66.0, 47.5, 12.0) is None
+    # Above the trip point and staying there: already tripped.
+    assert thermal._minutes_to_trip(66.0, 70.0, 12.0) == 0.0
+
+
 async def test_thermal_predict_idle_forecast(db):
     now = time.time()
     _seed_idle(db, now - 1200, now, ambient_c=35.4)
