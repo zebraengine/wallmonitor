@@ -715,6 +715,10 @@ async function viewLive(root) {
         chip = chipFor("warning", `derate expected ≈ ${fmtT(f.trip_ts).slice(0, 5)} (in ~${fmtNum(f.minutes_to_trip, 0)} min)`);
         lines.push(`Handle is at ${fmtNum(d.handle_c, 1)} °C and heading to ~${fmtNum(f.steady_state_c, 1)} °C — ` +
           `alert 40 raises at ${fmtNum(m.trip_c, 0)} °C and halves the charge current for the rest of the session.`);
+        if (f.suggested_max_a) {
+          lines.push(`Capping the vehicle's charge current at ~${fmtNum(f.suggested_max_a, 0)} A now would stay under the limit — ` +
+            `a faster charge overall than riding it into the 50% foldback.`);
+        }
       } else {
         chip = chipFor("good", "no derate expected");
         lines.push(`Handle is at ${fmtNum(d.handle_c, 1)} °C, settling near ~${fmtNum(f.steady_state_c, 1)} °C — ` +
@@ -731,6 +735,10 @@ async function viewLive(root) {
         chip = chipFor("warning", "hot enough to derate");
         lines.push(`Ambient at the charger ≈ ${amb}. A full-rate (${fmtNum(m.ref_current_a, 0)} A) charge started now ` +
           `would hit the ${fmtNum(m.trip_c, 0)} °C handle limit in ~${fmtNum(f.minutes_to_trip, 0)} min and drop to half current.`);
+        if (f.suggested_max_a) {
+          lines.push(`Setting the vehicle to ~${fmtNum(f.suggested_max_a, 0)} A before plugging in would avoid the derate ` +
+            `and beat a full-rate start that folds back to ${fmtNum(m.ref_current_a / 2, 0)} A.`);
+        }
       } else {
         chip = chipFor("good", "full-rate charging safe");
         lines.push(`Ambient at the charger ≈ ${amb}. A full-rate (${fmtNum(m.ref_current_a, 0)} A) charge would settle ` +

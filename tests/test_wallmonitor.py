@@ -373,6 +373,9 @@ async def test_thermal_predict_charging_trajectory(db):
     # Analytic time-to-trip from the seeded model is ~8.8 min.
     assert 5.0 < f["minutes_to_trip"] < 13.0
     assert f["steady_state_c"] > thermal.TRIP_HANDLE_C
+    # Seeded ambient 35.4 C implies a ~42 A cap avoids the trip entirely.
+    assert f["suggested_max_a"] is not None
+    assert abs(f["suggested_max_a"] - 42.0) <= 1.0
 
 
 async def test_thermal_predict_idle_forecast(db):
@@ -387,15 +390,25 @@ async def test_thermal_predict_idle_forecast(db):
     assert f["will_trip"] is True  # 35.4 + 36 rise is well past the 65 C trip
     assert 12.0 < f["minutes_to_trip"] < 30.0
     assert abs(f["safe_ambient_max_c"] - 29.0) < 0.1
+    assert f["suggested_max_a"] == 42.0  # floor(48*sqrt((63-35.4)/36))
 
-    # A cool garage never trips at full rate.
+    # A cool garage never trips at full rate, so there is no cap to suggest.
     cool = Database(":memory:")
     try:
         _seed_idle(cool, now - 1200, now, ambient_c=20.0)
         out = thermal.predict(cool, now, params)
         assert out["forecast"]["will_trip"] is False
+        assert out["forecast"]["suggested_max_a"] is None
     finally:
         cool.close()
+
+
+async def test_thermal_suggest_max_current():
+    params = thermal.ThermalParams()
+    assert thermal.suggest_max_current(35.4, params) == 42.0
+    assert thermal.suggest_max_current(45.0, params) == 33.0
+    assert thermal.suggest_max_current(20.0, params) is None  # full rate already safe
+    assert thermal.suggest_max_current(64.0, params) is None  # no rate avoids the trip
 
 
 async def test_thermal_api_endpoint(db):

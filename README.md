@@ -41,7 +41,10 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
    as its own thermometer. The Live page forecasts: during charging, whether
    and when the current session will derate (from the handle's live
    trajectory); when idle, the estimated ambient and whether a full-rate
-   charge started now would trip. Exposed at `/api/thermal`.
+   charge started now would trip. When a derate is coming it also suggests
+   the highest vehicle charge-current cap that stays under the limit —
+   a steady capped rate charges faster than full rate folding back to 50%.
+   Exposed at `/api/thermal`.
 7. **One synchronized clock** — every sample, session boundary, alert, and
    event is stamped with the host's UTC time the moment it was observed, and
    rendered in your local timezone by one shared formatter, so you can line up

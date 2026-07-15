@@ -184,6 +184,26 @@ def _minutes_to_trip(t_now: float, t_inf: float, tau_min: float) -> float | None
     return tau_min * math.log((t_inf - t_now) / (t_inf - TRIP_HANDLE_C))
 
 
+SUGGEST_MARGIN_C = 2.0  # keep the suggested current's steady state this far under the trip
+
+
+def suggest_max_current(ambient_c: float, params: ThermalParams) -> float | None:
+    """Highest charge current whose steady-state handle temp stays safely
+    below the trip point at the given ambient — the alternative to letting
+    the charger fold back to a blunt 50%. Vehicles take whole amps, so the
+    value is floored. None when even a minimal rate would trip (or when no
+    cap is needed at all, i.e. full rate is already safe)."""
+    headroom = TRIP_HANDLE_C - SUGGEST_MARGIN_C - ambient_c
+    if headroom <= 0:
+        return None
+    amps = math.floor(REF_CURRENT_A * math.sqrt(headroom / params.rise_ref_c))
+    if amps < 6:  # J1772 floor — below this the vehicle won't charge anyway
+        return None
+    if amps >= REF_CURRENT_A:
+        return None  # full rate is safe; no cap to suggest
+    return float(amps)
+
+
 def predict(db: Database, now: float, params: ThermalParams) -> dict:
     """Forecast alert-40 for the current state (live session or idle)."""
     out: dict = {"model": params.as_dict(), "state": "no_data", "forecast": None}
@@ -221,15 +241,19 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
         window.reverse()
         forecast: dict = {}
         if len(window) >= 8 and window[-1][0] - window[0][0] >= 120:
-            # dT/dt from the recent trajectory; the first-order lag gives
-            # T_inf = T + tau * dT/dt with no ambient input needed.
+            # Project the steady state from the recent trajectory: with tau
+            # known, T(t) = T_inf - C*exp(-t/tau) is linear in (T_inf, C), so
+            # an ordinary least-squares line on x = exp(-t/tau) gives an
+            # unbiased T_inf (a straight-line slope would read the window's
+            # average rate and overshoot during a fast ramp). No ambient
+            # input needed.
             n = len(window)
-            mt = sum(t for t, _ in window) / n
+            xs = [math.exp(-(t - window[0][0]) / (tau_min * 60.0)) for t, _ in window]
+            mx = sum(xs) / n
             mv = sum(v for _, v in window) / n
-            var = sum((t - mt) ** 2 for t, _ in window)
-            cov = sum((t - mt) * (v - mv) for t, v in window)
-            slope = cov / var if var > 0 else 0.0
-            t_inf = last["handle_temp_c"] + tau_min * 60.0 * slope
+            var = sum((x - mx) ** 2 for x in xs)
+            cov = sum((x - mx) * (v - mv) for x, (_, v) in zip(xs, window))
+            t_inf = mv - (cov / var) * mx if var > 1e-9 else last["handle_temp_c"]
             forecast["basis"] = "trajectory"
         else:
             # Too early in the session for a slope: model from pre-session
@@ -252,6 +276,11 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
                 "trip_ts": last["ts"] + minutes * 60.0 if minutes is not None else None,
             }
         )
+        if minutes is not None:
+            # Ambient implied by the steady state at this current; from it,
+            # the highest cap that avoids the trip (and the 50% foldback).
+            ambient = t_inf - params.rise_ref_c * (current / REF_CURRENT_A) ** 2
+            forecast["suggested_max_a"] = suggest_max_current(ambient, params)
         out["forecast"] = forecast
         return out
 
@@ -272,6 +301,7 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
             "minutes_to_trip": round(minutes, 1) if minutes is not None else None,
             "trip_ts": None,
             "safe_ambient_max_c": round(TRIP_HANDLE_C - params.rise_ref_c, 1),
+            "suggested_max_a": suggest_max_current(ambient, params) if minutes is not None else None,
         }
         return out
 
