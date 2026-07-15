@@ -664,8 +664,13 @@ async function viewLive(root) {
     if (notReady == null && st.vitals && st.vitals.raw) {
       try { notReady = JSON.parse(st.vitals.raw).evse_not_ready_reasons || []; } catch { notReady = []; }
     }
+    // This firmware reports evse_not_ready_reasons [1] persistently — on
+    // every connected sample, including while actively charging — so the
+    // codes only carry meaning when no power is flowing. Suppress them during
+    // charging rather than caption "Charging" with "not-ready reasons".
+    const showNotReady = !s.charging && notReady && notReady.length;
     evseTile.querySelector(".tile-sub").textContent =
-      (notReady && notReady.length ? `not-ready reason codes: ${notReady.join(", ")} — ` : "") +
+      (showNotReady ? `not-ready reason codes: ${notReady.join(", ")} — ` : "") +
       (EVSE_VERIFIED.has(s.evse)
         ? "label verified from this charger's own telemetry; (n) is the charger's raw value"
         : "label is community-reported, unverified — Tesla doesn't document these codes; (n) is the charger's raw value");
