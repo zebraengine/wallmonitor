@@ -12,8 +12,8 @@
   "codes": {
     "40": {
       "label": "High temperature detected",
-      "description": "High temperature detected; charging is limited. The charger reduces current until it cools. Check the faceplate and cable handle for excessive warmth and rule out wiring issues (conductor sizing, terminal torque); in a hot garage this can simply be ambient heat, and it clears on its own once temperatures drop.",
-      "source": "Tesla app > Wall Connector Troubleshooting, confirmed against an active alert on 2026-07-14 (matches the manual's 'High temperature' fault category)",
+      "description": "High temperature detected; charging is limited. Observed behavior on firmware 26.18.0: raises when handle_temp_c reaches 65 C and instantly derates charge current to 50%; clears once the handle cools to ~60 C, but the derate persists for the rest of the session. Check the faceplate and cable handle for excessive warmth and rule out wiring issues (conductor sizing, terminal torque); in a hot garage this can simply be ambient heat.",
+      "source": "Tesla app > Wall Connector Troubleshooting, confirmed against an active alert on 2026-07-14 (matches the manual's 'High temperature' fault category); thresholds observed from monitor telemetry of that event",
       "verified": true
     }
   },
