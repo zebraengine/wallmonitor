@@ -77,19 +77,20 @@ def _fit_exponential(points: list[tuple[float, float]]) -> tuple[float, float, f
     T0 is pinned to the first sample; tau is grid-searched and T_inf is the
     closed-form optimum for each tau. Returns (tau_s, t_inf, rmse) or None.
     """
-    t0, temp0 = points[0]
+    start_ts, start_temp = points[0]
     best: tuple[float, float, float] | None = None
     tau = TAU_RANGE_MIN[0] * 60.0
     while tau <= TAU_RANGE_MIN[1] * 60.0:
-        xs = [math.exp(-(t - t0) / tau) for t, _ in points]
+        decays = [math.exp(-(ts - start_ts) / tau) for ts, _ in points]
         num = den = 0.0
-        for (_, temp), x in zip(points, xs):
-            num += (1.0 - x) * (temp - temp0 * x)
-            den += (1.0 - x) ** 2
+        for (_, temp), decay in zip(points, decays):
+            num += (1.0 - decay) * (temp - start_temp * decay)
+            den += (1.0 - decay) ** 2
         if den > 1e-9:
             t_inf = num / den
             sse = sum(
-                (t_inf - (t_inf - temp0) * x - temp) ** 2 for (_, temp), x in zip(points, xs)
+                (t_inf - (t_inf - start_temp) * decay - temp) ** 2
+                for (_, temp), decay in zip(points, decays)
             )
             rmse = math.sqrt(sse / len(points))
             if best is None or rmse < best[2]:
@@ -109,23 +110,27 @@ def _steady_current_prefix(samples: list[dict]) -> list[dict]:
     rather than treated as the end of the run.
     """
     charging = [
-        s
-        for s in samples
-        if s.get("contactor_closed") and (s.get("vehicle_current_a") or 0) >= 16
+        sample
+        for sample in samples
+        if sample.get("contactor_closed") and (sample.get("vehicle_current_a") or 0) >= 16
     ]
     if not charging:
         return []
-    t0 = charging[0]["ts"]
-    i_ref = median(s["vehicle_current_a"] for s in charging if s["ts"] - t0 <= 600)
+    charge_start_ts = charging[0]["ts"]
+    i_ref = median(
+        sample["vehicle_current_a"]
+        for sample in charging
+        if sample["ts"] - charge_start_ts <= 600
+    )
     band = max(2.0, 0.1 * i_ref)
     prefix: list[dict] = []
-    for s in charging:
-        if abs(s["vehicle_current_a"] - i_ref) > band:
+    for sample in charging:
+        if abs(sample["vehicle_current_a"] - i_ref) > band:
             if prefix:
                 break  # the steady run ended (derate or charge stop)
             continue  # still ramping up to the plateau
-        prefix.append(s)
-        if s["ts"] - prefix[0]["ts"] > 1800:  # first 30 min is where the ramp lives
+        prefix.append(sample)
+        if sample["ts"] - prefix[0]["ts"] > 1800:  # first 30 min is where the ramp lives
             break
     return prefix
 
@@ -134,11 +139,11 @@ def _ambient_before(db: Database, start_ts: float) -> float | None:
     """Ambient estimate from the idle handle temperature before a session."""
     rows = db.vitals_range(start_ts - 2400, start_ts - 30, 5000)
     idle = [
-        r["handle_temp_c"]
-        for r in rows
-        if not r.get("contactor_closed")
-        and (r.get("vehicle_current_a") or 0) < 1
-        and r.get("handle_temp_c") is not None
+        row["handle_temp_c"]
+        for row in rows
+        if not row.get("contactor_closed")
+        and (row.get("vehicle_current_a") or 0) < 1
+        and row.get("handle_temp_c") is not None
     ]
     if len(idle) < 5 or max(idle) - min(idle) > 2.0:
         return None
@@ -150,9 +155,9 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
     ramp passed the quality gates. rise_ref_c is None when there was no
     stable pre-session idle to estimate ambient from."""
     sessions = [
-        s
-        for s in db.sessions_range(now - lookback_days * 86400, now)
-        if s.get("end_ts") and (s.get("charging_s") or 0) >= MIN_SEGMENT_S
+        session
+        for session in db.sessions_range(now - lookback_days * 86400, now)
+        if session.get("end_ts") and (session.get("charging_s") or 0) >= MIN_SEGMENT_S
     ][:40]
     fits: list[dict] = []
     for sess in sessions:
@@ -162,10 +167,14 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
         t_hi = min(sess["end_ts"], sess["start_ts"] + 2700)
         samples = db.vitals_range(sess["start_ts"] - 1, t_hi + 1, 5000)
         prefix = _steady_current_prefix(samples)
-        seg = [(s["ts"], s["handle_temp_c"]) for s in prefix if s.get("handle_temp_c") is not None]
+        seg = [
+            (sample["ts"], sample["handle_temp_c"])
+            for sample in prefix
+            if sample.get("handle_temp_c") is not None
+        ]
         if len(seg) < MIN_SEGMENT_SAMPLES or seg[-1][0] - seg[0][0] < MIN_SEGMENT_S:
             continue
-        if max(t for _, t in seg) - seg[0][1] < MIN_RISE_SEEN_C:
+        if max(temp for _, temp in seg) - seg[0][1] < MIN_RISE_SEEN_C:
             continue
         fit = _fit_exponential(seg)
         if fit is None:
@@ -173,7 +182,7 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
         tau_s, t_inf, rmse = fit
         if rmse > MAX_FIT_RMSE_C or t_inf <= seg[0][1] + 3.0:
             continue
-        i_med = median(s["vehicle_current_a"] for s in prefix)
+        i_med = median(sample["vehicle_current_a"] for sample in prefix)
         ambient = _ambient_before(db, sess["start_ts"])
         rise = None
         if ambient is not None:
@@ -190,7 +199,7 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
                 "current_a": round(i_med, 1),
             }
         )
-    fits.sort(key=lambda f: f["start_ts"])
+    fits.sort(key=lambda fit: fit["start_ts"])
     return fits
 
 
@@ -199,9 +208,9 @@ def fit_history(db: Database, now: float, lookback_days: float = 120.0,
     """Aggregate per-session fits into model parameters; defaults where thin."""
     if fits is None:
         fits = fit_sessions(db, now, lookback_days)
-    taus = [f["tau_min"] for f in fits]
-    rises = [f["rise_ref_c"] for f in fits if f["rise_ref_c"] is not None]
-    rmses = [f["rmse_c"] for f in fits]
+    taus = [fit["tau_min"] for fit in fits]
+    rises = [fit["rise_ref_c"] for fit in fits if fit["rise_ref_c"] is not None]
+    rmses = [fit["rmse_c"] for fit in fits]
     return ThermalParams(
         tau_min=median(taus) if taus else DEFAULT_TAU_MIN,
         rise_ref_c=median(rises) if rises else DEFAULT_RISE_REF_C,
@@ -231,12 +240,12 @@ def detect_drift(fits: list[dict]) -> dict | None:
     added contact resistance changes how much heat is made, not how fast the
     handle mass warms.
     """
-    rises = [(f["start_ts"], f["rise_ref_c"]) for f in fits if f["rise_ref_c"] is not None]
-    rises.sort(key=lambda r: r[0])
+    rises = [(fit["start_ts"], fit["rise_ref_c"]) for fit in fits if fit["rise_ref_c"] is not None]
+    rises.sort(key=lambda entry: entry[0])
     if len(rises) < DRIFT_RECENT_N + DRIFT_MIN_BASELINE_N:
         return None
-    recent = [r for _, r in rises[-DRIFT_RECENT_N:]]
-    baseline = [r for _, r in rises[:-DRIFT_RECENT_N]]
+    recent = [rise for _, rise in rises[-DRIFT_RECENT_N:]]
+    baseline = [rise for _, rise in rises[:-DRIFT_RECENT_N]]
     recent_med = median(recent)
     baseline_med = median(baseline)
     delta = recent_med - baseline_med
@@ -288,7 +297,9 @@ def suggest_max_current(ambient_c: float, params: ThermalParams) -> float | None
 def predict(db: Database, now: float, params: ThermalParams) -> dict:
     """Forecast alert-40 for the current state (live session or idle)."""
     out: dict = {"model": params.as_dict(), "state": "no_data", "forecast": None}
-    recent = [r for r in db.vitals_range(now - 900, now, 2000) if r.get("handle_temp_c") is not None]
+    recent = [
+        row for row in db.vitals_range(now - 900, now, 2000) if row.get("handle_temp_c") is not None
+    ]
     if not recent:
         return out
     last = recent[-1]
@@ -311,14 +322,14 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
         out["state"] = "charging"
         band = max(2.0, 0.1 * current)
         window: list[tuple[float, float]] = []
-        for s in reversed(recent):
+        for sample in reversed(recent):
             if (
-                not s.get("contactor_closed")
-                or abs((s.get("vehicle_current_a") or 0) - current) > band
-                or last["ts"] - s["ts"] > 360
+                not sample.get("contactor_closed")
+                or abs((sample.get("vehicle_current_a") or 0) - current) > band
+                or last["ts"] - sample["ts"] > 360
             ):
                 break
-            window.append((s["ts"], s["handle_temp_c"]))
+            window.append((sample["ts"], sample["handle_temp_c"]))
         window.reverse()
         forecast: dict = {}
         if len(window) >= 8 and window[-1][0] - window[0][0] >= 120:
@@ -328,13 +339,16 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
             # unbiased T_inf (a straight-line slope would read the window's
             # average rate and overshoot during a fast ramp). No ambient
             # input needed.
-            n = len(window)
-            xs = [math.exp(-(t - window[0][0]) / (tau_min * 60.0)) for t, _ in window]
-            mx = sum(xs) / n
-            mv = sum(v for _, v in window) / n
-            var = sum((x - mx) ** 2 for x in xs)
-            cov = sum((x - mx) * (v - mv) for x, (_, v) in zip(xs, window))
-            t_inf = mv - (cov / var) * mx if var > 1e-9 else last["handle_temp_c"]
+            count = len(window)
+            decays = [math.exp(-(ts - window[0][0]) / (tau_min * 60.0)) for ts, _ in window]
+            mean_decay = sum(decays) / count
+            mean_temp = sum(temp for _, temp in window) / count
+            var = sum((decay - mean_decay) ** 2 for decay in decays)
+            cov = sum(
+                (decay - mean_decay) * (temp - mean_temp)
+                for decay, (_, temp) in zip(decays, window)
+            )
+            t_inf = mean_temp - (cov / var) * mean_decay if var > 1e-9 else last["handle_temp_c"]
             forecast["basis"] = "trajectory"
         else:
             # Too early in the session for a slope: model from pre-session
@@ -369,7 +383,7 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
 
     if current < 1.0 and not last.get("contactor_closed"):
         out["state"] = "idle"
-        temps = [r["handle_temp_c"] for r in recent if last["ts"] - r["ts"] <= 900]
+        temps = [row["handle_temp_c"] for row in recent if last["ts"] - row["ts"] <= 900]
         stable = len(temps) >= 3 and max(temps) - min(temps) <= 1.5
         ambient = last["handle_temp_c"] - IDLE_OFFSET_C
         out["ambient_c"] = round(ambient, 1)

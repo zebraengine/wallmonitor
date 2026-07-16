@@ -43,10 +43,10 @@ class SimState:
 
     def phase(self) -> tuple[str, float, int]:
         """Current phase name, seconds into the phase, and cycle count."""
-        total = sum(d for _, d in CYCLE)
-        e = self._elapsed()
-        cycle_n = int(e // total)
-        into = e % total
+        total = sum(duration for _, duration in CYCLE)
+        elapsed = self._elapsed()
+        cycle_n = int(elapsed // total)
+        into = elapsed % total
         for name, dur in CYCLE:
             if into < dur:
                 return name, into, cycle_n
@@ -143,8 +143,8 @@ class SimState:
 
     def wifi_status(self) -> dict:
         # RSSI drifts slowly; dips periodically so the health chart has shape.
-        e = self._elapsed()
-        rssi = -62 + int(6 * math.sin(e / 90.0)) - (8 if int(e) % 300 < 20 else 0)
+        elapsed = self._elapsed()
+        rssi = -62 + int(6 * math.sin(elapsed / 90.0)) - (8 if int(elapsed) % 300 < 20 else 0)
         return {
             "wifi_ssid": base64.b64encode(b"HomeNetwork").decode(),
             "wifi_signal_strength": max(0, min(100, 2 * (rssi + 100))),
@@ -152,7 +152,7 @@ class SimState:
             "wifi_snr": max(5, rssi + 88),
             "wifi_connected": True,
             "wifi_infra_ip": "127.0.0.1",
-            "internet": int(e) % 600 > 30,  # brief internet dropout every 10 sim-minutes
+            "internet": int(elapsed) % 600 > 30,  # brief internet dropout every 10 sim-minutes
             "wifi_mac": "AA:BB:CC:DD:EE:FF",
         }
 

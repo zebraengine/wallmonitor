@@ -119,7 +119,11 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
             raise web.HTTPNotFound(text="no such session")
         end = session["end_ts"] or time.time()
         samples = await asyncio.to_thread(db.vitals_range, session["start_ts"] - 1, end + 1, 2000)
-        samples = [s for s in samples if s.get("session_id") == sid or s["ts"] >= session["start_ts"]]
+        samples = [
+            sample
+            for sample in samples
+            if sample.get("session_id") == sid or sample["ts"] >= session["start_ts"]
+        ]
         events = await asyncio.to_thread(db.events_range, session["start_ts"] - 1, end + 1)
         return web.json_response({"session": session, "samples": samples, "events": events})
 
@@ -136,7 +140,7 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
         t_from = _float_q(request, "from", now - 7 * 24 * 3600)
         t_to = _float_q(request, "to", now)
         kinds = request.query.get("kinds")
-        kind_list = [k for k in kinds.split(",") if k] if kinds else None
+        kind_list = [kind for kind in kinds.split(",") if kind] if kinds else None
         rows = await asyncio.to_thread(db.events_range, t_from, t_to, kind_list)
         return web.json_response({"events": rows})
 
@@ -174,12 +178,12 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
             }
         )
         await response.prepare(request)
-        q = bus.subscribe()
+        queue = bus.subscribe()
         try:
             await response.write(b": connected\n\n")
             while True:
                 try:
-                    msg = await asyncio.wait_for(q.get(), timeout=15.0)
+                    msg = await asyncio.wait_for(queue.get(), timeout=15.0)
                 except TimeoutError:
                     await response.write(b": keepalive\n\n")
                     continue
@@ -188,7 +192,7 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
         except (ConnectionResetError, asyncio.CancelledError):
             pass
         finally:
-            bus.unsubscribe(q)
+            bus.unsubscribe(queue)
         return response
 
     app.router.add_get("/", index)
