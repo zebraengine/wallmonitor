@@ -10,41 +10,41 @@ const $ = (sel, root) => (root || document).querySelector(sel);
 function el(tag, attrs, ...children) {
   const node = document.createElement(tag);
   if (attrs) {
-    for (const [k, v] of Object.entries(attrs)) {
-      if (k === "class") node.className = v;
-      else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
-      else node.setAttribute(k, v);
+    for (const [key, value] of Object.entries(attrs)) {
+      if (key === "class") node.className = value;
+      else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+      else node.setAttribute(key, value);
     }
   }
-  for (const c of children.flat()) {
-    if (c == null) continue;
-    node.append(c.nodeType ? c : document.createTextNode(String(c)));
+  for (const child of children.flat()) {
+    if (child == null) continue;
+    node.append(child.nodeType ? child : document.createTextNode(String(child)));
   }
   return node;
 }
 
-const pad = (n) => String(n).padStart(2, "0");
+const pad = (num) => String(num).padStart(2, "0");
 function fmtDT(ts) {
   if (ts == null) return "—";
-  const d = new Date(ts * 1000);
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
-         `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  const date = new Date(ts * 1000);
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+         `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 function fmtT(ts) {
-  const d = new Date(ts * 1000);
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  const date = new Date(ts * 1000);
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
-function fmtDur(s) {
-  if (s == null) return "—";
-  s = Math.round(s);
-  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
-  if (h) return `${h}h ${pad(m)}m`;
-  if (m) return `${m}m ${pad(sec)}s`;
-  return `${sec}s`;
+function fmtDur(seconds) {
+  if (seconds == null) return "—";
+  seconds = Math.round(seconds);
+  const hours = Math.floor(seconds / 3600), mins = Math.floor((seconds % 3600) / 60), secs = seconds % 60;
+  if (hours) return `${hours}h ${pad(mins)}m`;
+  if (mins) return `${mins}m ${pad(secs)}s`;
+  return `${secs}s`;
 }
-function fmtNum(v, digits = 1) {
-  if (v == null || Number.isNaN(v)) return "—";
-  return Number(v).toLocaleString(undefined, { maximumFractionDigits: digits, minimumFractionDigits: 0 });
+function fmtNum(value, digits = 1) {
+  if (value == null || Number.isNaN(value)) return "—";
+  return Number(value).toLocaleString(undefined, { maximumFractionDigits: digits, minimumFractionDigits: 0 });
 }
 
 async function getJSON(url) {
@@ -71,7 +71,7 @@ const EVSE_STATES = {
   8: "Charging (de-rated)", 9: "Connected, not charging", 10: "Charging finished", 11: "Charging",
 };
 const EVSE_VERIFIED = new Set([9, 11]);
-const evseLabel = (v) => v == null ? "—" : `${EVSE_STATES[v] || "State"} (${v})`;
+const evseLabel = (state) => state == null ? "—" : `${EVSE_STATES[state] || "State"} (${state})`;
 
 const EVENT_META = {
   session_start: ["Session started", "good"],
@@ -96,8 +96,8 @@ const EVENT_META = {
   thermal_drift: ["Handle heat rise increasing vs baseline", "serious"],
   thermal_drift_cleared: ["Handle heat rise back to baseline", "good"],
 };
-const eventLabel = (k) => (EVENT_META[k] || [k, "muted"])[0];
-const eventSeverity = (k) => (EVENT_META[k] || [k, "muted"])[1];
+const eventLabel = (kind) => (EVENT_META[kind] || [kind, "muted"])[0];
+const eventSeverity = (kind) => (EVENT_META[kind] || [kind, "muted"])[1];
 
 /* ---------------- alert decoding ---------------- */
 
@@ -115,24 +115,24 @@ const UNDOCUMENTED_HINT =
   "undocumented code — open the Tesla app while this alert is active to see its name, then add it to alert_codes.json";
 
 function alertDisplay(alertStr, source) {
-  const s = String(alertStr);
-  const known = alertCodes && alertCodes.codes && alertCodes.codes[s];
+  const alertText = String(alertStr);
+  const known = alertCodes && alertCodes.codes && alertCodes.codes[alertText];
   if (known) {
     return {
       label: known.label,
-      sub: `code ${s} — ${known.description}${known.verified ? "" : " (community-reported, unverified)"}`,
+      sub: `code ${alertText} — ${known.description}${known.verified ? "" : " (community-reported, unverified)"}`,
     };
   }
-  const numeric = /^\d+$/.test(s);
-  if (numeric) return { label: `Alert code ${s}`, sub: UNDOCUMENTED_HINT };
+  const numeric = /^\d+$/.test(alertText);
+  if (numeric) return { label: `Alert code ${alertText}`, sub: UNDOCUMENTED_HINT };
   // Monitor/wifi alerts (and any string alerts) are already human-readable.
-  return { label: s, sub: source === "device" ? UNDOCUMENTED_HINT : null };
+  return { label: alertText, sub: source === "device" ? UNDOCUMENTED_HINT : null };
 }
 
 /* ------------- unified vitals sample (DB row or SSE message) ------------- */
 
 // 255 (0xFF) is the device's "sensor read invalid" sentinel for temperatures.
-const realTemp = (v) => (v != null && v >= 255 ? null : v);
+const realTemp = (value) => (value != null && value >= 255 ? null : value);
 
 // Community-observed (not Tesla-published) circuit-board temperature at which
 // the Gen 3 begins throttling charge current. Shown as a reference line so
@@ -143,35 +143,35 @@ const PCBA_THROTTLE_C = 95;
 // (observed on firmware 26.18.0 — see alert_codes.json).
 const HANDLE_TRIP_C = 65;
 
-function fromDbRow(r) {
+function fromDbRow(row) {
   return {
-    ts: r.ts, power: r.total_power_w, maxPower: r.max_power_w,
-    iv: r.vehicle_current_a,
-    ia: r.current_a_a, ib: r.current_b_a, ic: r.current_c_a,
-    va: r.voltage_a_v, vb: r.voltage_b_v, vc: r.voltage_c_v,
-    gridV: r.grid_v, gridHz: r.grid_hz,
-    tPcba: realTemp(r.pcba_temp_c), tHandle: realTemp(r.handle_temp_c), tMcu: realTemp(r.mcu_temp_c),
-    energy: r.session_energy_wh, connected: !!r.vehicle_connected,
-    charging: !!r.contactor_closed, evse: r.evse_state, sessionId: r.session_id,
-    pilotHigh: r.pilot_high_v, pilotLow: r.pilot_low_v, prox: r.prox_v,
-    relayK1: r.relay_k1_v, relayK2: r.relay_k2_v,
+    ts: row.ts, power: row.total_power_w, maxPower: row.max_power_w,
+    iv: row.vehicle_current_a,
+    ia: row.current_a_a, ib: row.current_b_a, ic: row.current_c_a,
+    va: row.voltage_a_v, vb: row.voltage_b_v, vc: row.voltage_c_v,
+    gridV: row.grid_v, gridHz: row.grid_hz,
+    tPcba: realTemp(row.pcba_temp_c), tHandle: realTemp(row.handle_temp_c), tMcu: realTemp(row.mcu_temp_c),
+    energy: row.session_energy_wh, connected: !!row.vehicle_connected,
+    charging: !!row.contactor_closed, evse: row.evse_state, sessionId: row.session_id,
+    pilotHigh: row.pilot_high_v, pilotLow: row.pilot_low_v, prox: row.prox_v,
+    relayK1: row.relay_k1_v, relayK2: row.relay_k2_v,
   };
 }
-function fromSse(m) {
-  const d = m.data || {};
+function fromSse(msg) {
+  const data = msg.data || {};
   return {
-    ts: m.ts, power: m.total_power_w,
-    iv: d.vehicle_current_a,
-    ia: d.currentA_a, ib: d.currentB_a, ic: d.currentC_a,
-    va: d.voltageA_v, vb: d.voltageB_v, vc: d.voltageC_v,
-    gridV: d.grid_v, gridHz: d.grid_hz,
-    tPcba: realTemp(d.pcba_temp_c), tHandle: realTemp(d.handle_temp_c), tMcu: realTemp(d.mcu_temp_c),
-    energy: d.session_energy_wh, connected: !!d.vehicle_connected,
-    charging: !!d.contactor_closed, evse: d.evse_state, sessionId: m.session_id,
-    sessionS: d.session_s, alerts: d.current_alerts || [],
-    notReady: d.evse_not_ready_reasons || [],
-    pilotHigh: d.pilot_high_v, pilotLow: d.pilot_low_v, prox: d.prox_v,
-    relayK1: d.relay_k1_v ?? d.relay_coil_v, relayK2: d.relay_k2_v,
+    ts: msg.ts, power: msg.total_power_w,
+    iv: data.vehicle_current_a,
+    ia: data.currentA_a, ib: data.currentB_a, ic: data.currentC_a,
+    va: data.voltageA_v, vb: data.voltageB_v, vc: data.voltageC_v,
+    gridV: data.grid_v, gridHz: data.grid_hz,
+    tPcba: realTemp(data.pcba_temp_c), tHandle: realTemp(data.handle_temp_c), tMcu: realTemp(data.mcu_temp_c),
+    energy: data.session_energy_wh, connected: !!data.vehicle_connected,
+    charging: !!data.contactor_closed, evse: data.evse_state, sessionId: msg.session_id,
+    sessionS: data.session_s, alerts: data.current_alerts || [],
+    notReady: data.evse_not_ready_reasons || [],
+    pilotHigh: data.pilot_high_v, pilotLow: data.pilot_low_v, prox: data.prox_v,
+    relayK1: data.relay_k1_v ?? data.relay_coil_v, relayK2: data.relay_k2_v,
   };
 }
 
@@ -180,7 +180,7 @@ function fromSse(m) {
 const SVGNS = "http://www.w3.org/2000/svg";
 function svg(tag, attrs) {
   const node = document.createElementNS(SVGNS, tag);
-  for (const [k, v] of Object.entries(attrs || {})) node.setAttribute(k, v);
+  for (const [key, value] of Object.entries(attrs || {})) node.setAttribute(key, value);
   return node;
 }
 
@@ -190,21 +190,21 @@ function niceTicks(min, max, count) {
   const span = max - min;
   const step0 = span / Math.max(1, count);
   const mag = Math.pow(10, Math.floor(Math.log10(step0)));
-  const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => span / s <= count + 0.5) || 10 * mag;
+  const step = [1, 2, 2.5, 5, 10].map((mult) => mult * mag).find((candidate) => span / candidate <= count + 0.5) || 10 * mag;
   const lo = Math.floor(min / step) * step;
   const hi = Math.ceil(max / step) * step;
   const ticks = [];
-  for (let v = lo; v <= hi + step / 2; v += step) ticks.push(Math.round(v * 1e6) / 1e6);
+  for (let value = lo; value <= hi + step / 2; value += step) ticks.push(Math.round(value * 1e6) / 1e6);
   return { ticks, min: lo, max: hi };
 }
 
-function timeTickFormat(t, spanS) {
+function timeTickFormat(ts, spanS) {
   if (spanS > 36 * 3600) {
-    const d = new Date(t * 1000);
-    return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    const date = new Date(ts * 1000);
+    return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
   }
-  const d = new Date(t * 1000);
-  return spanS <= 900 ? fmtT(t) : `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const date = new Date(ts * 1000);
+  return spanS <= 900 ? fmtT(ts) : `${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
 /* lineChart(box, {series, height, unit, digits, area, zeroBase, xFrom, xTo}) */
@@ -214,33 +214,35 @@ function lineChart(box, opts) {
   box.style.minHeight = `${opts.height || 210}px`;
   box.textContent = "";
   box.classList.add("chart-box");
-  const series = (opts.series || []).map((s) => ({ ...s, points: s.points.filter((p) => p[1] != null && isFinite(p[1])) }));
+  const series = (opts.series || []).map((dataset) => (
+    { ...dataset, points: dataset.points.filter((point) => point[1] != null && isFinite(point[1])) }
+  ));
   const height = opts.height || 210;
   const width = Math.max(320, box.clientWidth || 800);
-  const M = { l: 48, r: 14, t: 12, b: 24 };
-  const pw = width - M.l - M.r, ph = height - M.t - M.b;
+  const margin = { left: 48, right: 14, top: 12, bottom: 24 };
+  const pw = width - margin.left - margin.right, ph = height - margin.top - margin.bottom;
 
-  const allPts = series.flatMap((s) => s.points);
+  const allPts = series.flatMap((dataset) => dataset.points);
   if (!allPts.length) {
     box.append(el("div", { class: "empty" }, "No data in this range"));
     return;
   }
-  const xFrom = opts.xFrom ?? Math.min(...allPts.map((p) => p[0]));
-  const xTo = opts.xTo ?? Math.max(...allPts.map((p) => p[0]));
+  const xFrom = opts.xFrom ?? Math.min(...allPts.map((point) => point[0]));
+  const xTo = opts.xTo ?? Math.max(...allPts.map((point) => point[0]));
   const spanS = Math.max(1, xTo - xFrom);
-  let yMin = Math.min(...allPts.map((p) => p[1]));
-  let yMax = Math.max(...allPts.map((p) => p[1]));
+  let yMin = Math.min(...allPts.map((point) => point[1]));
+  let yMax = Math.max(...allPts.map((point) => point[1]));
   if (opts.zeroBase) yMin = Math.min(0, yMin);
   // Reference lines (e.g. a thermal-foldback threshold) are drawn in-frame so
   // the headroom between the live value and the limit is visible at a glance.
   const refLines = opts.refLines || [];
-  for (const r of refLines) {
-    if (r.value > yMax) yMax = r.value;
-    if (r.value < yMin) yMin = r.value;
+  for (const refLine of refLines) {
+    if (refLine.value > yMax) yMax = refLine.value;
+    if (refLine.value < yMin) yMin = refLine.value;
   }
   const yt = niceTicks(yMin, yMax, 4);
-  const X = (t) => M.l + ((t - xFrom) / spanS) * pw;
-  const Y = (v) => M.t + ph - ((v - yt.min) / (yt.max - yt.min || 1)) * ph;
+  const xOf = (ts) => margin.left + ((ts - xFrom) / spanS) * pw;
+  const yOf = (value) => margin.top + ph - ((value - yt.min) / (yt.max - yt.min || 1)) * ph;
 
   const root = svg("svg", { viewBox: `0 0 ${width} ${height}`, width, height });
 
@@ -248,53 +250,54 @@ function lineChart(box, opts) {
   // duplicate rounded values (e.g. 0.5 steps labelled "1, 1, 0, -1, -1").
   const yStep = yt.ticks.length > 1 ? yt.ticks[1] - yt.ticks[0] : 1;
   const tickDigits = Math.max(0, Math.min(3, -Math.floor(Math.log10(yStep) + 1e-9)));
-  for (const v of yt.ticks) {
-    root.append(svg("line", { x1: M.l, x2: width - M.r, y1: Y(v), y2: Y(v), stroke: "var(--grid)", "stroke-width": 1 }));
-    const label = svg("text", { x: M.l - 6, y: Y(v) + 3.5, "text-anchor": "end", class: "axis-text" });
-    label.textContent = fmtNum(v, tickDigits);
+  for (const value of yt.ticks) {
+    root.append(svg("line", { x1: margin.left, x2: width - margin.right, y1: yOf(value), y2: yOf(value), stroke: "var(--grid)", "stroke-width": 1 }));
+    const label = svg("text", { x: margin.left - 6, y: yOf(value) + 3.5, "text-anchor": "end", class: "axis-text" });
+    label.textContent = fmtNum(value, tickDigits);
     label.classList.add("axis-text");
     root.append(label);
   }
-  root.append(svg("line", { x1: M.l, x2: width - M.r, y1: M.t + ph, y2: M.t + ph, stroke: "var(--baseline)", "stroke-width": 1 }));
+  root.append(svg("line", { x1: margin.left, x2: width - margin.right, y1: margin.top + ph, y2: margin.top + ph, stroke: "var(--baseline)", "stroke-width": 1 }));
 
   const nXTicks = Math.max(2, Math.min(6, Math.floor(pw / 110)));
   for (let i = 0; i <= nXTicks; i++) {
-    const t = xFrom + (spanS * i) / nXTicks;
-    const label = svg("text", { x: X(t), y: height - 6, "text-anchor": i === 0 ? "start" : i === nXTicks ? "end" : "middle", class: "axis-text" });
-    label.textContent = timeTickFormat(t, spanS);
+    const ts = xFrom + (spanS * i) / nXTicks;
+    const label = svg("text", { x: xOf(ts), y: height - 6, "text-anchor": i === 0 ? "start" : i === nXTicks ? "end" : "middle", class: "axis-text" });
+    label.textContent = timeTickFormat(ts, spanS);
     root.append(label);
   }
 
-  for (const s of series) {
-    if (!s.points.length) continue;
-    const d = s.points.map((p, i) => `${i ? "L" : "M"}${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join("");
+  for (const dataset of series) {
+    if (!dataset.points.length) continue;
+    const pathData = dataset.points.map((point, idx) =>
+      `${idx ? "L" : "M"}${xOf(point[0]).toFixed(1)},${yOf(point[1]).toFixed(1)}`).join("");
     if (opts.area && series.length === 1) {
-      const areaD = d + `L${X(s.points[s.points.length - 1][0]).toFixed(1)},${Y(yt.min).toFixed(1)}` +
-        `L${X(s.points[0][0]).toFixed(1)},${Y(yt.min).toFixed(1)}Z`;
-      root.append(svg("path", { d: areaD, fill: s.color, "fill-opacity": 0.1, stroke: "none" }));
+      const areaPath = pathData + `L${xOf(dataset.points[dataset.points.length - 1][0]).toFixed(1)},${yOf(yt.min).toFixed(1)}` +
+        `L${xOf(dataset.points[0][0]).toFixed(1)},${yOf(yt.min).toFixed(1)}Z`;
+      root.append(svg("path", { d: areaPath, fill: dataset.color, "fill-opacity": 0.1, stroke: "none" }));
     }
-    root.append(svg("path", { d, fill: "none", stroke: s.color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+    root.append(svg("path", { d: pathData, fill: "none", stroke: dataset.color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
   }
 
   // Reference/threshold lines sit above the data, below the crosshair: a thin
   // warning-toned solid line with a right-anchored label.
-  for (const r of refLines) {
-    const y = Y(r.value);
-    if (y < M.t || y > M.t + ph) continue;
+  for (const refLine of refLines) {
+    const y = yOf(refLine.value);
+    if (y < margin.top || y > margin.top + ph) continue;
     root.append(svg("line", {
-      x1: M.l, x2: width - M.r, y1: y, y2: y,
+      x1: margin.left, x2: width - margin.right, y1: y, y2: y,
       stroke: "var(--status-warning)", "stroke-width": 1, "stroke-opacity": 0.7,
     }));
-    const rl = svg("text", { x: width - M.r, y: y - 4, "text-anchor": "end", class: "axis-text" });
-    rl.textContent = r.label;
-    rl.setAttribute("fill", "var(--status-warning)");
-    root.append(rl);
+    const refLabel = svg("text", { x: width - margin.right, y: y - 4, "text-anchor": "end", class: "axis-text" });
+    refLabel.textContent = refLine.label;
+    refLabel.setAttribute("fill", "var(--status-warning)");
+    root.append(refLabel);
   }
 
-  const cross = svg("line", { x1: 0, x2: 0, y1: M.t, y2: M.t + ph, stroke: "var(--baseline)", "stroke-width": 1, visibility: "hidden" });
+  const cross = svg("line", { x1: 0, x2: 0, y1: margin.top, y2: margin.top + ph, stroke: "var(--baseline)", "stroke-width": 1, visibility: "hidden" });
   root.append(cross);
-  const dots = series.map((s) => {
-    const dot = svg("circle", { r: 4, fill: s.color, stroke: "var(--surface-1)", "stroke-width": 2, visibility: "hidden" });
+  const dots = series.map((dataset) => {
+    const dot = svg("circle", { r: 4, fill: dataset.color, stroke: "var(--surface-1)", "stroke-width": 2, visibility: "hidden" });
     root.append(dot);
     return dot;
   });
@@ -304,56 +307,58 @@ function lineChart(box, opts) {
   const tip = el("div", { class: "tooltip" });
   box.append(tip);
 
-  const xsUnion = [...new Set(allPts.map((p) => p[0]))].sort((a, b) => a - b);
-  const hit = svg("rect", { x: M.l, y: M.t, width: pw, height: ph, fill: "transparent" });
+  const tsUnion = [...new Set(allPts.map((point) => point[0]))].sort((tsA, tsB) => tsA - tsB);
+  const hit = svg("rect", { x: margin.left, y: margin.top, width: pw, height: ph, fill: "transparent" });
   root.append(hit);
 
-  function nearest(arr, t) {
+  function nearest(arr, target) {
     let lo = 0, hi = arr.length - 1;
-    while (hi - lo > 1) { const mid = (hi + lo) >> 1; (arr[mid] < t ? (lo = mid) : (hi = mid)); }
-    return t - arr[lo] < arr[hi] - t ? arr[lo] : arr[hi];
+    while (hi - lo > 1) { const mid = (hi + lo) >> 1; (arr[mid] < target ? (lo = mid) : (hi = mid)); }
+    return target - arr[lo] < arr[hi] - target ? arr[lo] : arr[hi];
   }
 
   function onMove(ev) {
     const rect = root.getBoundingClientRect();
     const px = ((ev.clientX - rect.left) / rect.width) * width;
-    const t = nearest(xsUnion, xFrom + ((px - M.l) / pw) * spanS);
-    const x = X(t);
-    cross.setAttribute("x1", x); cross.setAttribute("x2", x);
+    const ts = nearest(tsUnion, xFrom + ((px - margin.left) / pw) * spanS);
+    const xPos = xOf(ts);
+    cross.setAttribute("x1", xPos); cross.setAttribute("x2", xPos);
     cross.setAttribute("visibility", "visible");
     tip.textContent = "";
-    const timeRow = el("div", { class: "tt-time" }, fmtDT(t));
+    const timeRow = el("div", { class: "tt-time" }, fmtDT(ts));
     tip.append(timeRow);
-    series.forEach((s, i) => {
+    series.forEach((dataset, idx) => {
       let best = null;
-      for (const p of s.points) if (best === null || Math.abs(p[0] - t) < Math.abs(best[0] - t)) best = p;
-      if (!best || Math.abs(best[0] - t) > spanS / 8) { dots[i].setAttribute("visibility", "hidden"); return; }
-      dots[i].setAttribute("cx", X(best[0])); dots[i].setAttribute("cy", Y(best[1]));
-      dots[i].setAttribute("visibility", "visible");
+      for (const point of dataset.points) {
+        if (best === null || Math.abs(point[0] - ts) < Math.abs(best[0] - ts)) best = point;
+      }
+      if (!best || Math.abs(best[0] - ts) > spanS / 8) { dots[idx].setAttribute("visibility", "hidden"); return; }
+      dots[idx].setAttribute("cx", xOf(best[0])); dots[idx].setAttribute("cy", yOf(best[1]));
+      dots[idx].setAttribute("visibility", "visible");
       const row = el("div", { class: "tt-row" });
-      const sw = el("span", { class: "swatch" }); sw.style.background = s.color;
-      row.append(sw, el("span", { class: "tt-name" }, s.name),
+      const swatch = el("span", { class: "swatch" }); swatch.style.background = dataset.color;
+      row.append(swatch, el("span", { class: "tt-name" }, dataset.name),
         el("span", { class: "tt-val" }, `${fmtNum(best[1], opts.digits ?? 1)}${opts.unit ? " " + opts.unit : ""}`));
       tip.append(row);
     });
     tip.style.display = "block";
-    const bw = box.clientWidth;
-    const leftPct = (x / width) * bw;
-    tip.style.left = `${Math.min(bw - 150, Math.max(0, leftPct + 12))}px`;
+    const boxWidth = box.clientWidth;
+    const leftPct = (xPos / width) * boxWidth;
+    tip.style.left = `${Math.min(boxWidth - 150, Math.max(0, leftPct + 12))}px`;
     tip.style.top = "8px";
   }
   hit.addEventListener("pointermove", onMove);
   hit.addEventListener("pointerleave", () => {
     tip.style.display = "none";
     cross.setAttribute("visibility", "hidden");
-    dots.forEach((d) => d.setAttribute("visibility", "hidden"));
+    dots.forEach((dot) => dot.setAttribute("visibility", "hidden"));
   });
 
   if (series.length >= 2) {
     const legend = el("div", { class: "legend" });
-    for (const s of series) {
-      const sw = el("span", { class: "swatch" }); sw.style.background = s.color;
-      legend.append(el("span", { class: "lkey" }, sw, s.name));
+    for (const dataset of series) {
+      const swatch = el("span", { class: "swatch" }); swatch.style.background = dataset.color;
+      legend.append(el("span", { class: "lkey" }, swatch, dataset.name));
     }
     box.append(legend);
   }
@@ -372,60 +377,60 @@ function barChart(box, opts) {
   }
   const height = opts.height || 220;
   const width = Math.max(320, box.clientWidth || 800);
-  const M = { l: 48, r: 14, t: 12, b: 24 };
-  const pw = width - M.l - M.r, ph = height - M.t - M.b;
-  const yt = niceTicks(0, Math.max(...bars.map((b) => b.value), 0.001), 4);
-  const Y = (v) => M.t + ph - (v / (yt.max || 1)) * ph;
+  const margin = { left: 48, right: 14, top: 12, bottom: 24 };
+  const pw = width - margin.left - margin.right, ph = height - margin.top - margin.bottom;
+  const yt = niceTicks(0, Math.max(...bars.map((bar) => bar.value), 0.001), 4);
+  const yOf = (value) => margin.top + ph - (value / (yt.max || 1)) * ph;
   const root = svg("svg", { viewBox: `0 0 ${width} ${height}`, width, height });
 
   const yStep = yt.ticks.length > 1 ? yt.ticks[1] - yt.ticks[0] : 1;
   const tickDigits = Math.max(0, Math.min(3, -Math.floor(Math.log10(yStep) + 1e-9)));
-  for (const v of yt.ticks) {
-    if (v < 0) continue;
-    root.append(svg("line", { x1: M.l, x2: width - M.r, y1: Y(v), y2: Y(v), stroke: "var(--grid)", "stroke-width": 1 }));
-    const lbl = svg("text", { x: M.l - 6, y: Y(v) + 3.5, "text-anchor": "end", class: "axis-text" });
-    lbl.textContent = fmtNum(v, tickDigits);
+  for (const value of yt.ticks) {
+    if (value < 0) continue;
+    root.append(svg("line", { x1: margin.left, x2: width - margin.right, y1: yOf(value), y2: yOf(value), stroke: "var(--grid)", "stroke-width": 1 }));
+    const lbl = svg("text", { x: margin.left - 6, y: yOf(value) + 3.5, "text-anchor": "end", class: "axis-text" });
+    lbl.textContent = fmtNum(value, tickDigits);
     root.append(lbl);
   }
-  root.append(svg("line", { x1: M.l, x2: width - M.r, y1: M.t + ph, y2: M.t + ph, stroke: "var(--baseline)", "stroke-width": 1 }));
+  root.append(svg("line", { x1: margin.left, x2: width - margin.right, y1: margin.top + ph, y2: margin.top + ph, stroke: "var(--baseline)", "stroke-width": 1 }));
 
   const slot = pw / bars.length;
-  const bw = Math.min(24, Math.max(3, slot - 2));
+  const barWidth = Math.min(24, Math.max(3, slot - 2));
   const color = COLORS().s1;
   const tip = el("div", { class: "tooltip" });
-  const baseY = M.t + ph;
+  const baseY = margin.top + ph;
   const labelEvery = Math.max(1, Math.ceil(bars.length / Math.floor(pw / 60)));
 
-  bars.forEach((b, i) => {
-    const x = M.l + slot * i + (slot - bw) / 2;
-    const topY = Y(b.value);
-    const h = Math.max(0, baseY - topY);
-    const r = Math.min(4, bw / 2, h);
-    const d = h <= 0
+  bars.forEach((bar, idx) => {
+    const xPos = margin.left + slot * idx + (slot - barWidth) / 2;
+    const topY = yOf(bar.value);
+    const barHeight = Math.max(0, baseY - topY);
+    const cornerRadius = Math.min(4, barWidth / 2, barHeight);
+    const pathData = barHeight <= 0
       ? ""
-      : `M${x},${baseY} L${x},${topY + r} Q${x},${topY} ${x + r},${topY} L${x + bw - r},${topY} ` +
-        `Q${x + bw},${topY} ${x + bw},${topY + r} L${x + bw},${baseY} Z`;
-    const rect = d ? svg("path", { d, fill: color }) : null;
+      : `M${xPos},${baseY} L${xPos},${topY + cornerRadius} Q${xPos},${topY} ${xPos + cornerRadius},${topY} L${xPos + barWidth - cornerRadius},${topY} ` +
+        `Q${xPos + barWidth},${topY} ${xPos + barWidth},${topY + cornerRadius} L${xPos + barWidth},${baseY} Z`;
+    const rect = pathData ? svg("path", { d: pathData, fill: color }) : null;
     if (rect) root.append(rect);
-    if (i % labelEvery === 0) {
-      const xl = svg("text", { x: x + bw / 2, y: height - 6, "text-anchor": "middle", class: "axis-text" });
-      xl.textContent = b.label;
-      root.append(xl);
+    if (idx % labelEvery === 0) {
+      const xLabel = svg("text", { x: xPos + barWidth / 2, y: height - 6, "text-anchor": "middle", class: "axis-text" });
+      xLabel.textContent = bar.label;
+      root.append(xLabel);
     }
     // Hit target spans the full slot height, wider than the mark.
-    const hit = svg("rect", { x: M.l + slot * i, y: M.t, width: slot, height: ph, fill: "transparent" });
+    const hit = svg("rect", { x: margin.left + slot * idx, y: margin.top, width: slot, height: ph, fill: "transparent" });
     hit.addEventListener("pointermove", () => {
       if (rect) rect.setAttribute("fill-opacity", "0.8");
       tip.textContent = "";
-      tip.append(el("div", { class: "tt-time" }, b.label));
+      tip.append(el("div", { class: "tt-time" }, bar.label));
       const row = el("div", { class: "tt-row" });
-      const sw = el("span", { class: "swatch" }); sw.style.background = color;
-      row.append(sw, el("span", { class: "tt-name" }, opts.seriesName || ""),
-        el("span", { class: "tt-val" }, `${fmtNum(b.value, opts.digits ?? 1)}${opts.unit ? " " + opts.unit : ""}`));
+      const swatch = el("span", { class: "swatch" }); swatch.style.background = color;
+      row.append(swatch, el("span", { class: "tt-name" }, opts.seriesName || ""),
+        el("span", { class: "tt-val" }, `${fmtNum(bar.value, opts.digits ?? 1)}${opts.unit ? " " + opts.unit : ""}`));
       tip.append(row);
       tip.style.display = "block";
-      const bwPx = box.clientWidth;
-      tip.style.left = `${Math.min(bwPx - 150, Math.max(0, ((x + bw / 2) / width) * bwPx + 10))}px`;
+      const boxWidth = box.clientWidth;
+      tip.style.left = `${Math.min(boxWidth - 150, Math.max(0, ((xPos + barWidth / 2) / width) * boxWidth + 10))}px`;
       tip.style.top = "8px";
     });
     hit.addEventListener("pointerleave", () => {
@@ -448,80 +453,82 @@ function timeBrush(box, opts) {
   box.classList.add("chart-box");
   box.style.minHeight = `${HEIGHT}px`;
   const width = Math.max(320, box.clientWidth || 800);
-  const M = { l: 48, r: 14 };
-  const pw = width - M.l - M.r;
+  const margin = { left: 48, right: 14 };
+  const pw = width - margin.left - margin.right;
   const [tFrom, tTo] = opts.range;
   const span = Math.max(1, tTo - tFrom);
-  const X = (t) => M.l + ((t - tFrom) / span) * pw;
-  const T = (x) => tFrom + ((x - M.l) / pw) * span;
-  const clampT = (t) => Math.min(tTo, Math.max(tFrom, t));
+  const xOf = (ts) => margin.left + ((ts - tFrom) / span) * pw;
+  const tsOf = (xPos) => tFrom + ((xPos - margin.left) / pw) * span;
+  const clampT = (ts) => Math.min(tTo, Math.max(tFrom, ts));
   const MIN_WIN = Math.min(15, span / 4);
   const color = COLORS().s1;
 
   const root = svg("svg", { viewBox: `0 0 ${width} ${HEIGHT}`, width, height: HEIGHT, style: "touch-action:none" });
-  root.append(svg("rect", { x: M.l, y: 4, width: pw, height: HEIGHT - 8, fill: "transparent", stroke: "var(--grid)", "stroke-width": 1 }));
+  root.append(svg("rect", { x: margin.left, y: 4, width: pw, height: HEIGHT - 8, fill: "transparent", stroke: "var(--grid)", "stroke-width": 1 }));
 
   // overview: total power as a compact area
-  const pts = (opts.samples || []).map((p) => [p.ts, p.power]).filter((p) => p[1] != null && isFinite(p[1]));
+  const pts = (opts.samples || []).map((sample) => [sample.ts, sample.power])
+    .filter((point) => point[1] != null && isFinite(point[1]));
   if (pts.length > 1) {
-    const vMax = Math.max(...pts.map((p) => p[1]), 1);
-    const Y = (v) => (HEIGHT - 10) - (Math.max(0, v) / vMax) * (HEIGHT - 18);
-    const d = pts.map((p, i) => `${i ? "L" : "M"}${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join("");
+    const vMax = Math.max(...pts.map((point) => point[1]), 1);
+    const yOf = (value) => (HEIGHT - 10) - (Math.max(0, value) / vMax) * (HEIGHT - 18);
+    const pathData = pts.map((point, idx) =>
+      `${idx ? "L" : "M"}${xOf(point[0]).toFixed(1)},${yOf(point[1]).toFixed(1)}`).join("");
     root.append(svg("path", {
-      d: d + `L${X(pts[pts.length - 1][0]).toFixed(1)},${HEIGHT - 10}L${X(pts[0][0]).toFixed(1)},${HEIGHT - 10}Z`,
+      d: pathData + `L${xOf(pts[pts.length - 1][0]).toFixed(1)},${HEIGHT - 10}L${xOf(pts[0][0]).toFixed(1)},${HEIGHT - 10}Z`,
       fill: color, "fill-opacity": 0.12, stroke: "none",
     }));
-    root.append(svg("path", { d, fill: "none", stroke: color, "stroke-width": 1.5, "stroke-linejoin": "round" }));
+    root.append(svg("path", { d: pathData, fill: "none", stroke: color, "stroke-width": 1.5, "stroke-linejoin": "round" }));
   }
 
   // selection window
   const winRect = svg("rect", { y: 4, height: HEIGHT - 8, fill: color, "fill-opacity": 0.14, stroke: color, "stroke-width": 1.5, rx: 3 });
-  const hL = svg("rect", { y: HEIGHT / 2 - 12, width: 7, height: 24, rx: 3, fill: color, style: "cursor:ew-resize" });
-  const hR = svg("rect", { y: HEIGHT / 2 - 12, width: 7, height: 24, rx: 3, fill: color, style: "cursor:ew-resize" });
-  root.append(winRect, hL, hR);
+  const handleLeft = svg("rect", { y: HEIGHT / 2 - 12, width: 7, height: 24, rx: 3, fill: color, style: "cursor:ew-resize" });
+  const handleRight = svg("rect", { y: HEIGHT / 2 - 12, width: 7, height: 24, rx: 3, fill: color, style: "cursor:ew-resize" });
+  root.append(winRect, handleLeft, handleRight);
 
   let win = opts.win ? [...opts.win] : null;
   function draw() {
-    const [a, b] = win || [tFrom, tTo];
-    const xa = X(a), xb = X(b);
-    winRect.setAttribute("x", xa);
-    winRect.setAttribute("width", Math.max(1, xb - xa));
+    const [winStart, winEnd] = win || [tFrom, tTo];
+    const xStart = xOf(winStart), xEnd = xOf(winEnd);
+    winRect.setAttribute("x", xStart);
+    winRect.setAttribute("width", Math.max(1, xEnd - xStart));
     winRect.setAttribute("stroke-opacity", win ? 1 : 0.35);
     winRect.setAttribute("fill-opacity", win ? 0.14 : 0.04);
     winRect.style.cursor = win ? "grab" : "crosshair";
-    hL.setAttribute("x", xa - 3.5);
-    hR.setAttribute("x", xb - 3.5);
-    hL.style.display = hR.style.display = win ? "" : "none";
+    handleLeft.setAttribute("x", xStart - 3.5);
+    handleRight.setAttribute("x", xEnd - 3.5);
+    handleLeft.style.display = handleRight.style.display = win ? "" : "none";
   }
   draw();
 
   let mode = null, grabT = 0, winAtGrab = null;
   function pxT(ev) {
-    const r = root.getBoundingClientRect();
-    return T(((ev.clientX - r.left) / r.width) * width);
+    const rect = root.getBoundingClientRect();
+    return tsOf(((ev.clientX - rect.left) / rect.width) * width);
   }
   root.addEventListener("pointerdown", (ev) => {
-    const t = pxT(ev);
+    const ts = pxT(ev);
     root.setPointerCapture(ev.pointerId);
-    if (win && ev.target === hL) mode = "l";
-    else if (win && ev.target === hR) mode = "r";
-    else if (win && t > win[0] && t < win[1]) { mode = "move"; grabT = t; winAtGrab = [...win]; }
-    else { mode = "new"; grabT = clampT(t); win = [grabT, grabT]; }
+    if (win && ev.target === handleLeft) mode = "l";
+    else if (win && ev.target === handleRight) mode = "r";
+    else if (win && ts > win[0] && ts < win[1]) { mode = "move"; grabT = ts; winAtGrab = [...win]; }
+    else { mode = "new"; grabT = clampT(ts); win = [grabT, grabT]; }
     ev.preventDefault();
   });
   root.addEventListener("pointermove", (ev) => {
     if (!mode) return;
-    const t = clampT(pxT(ev));
-    if (mode === "l") win[0] = Math.min(t, win[1] - MIN_WIN);
-    else if (mode === "r") win[1] = Math.max(t, win[0] + MIN_WIN);
+    const ts = clampT(pxT(ev));
+    if (mode === "l") win[0] = Math.min(ts, win[1] - MIN_WIN);
+    else if (mode === "r") win[1] = Math.max(ts, win[0] + MIN_WIN);
     else if (mode === "move") {
-      const dt = t - grabT;
-      const w = winAtGrab[1] - winAtGrab[0];
-      let a = winAtGrab[0] + dt;
-      a = Math.min(Math.max(a, tFrom), tTo - w);
-      win = [a, a + w];
+      const dt = ts - grabT;
+      const winSpan = winAtGrab[1] - winAtGrab[0];
+      let newStart = winAtGrab[0] + dt;
+      newStart = Math.min(Math.max(newStart, tFrom), tTo - winSpan);
+      win = [newStart, newStart + winSpan];
     } else if (mode === "new") {
-      win = grabT < t ? [grabT, t] : [t, grabT];
+      win = grabT < ts ? [grabT, ts] : [ts, grabT];
     }
     draw();
   });
@@ -555,8 +562,8 @@ function statTile(label, value, unit, sub) {
 
 function presetRow(presets, activeKey, onPick) {
   const row = el("div", { class: "filters" }, el("span", { class: "flabel" }, "Range"));
-  for (const p of presets) {
-    row.append(el("button", { class: "chip" + (p.key === activeKey ? " active" : ""), onclick: () => onPick(p.key) }, p.label));
+  for (const preset of presets) {
+    row.append(el("button", { class: "chip" + (preset.key === activeKey ? " active" : ""), onclick: () => onPick(preset.key) }, preset.label));
   }
   return row;
 }
@@ -585,25 +592,25 @@ function connectSSE() {
 }
 
 function setConnDot(ok, text) {
-  const dot = $("#conn-dot"), t = $("#conn-text");
+  const dot = $("#conn-dot"), textEl = $("#conn-text");
   dot.className = "dot " + (ok ? "ok" : "bad");
-  t.textContent = text;
+  textEl.textContent = text;
 }
 
 async function refreshStatus() {
   try {
     const st = await getJSON("/api/status");
     live.status = st;
-    const p = st.poller || {};
+    const poller = st.poller || {};
     const stale = st.vitals ? (st.server_ts - st.vitals.ts) : null;
-    if (p.offline) setConnDot(false, `charger unreachable (${p.last_poll_error || "no response"})`);
+    if (poller.offline) setConnDot(false, `charger unreachable (${poller.last_poll_error || "no response"})`);
     else if (st.vitals) setConnDot(true, `charger online — last sample ${stale < 2 ? "now" : fmtDur(stale) + " ago"}`);
     else setConnDot(false, "no data yet");
     renderBanner(st.active_alerts || []);
     const counts = st.counts || {};
     $("#foot-info").textContent =
       `${fmtNum(counts.vitals_samples, 0)} vitals samples · ${fmtNum(counts.sessions, 0)} sessions · ` +
-      `${fmtNum(counts.events, 0)} events recorded` + (p.host ? ` · watching ${p.host}` : "");
+      `${fmtNum(counts.events, 0)} events recorded` + (poller.host ? ` · watching ${poller.host}` : "");
   } catch {
     setConnDot(false, "monitor unreachable");
   }
@@ -612,15 +619,15 @@ async function refreshStatus() {
 function renderBanner(alerts) {
   const holder = $("#alert-banner");
   holder.textContent = "";
-  for (const a of alerts) {
-    const sev = a.source === "device" ? "critical" : a.source === "wifi" ? "serious" : "critical";
-    const disp = alertDisplay(a.alert, a.source);
+  for (const alertItem of alerts) {
+    const sev = alertItem.source === "device" ? "critical" : alertItem.source === "wifi" ? "serious" : "critical";
+    const disp = alertDisplay(alertItem.alert, alertItem.source);
     const label = el("span", {}, disp.label);
     if (disp.sub) label.title = disp.sub;
     holder.append(el("div", { class: "banner " + sev },
       el("span", { class: "icon" }, "⚠"),
       label,
-      el("span", { class: "when" }, `active since ${fmtDT(a.first_ts)}`)));
+      el("span", { class: "when" }, `active since ${fmtDT(alertItem.first_ts)}`)));
   }
 }
 
@@ -629,7 +636,7 @@ function renderBanner(alerts) {
 let cleanup = null;
 
 async function viewLive(root) {
-  const C = COLORS();
+  const colors = COLORS();
   const tiles = el("div", { class: "cards" });
   const sessionCard = el("div", {});
   const thermalCard = el("div", {});
@@ -645,22 +652,22 @@ async function viewLive(root) {
     buf = hist.samples.map(fromDbRow);
   } catch { /* fresh DB */ }
 
-  function renderTiles(s) {
+  function renderTiles(sample) {
     tiles.textContent = "";
     const st = live.status || {};
     tiles.append(
-      statTile("Power", fmtNum((s.power ?? 0) / 1000, 2), "kW", s.charging ? "charging" : s.connected ? "connected, not charging" : "idle"),
-      statTile("Vehicle current", fmtNum(s.iv ?? (s.ia != null ? Math.max(s.ia, s.ib ?? 0, s.ic ?? 0) : null), 1), "A"),
-      statTile("Grid", `${fmtNum(s.gridV, 1)}`, "V", `${fmtNum(s.gridHz, 3)} Hz`),
-      statTile("Session energy", fmtNum((s.energy ?? 0) / 1000, 2), "kWh", s.sessionId ? `session #${s.sessionId}` : "no session"),
-      statTile("Plug handle temp", fmtNum(s.tHandle, 1), "°C",
-        `circuit board ${fmtNum(s.tPcba, 1)} °C · processor ${fmtNum(s.tMcu, 1)} °C`),
+      statTile("Power", fmtNum((sample.power ?? 0) / 1000, 2), "kW", sample.charging ? "charging" : sample.connected ? "connected, not charging" : "idle"),
+      statTile("Vehicle current", fmtNum(sample.iv ?? (sample.ia != null ? Math.max(sample.ia, sample.ib ?? 0, sample.ic ?? 0) : null), 1), "A"),
+      statTile("Grid", `${fmtNum(sample.gridV, 1)}`, "V", `${fmtNum(sample.gridHz, 3)} Hz`),
+      statTile("Session energy", fmtNum((sample.energy ?? 0) / 1000, 2), "kWh", sample.sessionId ? `session #${sample.sessionId}` : "no session"),
+      statTile("Plug handle temp", fmtNum(sample.tHandle, 1), "°C",
+        `circuit board ${fmtNum(sample.tPcba, 1)} °C · processor ${fmtNum(sample.tMcu, 1)} °C`),
       statTile("EVSE state", "", null, ""),
     );
     const evseTile = tiles.lastChild;
-    evseTile.querySelector(".tile-value").textContent = evseLabel(s.evse);
+    evseTile.querySelector(".tile-value").textContent = evseLabel(sample.evse);
     evseTile.querySelector(".tile-value").style.fontSize = "16px";
-    let notReady = s.notReady;
+    let notReady = sample.notReady;
     if (notReady == null && st.vitals && st.vitals.raw) {
       try { notReady = JSON.parse(st.vitals.raw).evse_not_ready_reasons || []; } catch { notReady = []; }
     }
@@ -668,124 +675,124 @@ async function viewLive(root) {
     // every connected sample, including while actively charging — so the
     // codes only carry meaning when no power is flowing. Suppress them during
     // charging rather than caption "Charging" with "not-ready reasons".
-    const showNotReady = !s.charging && notReady && notReady.length;
+    const showNotReady = !sample.charging && notReady && notReady.length;
     evseTile.querySelector(".tile-sub").textContent =
       (showNotReady ? `not-ready reason codes: ${notReady.join(", ")} — ` : "") +
-      (EVSE_VERIFIED.has(s.evse)
+      (EVSE_VERIFIED.has(sample.evse)
         ? "label verified from this charger's own telemetry; (n) is the charger's raw value"
         : "label is community-reported, unverified — Tesla doesn't document these codes; (n) is the charger's raw value");
     if (st.version) {
       tiles.append(statTile("Firmware", "", null, ""));
-      const t = tiles.lastChild;
-      t.querySelector(".tile-value").textContent = st.version.firmware_version || "—";
-      t.querySelector(".tile-value").style.fontSize = "15px";
-      t.querySelector(".tile-sub").textContent = `S/N ${st.version.serial_number || "?"}`;
+      const tile = tiles.lastChild;
+      tile.querySelector(".tile-value").textContent = st.version.firmware_version || "—";
+      tile.querySelector(".tile-value").style.fontSize = "15px";
+      tile.querySelector(".tile-sub").textContent = `S/N ${st.version.serial_number || "?"}`;
     }
   }
 
-  function renderSessionCard(s) {
+  function renderSessionCard(sample) {
     sessionCard.textContent = "";
-    if (!s.sessionId) return;
-    const started = buf.find((p) => p.sessionId === s.sessionId);
+    if (!sample.sessionId) return;
+    const started = buf.find((entry) => entry.sessionId === sample.sessionId);
     const startTs = (live.status && live.status.active_session && live.status.active_session.start_ts) || (started && started.ts);
     sessionCard.append(el("div", { class: "chart-card" },
-      el("div", { class: "chart-title" }, `Live charging session #${s.sessionId}`),
+      el("div", { class: "chart-title" }, `Live charging session #${sample.sessionId}`),
       el("dl", { class: "kv" },
-        el("dt", {}, "Plugged in"), el("dd", {}, startTs ? `${fmtDT(startTs)} (${fmtDur(s.ts - startTs)} ago)` : "—"),
-        el("dt", {}, "Energy this session"), el("dd", {}, `${fmtNum((s.energy ?? 0) / 1000, 2)} kWh`),
-        el("dt", {}, "State"), el("dd", {}, evseLabel(s.evse)),
+        el("dt", {}, "Plugged in"), el("dd", {}, startTs ? `${fmtDT(startTs)} (${fmtDur(sample.ts - startTs)} ago)` : "—"),
+        el("dt", {}, "Energy this session"), el("dd", {}, `${fmtNum((sample.energy ?? 0) / 1000, 2)} kWh`),
+        el("dt", {}, "State"), el("dd", {}, evseLabel(sample.evse)),
         el("dt", {}, "Device alerts"), el("dd", {},
-          (s.alerts && s.alerts.length) ? s.alerts.map((a) => alertDisplay(a, "device").label).join(", ") : "none")),
+          (sample.alerts && sample.alerts.length) ? sample.alerts.map((alertId) => alertDisplay(alertId, "device").label).join(", ") : "none")),
       el("div", { class: "note" }, "Full history for this session appears under Sessions once it ends — or open it live: "),
-      el("a", { href: `#/sessions/${s.sessionId}` }, "open session detail")));
+      el("a", { href: `#/sessions/${sample.sessionId}` }, "open session detail")));
   }
 
   function renderCharts() {
     const xTo = Date.now() / 1000;
     const xFrom = xTo - 900;
-    const pts = buf.filter((p) => p.ts >= xFrom);
+    const pts = buf.filter((sample) => sample.ts >= xFrom);
     lineChart(power.box, {
-      series: [{ name: "Power (W)", color: C.s1, points: pts.map((p) => [p.ts, p.power]) }],
+      series: [{ name: "Power (W)", color: colors.s1, points: pts.map((sample) => [sample.ts, sample.power]) }],
       unit: "W", digits: 0, area: true, zeroBase: true, xFrom, xTo, height: 230,
     });
     lineChart(currents.box, {
       series: [
-        { name: "Phase A", color: C.s1, points: pts.map((p) => [p.ts, p.ia]) },
-        { name: "Phase B", color: C.s2, points: pts.map((p) => [p.ts, p.ib]) },
-        { name: "Phase C", color: C.s3, points: pts.map((p) => [p.ts, p.ic]) },
+        { name: "Phase A", color: colors.s1, points: pts.map((sample) => [sample.ts, sample.ia]) },
+        { name: "Phase B", color: colors.s2, points: pts.map((sample) => [sample.ts, sample.ib]) },
+        { name: "Phase C", color: colors.s3, points: pts.map((sample) => [sample.ts, sample.ic]) },
       ],
       unit: "A", digits: 1, zeroBase: true, xFrom, xTo, height: 200,
     });
   }
 
-  const cToF = (c) => (c * 9) / 5 + 32;
+  const cToF = (celsius) => (celsius * 9) / 5 + 32;
 
-  function renderThermal(d) {
+  function renderThermal(data) {
     thermalCard.textContent = "";
-    const f = d.forecast, m = d.model || {};
+    const forecast = data.forecast, model = data.model || {};
     let chip = null;
     const lines = [];
-    if (d.state === "charging" && f && f.will_trip != null) {
-      if (f.will_trip && f.minutes_to_trip <= 0.5) {
+    if (data.state === "charging" && forecast && forecast.will_trip != null) {
+      if (forecast.will_trip && forecast.minutes_to_trip <= 0.5) {
         chip = chipFor("critical", "at the derate threshold now");
-      } else if (f.will_trip) {
-        chip = chipFor("warning", `derate expected ≈ ${fmtT(f.trip_ts).slice(0, 5)} (in ~${fmtNum(f.minutes_to_trip, 0)} min)`);
-        lines.push(`Handle is at ${fmtNum(d.handle_c, 1)} °C and heading to ~${fmtNum(f.steady_state_c, 1)} °C — ` +
-          `alert 40 raises at ${fmtNum(m.trip_c, 0)} °C and halves the charge current for the rest of the session.`);
-        if (f.suggested_max_a) {
-          lines.push(`Capping the vehicle's charge current at ~${fmtNum(f.suggested_max_a, 0)} A now would stay under the limit — ` +
+      } else if (forecast.will_trip) {
+        chip = chipFor("warning", `derate expected ≈ ${fmtT(forecast.trip_ts).slice(0, 5)} (in ~${fmtNum(forecast.minutes_to_trip, 0)} min)`);
+        lines.push(`Handle is at ${fmtNum(data.handle_c, 1)} °C and heading to ~${fmtNum(forecast.steady_state_c, 1)} °C — ` +
+          `alert 40 raises at ${fmtNum(model.trip_c, 0)} °C and halves the charge current for the rest of the session.`);
+        if (forecast.suggested_max_a) {
+          lines.push(`Capping the vehicle's charge current at ~${fmtNum(forecast.suggested_max_a, 0)} A now would stay under the limit — ` +
             `a faster charge overall than riding it into the 50% foldback.`);
         }
       } else {
         chip = chipFor("good", "no derate expected");
-        lines.push(`Handle is at ${fmtNum(d.handle_c, 1)} °C, settling near ~${fmtNum(f.steady_state_c, 1)} °C — ` +
-          `below the ${fmtNum(m.trip_c, 0)} °C alert-40 threshold.`);
+        lines.push(`Handle is at ${fmtNum(data.handle_c, 1)} °C, settling near ~${fmtNum(forecast.steady_state_c, 1)} °C — ` +
+          `below the ${fmtNum(model.trip_c, 0)} °C alert-40 threshold.`);
       }
-      lines.push(f.basis === "trajectory"
+      lines.push(forecast.basis === "trajectory"
         ? "Based on the handle's temperature trajectory over the last few minutes."
         : "Based on pre-session ambient and charge current — refines as the session warms up.");
-    } else if (d.state === "charging") {
+    } else if (data.state === "charging") {
       lines.push("Charging just started — the forecast needs a few minutes of steady data.");
-    } else if (d.state === "idle" && f) {
-      const amb = `${fmtNum(d.ambient_c, 1)} °C (${fmtNum(cToF(d.ambient_c), 0)} °F)`;
-      if (f.will_trip) {
+    } else if (data.state === "idle" && forecast) {
+      const amb = `${fmtNum(data.ambient_c, 1)} °C (${fmtNum(cToF(data.ambient_c), 0)} °F)`;
+      if (forecast.will_trip) {
         chip = chipFor("warning", "hot enough to derate");
-        lines.push(`Ambient at the charger ≈ ${amb}. A full-rate (${fmtNum(m.ref_current_a, 0)} A) charge started now ` +
-          `would hit the ${fmtNum(m.trip_c, 0)} °C handle limit in ~${fmtNum(f.minutes_to_trip, 0)} min and drop to half current.`);
-        if (f.suggested_max_a) {
-          lines.push(`Setting the vehicle to ~${fmtNum(f.suggested_max_a, 0)} A before plugging in would avoid the derate ` +
-            `and beat a full-rate start that folds back to ${fmtNum(m.ref_current_a / 2, 0)} A.`);
+        lines.push(`Ambient at the charger ≈ ${amb}. A full-rate (${fmtNum(model.ref_current_a, 0)} A) charge started now ` +
+          `would hit the ${fmtNum(model.trip_c, 0)} °C handle limit in ~${fmtNum(forecast.minutes_to_trip, 0)} min and drop to half current.`);
+        if (forecast.suggested_max_a) {
+          lines.push(`Setting the vehicle to ~${fmtNum(forecast.suggested_max_a, 0)} A before plugging in would avoid the derate ` +
+            `and beat a full-rate start that folds back to ${fmtNum(model.ref_current_a / 2, 0)} A.`);
         }
       } else {
         chip = chipFor("good", "full-rate charging safe");
-        lines.push(`Ambient at the charger ≈ ${amb}. A full-rate (${fmtNum(m.ref_current_a, 0)} A) charge would settle ` +
-          `near ~${fmtNum(f.steady_state_c, 1)} °C, below the ${fmtNum(m.trip_c, 0)} °C limit — derates start above ` +
-          `~${fmtNum(f.safe_ambient_max_c, 0)} °C (${fmtNum(cToF(f.safe_ambient_max_c), 0)} °F) ambient.`);
+        lines.push(`Ambient at the charger ≈ ${amb}. A full-rate (${fmtNum(model.ref_current_a, 0)} A) charge would settle ` +
+          `near ~${fmtNum(forecast.steady_state_c, 1)} °C, below the ${fmtNum(model.trip_c, 0)} °C limit — derates start above ` +
+          `~${fmtNum(forecast.safe_ambient_max_c, 0)} °C (${fmtNum(cToF(forecast.safe_ambient_max_c), 0)} °F) ambient.`);
       }
-      if (d.ambient_stable === false) lines.push("Handle is still cooling from recent charging, so the ambient estimate reads high.");
-    } else if (d.state === "connected") {
+      if (data.ambient_stable === false) lines.push("Handle is still cooling from recent charging, so the ambient estimate reads high.");
+    } else if (data.state === "connected") {
       lines.push("Vehicle connected but not charging — the forecast resumes when current flows.");
     } else {
       lines.push("No recent samples to forecast from.");
     }
     // Degradation watch: same fits, watched over time. Rising heat at the
     // same current means added resistance somewhere in the current path.
-    const drift = d.drift;
+    const drift = data.drift;
     let driftLine = null;
     if (drift && drift.drifting) {
       driftLine = el("div", { class: "note" },
         chipFor("serious", "heat rise increasing"),
-        ` Recent sessions average +${fmtNum(drift.recent_rise_c, 1)} °C at ${fmtNum(m.ref_current_a, 0)} A vs a ` +
+        ` Recent sessions average +${fmtNum(drift.recent_rise_c, 1)} °C at ${fmtNum(model.ref_current_a, 0)} A vs a ` +
         `+${fmtNum(drift.baseline_rise_c, 1)} °C baseline (Δ ${fmtNum(drift.delta_c, 1)} °C). More heat at the same current ` +
         `means added resistance — inspect the handle and charge-port pins, and have the terminal torque checked.`);
     }
-    const modelNote = `Model: τ ≈ ${fmtNum(m.tau_min, 1)} min, +${fmtNum(m.rise_ref_c, 0)} °C at ${fmtNum(m.ref_current_a, 0)} A — ` +
-      (m.fitted ? `fitted from ${m.tau_fits} recorded session ramp${m.tau_fits === 1 ? "" : "s"}.`
+    const modelNote = `Model: τ ≈ ${fmtNum(model.tau_min, 1)} min, +${fmtNum(model.rise_ref_c, 0)} °C at ${fmtNum(model.ref_current_a, 0)} A — ` +
+      (model.fitted ? `fitted from ${model.tau_fits} recorded session ramp${model.tau_fits === 1 ? "" : "s"}.`
                 : "defaults from the verified alert-40 event; refits automatically as sessions accumulate.") +
       (drift && !drift.drifting ? ` Heat rise stable across the last ${drift.recent_n + drift.baseline_n} fitted sessions.` : "");
     thermalCard.append(el("div", { class: "chart-card" },
       el("div", { class: "chart-title" }, "Thermal derate forecast", chip ? " " : null, chip),
-      ...lines.map((t) => el("div", { class: "note" }, t)),
+      ...lines.map((text) => el("div", { class: "note" }, text)),
       driftLine,
       el("div", { class: "chart-sub" }, modelNote)));
   }
@@ -802,37 +809,37 @@ async function viewLive(root) {
   let lastCharging = null;
   const onMsg = (msg) => {
     if (msg.type !== "vitals") return;
-    const s = fromSse(msg);
-    buf.push(s);
+    const sample = fromSse(msg);
+    buf.push(sample);
     const cutoff = Date.now() / 1000 - 960;
     while (buf.length && buf[0].ts < cutoff) buf.shift();
-    renderTiles(s);
-    renderSessionCard(s);
+    renderTiles(sample);
+    renderSessionCard(sample);
     renderCharts();
     // Refresh the forecast immediately when charging starts or stops rather
     // than waiting out the poll interval.
-    if (lastCharging !== null && s.charging !== lastCharging) loadThermal();
-    lastCharging = s.charging;
+    if (lastCharging !== null && sample.charging !== lastCharging) loadThermal();
+    lastCharging = sample.charging;
   };
   live.listeners.add(onMsg);
   return () => { live.listeners.delete(onMsg); clearInterval(thermalTimer); };
 }
 
 const RANGE_PRESETS = [
-  { key: "1h", label: "Last hour", s: 3600 },
-  { key: "6h", label: "6 hours", s: 6 * 3600 },
-  { key: "24h", label: "24 hours", s: 24 * 3600 },
-  { key: "7d", label: "7 days", s: 7 * 24 * 3600 },
-  { key: "30d", label: "30 days", s: 30 * 24 * 3600 },
-  { key: "90d", label: "90 days", s: 90 * 24 * 3600 },
+  { key: "1h", label: "Last hour", seconds: 3600 },
+  { key: "6h", label: "6 hours", seconds: 6 * 3600 },
+  { key: "24h", label: "24 hours", seconds: 24 * 3600 },
+  { key: "7d", label: "7 days", seconds: 7 * 24 * 3600 },
+  { key: "30d", label: "30 days", seconds: 30 * 24 * 3600 },
+  { key: "90d", label: "90 days", seconds: 90 * 24 * 3600 },
 ];
-const rangeSeconds = (key) => (RANGE_PRESETS.find((p) => p.key === key) || RANGE_PRESETS[3]).s;
+const rangeSeconds = (key) => (RANGE_PRESETS.find((preset) => preset.key === key) || RANGE_PRESETS[3]).seconds;
 
 async function viewSessions(root, rangeKey = "30d") {
   const now = Date.now() / 1000;
   const from = now - rangeSeconds(rangeKey);
   root.append(el("h2", {}, "Charging sessions"));
-  root.append(presetRow(RANGE_PRESETS.slice(2), rangeKey, (k) => { render("sessions", k); }));
+  root.append(presetRow(RANGE_PRESETS.slice(2), rangeKey, (key) => { render("sessions", key); }));
 
   const data = await getJSON(`/api/sessions?from=${from}&to=${now}`);
   const wrap = el("div", { class: "tbl-wrap" });
@@ -846,18 +853,18 @@ async function viewSessions(root, rangeKey = "30d") {
         el("th", { class: "num" }, "Energy (kWh)"), el("th", { class: "num" }, "Peak power (kW)"),
         el("th", { class: "num" }, "Samples"), el("th", {}, "Status"))));
     const tbody = el("tbody", {});
-    for (const s of data.sessions) {
-      const ongoing = s.end_ts == null;
-      const row = el("tr", { class: "clickable", onclick: () => { location.hash = `#/sessions/${s.id}`; } },
-        el("td", {}, `#${s.id}`),
-        el("td", {}, fmtDT(s.start_ts)),
-        el("td", {}, ongoing ? "ongoing" : fmtDT(s.end_ts)),
-        el("td", { class: "num" }, fmtDur((ongoing ? now : s.end_ts) - s.start_ts)),
-        el("td", { class: "num" }, fmtDur(s.charging_s)),
-        el("td", { class: "num" }, fmtNum((s.energy_wh ?? 0) / 1000, 2)),
-        el("td", { class: "num" }, fmtNum((s.max_power_w ?? 0) / 1000, 2)),
-        el("td", { class: "num" }, fmtNum(s.sample_count, 0)),
-        el("td", {}, chipFor(ongoing ? "good" : "muted", ongoing ? "live" : (s.end_reason || "ended").replaceAll("_", " "))));
+    for (const session of data.sessions) {
+      const ongoing = session.end_ts == null;
+      const row = el("tr", { class: "clickable", onclick: () => { location.hash = `#/sessions/${session.id}`; } },
+        el("td", {}, `#${session.id}`),
+        el("td", {}, fmtDT(session.start_ts)),
+        el("td", {}, ongoing ? "ongoing" : fmtDT(session.end_ts)),
+        el("td", { class: "num" }, fmtDur((ongoing ? now : session.end_ts) - session.start_ts)),
+        el("td", { class: "num" }, fmtDur(session.charging_s)),
+        el("td", { class: "num" }, fmtNum((session.energy_wh ?? 0) / 1000, 2)),
+        el("td", { class: "num" }, fmtNum((session.max_power_w ?? 0) / 1000, 2)),
+        el("td", { class: "num" }, fmtNum(session.sample_count, 0)),
+        el("td", {}, chipFor(ongoing ? "good" : "muted", ongoing ? "live" : (session.end_reason || "ended").replaceAll("_", " "))));
       tbody.append(row);
     }
     tbl.append(tbody);
@@ -877,16 +884,16 @@ async function viewEnergy(root, rangeKey = "30d") {
   root.append(el("h2", {}, "Charger lifetime"));
 
   const st = live.status || await getJSON("/api/status");
-  const lt = st.lifetime;
+  const lifetime = st.lifetime;
   const tiles = el("div", { class: "cards" });
-  if (lt) {
+  if (lifetime) {
     tiles.append(
-      statTile("Energy delivered", fmtNum(lt.energy_wh / 1e6, 2), "MWh", "over the charger's whole life"),
-      statTile("Charge sessions", fmtNum(lt.charge_starts, 0), null, `${fmtNum(lt.connector_cycles, 0)} plug-in cycles`),
-      statTile("Time charging", fmtNum(lt.charging_time_s / 3600, 0), "h", `uptime ${fmtNum(lt.uptime_s / 86400, 0)} days`),
-      statTile("Thermal foldbacks", fmtNum(lt.thermal_foldbacks, 0), null, "times charging was slowed by heat"),
-      statTile("Lifetime alerts", fmtNum(lt.alert_count, 0), null),
-      statTile("Contactor cycles", fmtNum(lt.contactor_cycles, 0), null, `${fmtNum(lt.contactor_cycles_loaded, 0)} under load`),
+      statTile("Energy delivered", fmtNum(lifetime.energy_wh / 1e6, 2), "MWh", "over the charger's whole life"),
+      statTile("Charge sessions", fmtNum(lifetime.charge_starts, 0), null, `${fmtNum(lifetime.connector_cycles, 0)} plug-in cycles`),
+      statTile("Time charging", fmtNum(lifetime.charging_time_s / 3600, 0), "h", `uptime ${fmtNum(lifetime.uptime_s / 86400, 0)} days`),
+      statTile("Thermal foldbacks", fmtNum(lifetime.thermal_foldbacks, 0), null, "times charging was slowed by heat"),
+      statTile("Lifetime alerts", fmtNum(lifetime.alert_count, 0), null),
+      statTile("Contactor cycles", fmtNum(lifetime.contactor_cycles, 0), null, `${fmtNum(lifetime.contactor_cycles_loaded, 0)} under load`),
     );
   } else {
     tiles.append(el("div", { class: "card" }, el("div", { class: "empty" }, "No lifetime data recorded yet.")));
@@ -894,23 +901,23 @@ async function viewEnergy(root, rangeKey = "30d") {
   root.append(tiles);
 
   root.append(el("h2", {}, "Energy per day"));
-  root.append(presetRow(RANGE_PRESETS.slice(3), rangeKey, (k) => render("energy", k)));
+  root.append(presetRow(RANGE_PRESETS.slice(3), rangeKey, (key) => render("energy", key)));
   const daily = chartCard("Daily energy delivered",
     "From the charger's cumulative counter, sampled every minute — days before monitoring began can't be reconstructed");
   root.append(daily.card);
 
   const data = await getJSON(`/api/lifetime?from=${from}&to=${now}`);
   const byDay = new Map();
-  for (const s of data.samples) {
-    if (s.energy_wh == null) continue;
-    const key = fmtDT(s.ts).slice(0, 10);
+  for (const sample of data.samples) {
+    if (sample.energy_wh == null) continue;
+    const key = fmtDT(sample.ts).slice(0, 10);
     const cur = byDay.get(key);
-    if (!cur) byDay.set(key, { min: s.energy_wh, max: s.energy_wh });
-    else { cur.min = Math.min(cur.min, s.energy_wh); cur.max = Math.max(cur.max, s.energy_wh); }
+    if (!cur) byDay.set(key, { min: sample.energy_wh, max: sample.energy_wh });
+    else { cur.min = Math.min(cur.min, sample.energy_wh); cur.max = Math.max(cur.max, sample.energy_wh); }
   }
-  const bars = [...byDay.entries()].map(([day, v]) => ({ label: day.slice(5), value: (v.max - v.min) / 1000 }));
+  const bars = [...byDay.entries()].map(([day, range]) => ({ label: day.slice(5), value: (range.max - range.min) / 1000 }));
   barChart(daily.box, { bars, unit: "kWh", digits: 1, seriesName: "Energy", height: 240 });
-  const total = bars.reduce((a, b) => a + b.value, 0);
+  const total = bars.reduce((sum, bar) => sum + bar.value, 0);
   if (bars.length) {
     root.append(el("div", { class: "note" },
       `${fmtNum(total, 1)} kWh across ${bars.length} recorded day${bars.length > 1 ? "s" : ""} ` +
@@ -919,7 +926,7 @@ async function viewEnergy(root, rangeKey = "30d") {
 }
 
 async function viewSessionDetail(root, id) {
-  const C = COLORS();
+  const colors = COLORS();
   // The skeleton is built once; live refreshes fetch first and then update
   // content in place, so the page never blanks or flashes mid-update.
   const heading = el("h2", {}, `Session #${id}`);
@@ -961,28 +968,28 @@ async function viewSessionDetail(root, id) {
 
   function renderCharts(samples, xFrom, xTo) {
     lineChart(power.box, {
-      series: [{ name: "Power (W)", color: C.s1, points: samples.map((p) => [p.ts, p.power]) }],
+      series: [{ name: "Power (W)", color: colors.s1, points: samples.map((sample) => [sample.ts, sample.power]) }],
       unit: "W", digits: 0, area: true, zeroBase: true, xFrom, xTo, height: 240,
     });
     lineChart(cur.box, {
       series: [
-        { name: "Phase A", color: C.s1, points: samples.map((p) => [p.ts, p.ia]) },
-        { name: "Phase B", color: C.s2, points: samples.map((p) => [p.ts, p.ib]) },
-        { name: "Phase C", color: C.s3, points: samples.map((p) => [p.ts, p.ic]) },
+        { name: "Phase A", color: colors.s1, points: samples.map((sample) => [sample.ts, sample.ia]) },
+        { name: "Phase B", color: colors.s2, points: samples.map((sample) => [sample.ts, sample.ib]) },
+        { name: "Phase C", color: colors.s3, points: samples.map((sample) => [sample.ts, sample.ic]) },
       ], unit: "A", digits: 1, zeroBase: true, xFrom, xTo, height: 190,
     });
     lineChart(volt.box, {
       series: [
-        { name: "Phase A", color: C.s1, points: samples.map((p) => [p.ts, p.va]) },
-        { name: "Phase B", color: C.s2, points: samples.map((p) => [p.ts, p.vb]) },
-        { name: "Phase C", color: C.s3, points: samples.map((p) => [p.ts, p.vc]) },
+        { name: "Phase A", color: colors.s1, points: samples.map((sample) => [sample.ts, sample.va]) },
+        { name: "Phase B", color: colors.s2, points: samples.map((sample) => [sample.ts, sample.vb]) },
+        { name: "Phase C", color: colors.s3, points: samples.map((sample) => [sample.ts, sample.vc]) },
       ], unit: "V", digits: 1, xFrom, xTo, height: 190,
     });
     lineChart(temp.box, {
       series: [
-        { name: "Circuit board (PCBA)", color: C.s1, points: samples.map((p) => [p.ts, p.tPcba]) },
-        { name: "Plug handle", color: C.s2, points: samples.map((p) => [p.ts, p.tHandle]) },
-        { name: "Processor (MCU)", color: C.s3, points: samples.map((p) => [p.ts, p.tMcu]) },
+        { name: "Circuit board (PCBA)", color: colors.s1, points: samples.map((sample) => [sample.ts, sample.tPcba]) },
+        { name: "Plug handle", color: colors.s2, points: samples.map((sample) => [sample.ts, sample.tHandle]) },
+        { name: "Processor (MCU)", color: colors.s3, points: samples.map((sample) => [sample.ts, sample.tMcu]) },
       ], unit: "°C", digits: 1, xFrom, xTo, height: 190,
       refLines: [
         { value: HANDLE_TRIP_C, label: `${HANDLE_TRIP_C}°C handle → alert 40 derate` },
@@ -991,21 +998,21 @@ async function viewSessionDetail(root, id) {
     });
     lineChart(pilot.box, {
       series: [
-        { name: "Pilot high", color: C.s1, points: samples.map((p) => [p.ts, p.pilotHigh]) },
-        { name: "Pilot low", color: C.s2, points: samples.map((p) => [p.ts, p.pilotLow]) },
-        { name: "Proximity", color: C.s3, points: samples.map((p) => [p.ts, p.prox]) },
+        { name: "Pilot high", color: colors.s1, points: samples.map((sample) => [sample.ts, sample.pilotHigh]) },
+        { name: "Pilot low", color: colors.s2, points: samples.map((sample) => [sample.ts, sample.pilotLow]) },
+        { name: "Proximity", color: colors.s3, points: samples.map((sample) => [sample.ts, sample.prox]) },
       ], unit: "V", digits: 1, xFrom, xTo, height: 190,
     });
     lineChart(relay.box, {
       series: [
-        { name: "Relay K1", color: C.s1, points: samples.map((p) => [p.ts, p.relayK1]) },
-        { name: "Relay K2", color: C.s2, points: samples.map((p) => [p.ts, p.relayK2]) },
+        { name: "Relay K1", color: colors.s1, points: samples.map((sample) => [sample.ts, sample.relayK1]) },
+        { name: "Relay K2", color: colors.s2, points: samples.map((sample) => [sample.ts, sample.relayK2]) },
       ], unit: "V", digits: 1, zeroBase: true, xFrom, xTo, height: 190,
     });
   }
 
   function renderEvents() {
-    const evs = win ? fullEvents.filter((e) => e.ts >= win[0] && e.ts <= win[1]) : fullEvents;
+    const evs = win ? fullEvents.filter((event) => event.ts >= win[0] && event.ts <= win[1]) : fullEvents;
     eventsWrap.replaceChildren(eventsTable(evs));
   }
 
@@ -1028,18 +1035,18 @@ async function viewSessionDetail(root, id) {
       return;
     }
     // Immediate feedback from data already in hand…
-    renderCharts(fullSamples.filter((p) => p.ts >= win[0] && p.ts <= win[1]), win[0], win[1]);
+    renderCharts(fullSamples.filter((sample) => sample.ts >= win[0] && sample.ts <= win[1]), win[0], win[1]);
     renderEvents();
     // …then upgrade to full-resolution samples for the window.
     try {
-      const d = await getJSON(`/api/vitals?from=${win[0]}&to=${win[1]}&points=1500`);
+      const data = await getJSON(`/api/vitals?from=${win[0]}&to=${win[1]}&points=1500`);
       if (seq !== winSeq || !win) return;
-      renderCharts(d.samples.map(fromDbRow), win[0], win[1]);
+      renderCharts(data.samples.map(fromDbRow), win[0], win[1]);
     } catch { /* keep the client-filtered render */ }
   }
 
-  function onBrushChange(w) {
-    win = w;
+  function onBrushChange(newWin) {
+    win = newWin;
     updateBrushInfo();
     clearTimeout(winTimer);
     winTimer = setTimeout(applyWindow, 200);
@@ -1047,34 +1054,34 @@ async function viewSessionDetail(root, id) {
 
   async function refresh() {
     const data = await getJSON(`/api/sessions/${id}`); // fetch completes before any DOM change
-    const s = data.session;
-    ongoing = s.end_ts == null;
+    const session = data.session;
+    ongoing = session.end_ts == null;
     const now = Date.now() / 1000;
     const samples = data.samples.map(fromDbRow);
 
-    heading.replaceChildren(`Session #${s.id} `, ongoing ? chipFor("good", "live") : chipFor("muted", "ended"));
+    heading.replaceChildren(`Session #${session.id} `, ongoing ? chipFor("good", "live") : chipFor("muted", "ended"));
 
-    const energyKwh = (s.energy_wh ?? (samples.length ? samples[samples.length - 1].energy : 0) ?? 0) / 1000;
-    const maxP = s.max_power_w ?? Math.max(0, ...samples.map((p) => p.power || 0));
+    const energyKwh = (session.energy_wh ?? (samples.length ? samples[samples.length - 1].energy : 0) ?? 0) / 1000;
+    const maxP = session.max_power_w ?? Math.max(0, ...samples.map((sample) => sample.power || 0));
     // The plug-in time can predate monitoring (derived from the charger's own
     // session timer); charts still start at the first observed sample.
-    const firstSeen = samples.length ? samples[0].ts : s.start_ts;
-    const backdated = firstSeen - s.start_ts > 120;
+    const firstSeen = samples.length ? samples[0].ts : session.start_ts;
+    const backdated = firstSeen - session.start_ts > 120;
     tiles.replaceChildren(
-      statTile("Plugged in", fmtDT(s.start_ts).slice(11), null,
-        fmtDT(s.start_ts).slice(0, 10) + (backdated ? ` — from charger's timer; monitoring since ${fmtT(firstSeen)}` : "")),
+      statTile("Plugged in", fmtDT(session.start_ts).slice(11), null,
+        fmtDT(session.start_ts).slice(0, 10) + (backdated ? ` — from charger's timer; monitoring since ${fmtT(firstSeen)}` : "")),
       ongoing
         ? statTile("Status", "Plugged in", null, "session in progress")
-        : statTile("Unplugged", fmtDT(s.end_ts).slice(11), null, fmtDT(s.end_ts).slice(0, 10)),
-      statTile("Duration", fmtDur((ongoing ? now : s.end_ts) - s.start_ts), null,
-        s.charging_s != null ? `charging ${fmtDur(s.charging_s)}` : "charging time totals when the session ends"),
+        : statTile("Unplugged", fmtDT(session.end_ts).slice(11), null, fmtDT(session.end_ts).slice(0, 10)),
+      statTile("Duration", fmtDur((ongoing ? now : session.end_ts) - session.start_ts), null,
+        session.charging_s != null ? `charging ${fmtDur(session.charging_s)}` : "charging time totals when the session ends"),
       statTile("Energy", fmtNum(energyKwh, 2), "kWh"),
-      statTile("Peak power", fmtNum(maxP / 1000, 2), "kW", s.avg_power_w != null ? `avg ${fmtNum(s.avg_power_w / 1000, 2)} kW` : null),
-      statTile("Samples", fmtNum(s.sample_count ?? samples.length, 0), null, "full fidelity retained"));
+      statTile("Peak power", fmtNum(maxP / 1000, 2), "kW", session.avg_power_w != null ? `avg ${fmtNum(session.avg_power_w / 1000, 2)} kW` : null),
+      statTile("Samples", fmtNum(session.sample_count ?? samples.length, 0), null, "full fidelity retained"));
 
     fullSamples = samples;
     fullEvents = data.events;
-    sessionRange = [backdated ? firstSeen : s.start_ts, ongoing ? now : s.end_ts];
+    sessionRange = [backdated ? firstSeen : session.start_ts, ongoing ? now : session.end_ts];
     renderBrush();
     await applyWindow();
   }
@@ -1112,18 +1119,18 @@ function eventsTable(events) {
     let detail = "";
     if (ev.detail) {
       try {
-        const d = JSON.parse(ev.detail);
-        if (ev.kind === "evse_state_change") detail = `${evseLabel(d.from)} → ${evseLabel(d.to)}`;
-        else if (ev.kind === "monitor_gap") detail = `no data since ${fmtDT(d.offline_since)} (${fmtDur(d.gap_s)})`;
+        const detailObj = JSON.parse(ev.detail);
+        if (ev.kind === "evse_state_change") detail = `${evseLabel(detailObj.from)} → ${evseLabel(detailObj.to)}`;
+        else if (ev.kind === "monitor_gap") detail = `no data since ${fmtDT(detailObj.offline_since)} (${fmtDur(detailObj.gap_s)})`;
         else if (ev.kind === "evse_not_ready_change")
-          detail = `codes [${(d.from || []).join(", ")}] → [${(d.to || []).join(", ")}] (undocumented)`;
-        else if ((ev.kind === "alert_raised" || ev.kind === "alert_cleared") && d.alert != null) {
-          const disp = alertDisplay(d.alert, "device");
+          detail = `codes [${(detailObj.from || []).join(", ")}] → [${(detailObj.to || []).join(", ")}] (undocumented)`;
+        else if ((ev.kind === "alert_raised" || ev.kind === "alert_cleared") && detailObj.alert != null) {
+          const disp = alertDisplay(detailObj.alert, "device");
           detail = disp.sub ? `${disp.label} · ${disp.sub}` : disp.label;
         }
-        else if (ev.kind === "session_start" && d.backdated_s)
-          detail = `session_id: ${d.session_id} · start backdated ${fmtDur(d.backdated_s)} from the charger's session timer`;
-        else detail = Object.entries(d).map(([k, v]) => `${k}: ${v}`).join(" · ");
+        else if (ev.kind === "session_start" && detailObj.backdated_s)
+          detail = `session_id: ${detailObj.session_id} · start backdated ${fmtDur(detailObj.backdated_s)} from the charger's session timer`;
+        else detail = Object.entries(detailObj).map(([key, value]) => `${key}: ${value}`).join(" · ");
       } catch { detail = String(ev.detail); }
     }
     tbody.append(el("tr", {},
@@ -1137,34 +1144,34 @@ function eventsTable(events) {
 }
 
 async function viewWifi(root, rangeKey = "24h") {
-  const C = COLORS();
+  const colors = COLORS();
   const now = Date.now() / 1000;
   const from = now - rangeSeconds(rangeKey);
   root.append(el("h2", {}, "Wi-Fi health"));
-  root.append(presetRow(RANGE_PRESETS.slice(0, 4), rangeKey, (k) => render("wifi", k)));
+  root.append(presetRow(RANGE_PRESETS.slice(0, 4), rangeKey, (key) => render("wifi", key)));
 
   const [data, evData] = await Promise.all([
     getJSON(`/api/wifi?from=${from}&to=${now}`),
     getJSON(`/api/events?from=${from}&to=${now}&kinds=wifi_disconnected,wifi_reconnected,internet_lost,internet_restored,poll_error,poll_recovered`),
   ]);
   const st = live.status || await getJSON("/api/status");
-  const w = st.wifi;
+  const wifi = st.wifi;
 
   const tiles = el("div", { class: "cards" });
-  if (w) {
+  if (wifi) {
     tiles.append(
       statTile("Charger Wi-Fi", "", null, ""),
       statTile("Internet (charger → Tesla)", "", null, ""),
-      statTile("Signal", fmtNum(w.signal_strength, 0), "%", `RSSI ${fmtNum(w.rssi, 0)} dBm · SNR ${fmtNum(w.snr, 0)} dB`),
+      statTile("Signal", fmtNum(wifi.signal_strength, 0), "%", `RSSI ${fmtNum(wifi.rssi, 0)} dBm · SNR ${fmtNum(wifi.snr, 0)} dB`),
       statTile("Network", "", null, ""));
     const [wifiTile, netTile, , netInfo] = tiles.children;
-    wifiTile.querySelector(".tile-value").replaceChildren(chipFor(w.connected ? "good" : "critical", w.connected ? "connected" : "disconnected"));
-    wifiTile.querySelector(".tile-sub").textContent = `as of ${fmtDT(w.ts)}`;
-    netTile.querySelector(".tile-value").replaceChildren(chipFor(w.internet ? "good" : "warning", w.internet ? "reachable" : "unreachable"));
+    wifiTile.querySelector(".tile-value").replaceChildren(chipFor(wifi.connected ? "good" : "critical", wifi.connected ? "connected" : "disconnected"));
+    wifiTile.querySelector(".tile-sub").textContent = `as of ${fmtDT(wifi.ts)}`;
+    netTile.querySelector(".tile-value").replaceChildren(chipFor(wifi.internet ? "good" : "warning", wifi.internet ? "reachable" : "unreachable"));
     netTile.querySelector(".tile-sub").textContent = "the charger's own cloud link — the monitor never uses it";
-    netInfo.querySelector(".tile-value").textContent = w.ssid || "—";
+    netInfo.querySelector(".tile-value").textContent = wifi.ssid || "—";
     netInfo.querySelector(".tile-value").style.fontSize = "16px";
-    netInfo.querySelector(".tile-sub").textContent = `${w.infra_ip || "?"} · ${w.mac || "?"}`;
+    netInfo.querySelector(".tile-sub").textContent = `${wifi.infra_ip || "?"} · ${wifi.mac || "?"}`;
   } else {
     tiles.append(el("div", { class: "card" }, el("div", { class: "empty" }, "No Wi-Fi data recorded yet.")));
   }
@@ -1175,20 +1182,20 @@ async function viewWifi(root, rangeKey = "24h") {
   const snr = chartCard("Signal-to-noise ratio", "dB — above ~20 dB is healthy");
   const sig = chartCard("Signal strength", "Charger-reported quality, %");
   root.append(el("div", { class: "grid-3" }, rssi.card, snr.card, sig.card));
-  lineChart(rssi.box, { series: [{ name: "RSSI", color: C.s1, points: pts.map((p) => [p.ts, p.rssi]) }], unit: "dBm", digits: 0, xFrom: from, xTo: now, height: 170 });
-  lineChart(snr.box, { series: [{ name: "SNR", color: C.s1, points: pts.map((p) => [p.ts, p.snr]) }], unit: "dB", digits: 0, xFrom: from, xTo: now, height: 170 });
-  lineChart(sig.box, { series: [{ name: "Signal", color: C.s1, points: pts.map((p) => [p.ts, p.signal_strength]) }], unit: "%", digits: 0, zeroBase: true, xFrom: from, xTo: now, height: 170 });
+  lineChart(rssi.box, { series: [{ name: "RSSI", color: colors.s1, points: pts.map((sample) => [sample.ts, sample.rssi]) }], unit: "dBm", digits: 0, xFrom: from, xTo: now, height: 170 });
+  lineChart(snr.box, { series: [{ name: "SNR", color: colors.s1, points: pts.map((sample) => [sample.ts, sample.snr]) }], unit: "dB", digits: 0, xFrom: from, xTo: now, height: 170 });
+  lineChart(sig.box, { series: [{ name: "Signal", color: colors.s1, points: pts.map((sample) => [sample.ts, sample.signal_strength]) }], unit: "%", digits: 0, zeroBase: true, xFrom: from, xTo: now, height: 170 });
 
   root.append(el("h2", {}, "Connectivity events"));
   root.append(eventsTable(evData.events));
 }
 
 async function viewAlerts(root, rangeKey = "7d") {
-  const C = COLORS();
+  const colors = COLORS();
   const now = Date.now() / 1000;
   const from = now - rangeSeconds(rangeKey);
   root.append(el("h2", {}, "Alerts"));
-  const [data, th] = await Promise.all([
+  const [data, thermalData] = await Promise.all([
     getJSON(`/api/alerts?from=${from}&to=${now}`),
     getJSON("/api/thermal").catch(() => null),
     loadAlertCodes(),
@@ -1201,18 +1208,18 @@ async function viewAlerts(root, rangeKey = "7d") {
       el("div", { class: "tile-value" }, chipFor("good", "none")),
       el("div", { class: "tile-sub" }, "the charger reports no active alerts")));
   } else {
-    for (const a of data.active) {
-      const disp = alertDisplay(a.alert, a.source);
+    for (const alertItem of data.active) {
+      const disp = alertDisplay(alertItem.alert, alertItem.source);
       // Verified descriptions can run to a paragraph; inline only the first
       // sentence (the official alert text) and keep the full description in
       // the hover tooltip, like the banner and history table. The card spans
       // the grid row so a lone active alert doesn't render as a tall column.
       const firstSentence = disp.sub ? disp.sub.split(". ")[0] : null;
       const card = el("div", { class: "card wide" },
-        el("div", { class: "tile-label" }, `${a.source} alert`),
-        el("div", { class: "tile-value" }, chipFor(a.source === "wifi" ? "serious" : "critical", disp.label)),
+        el("div", { class: "tile-label" }, `${alertItem.source} alert`),
+        el("div", { class: "tile-value" }, chipFor(alertItem.source === "wifi" ? "serious" : "critical", disp.label)),
         el("div", { class: "tile-sub" },
-          `since ${fmtDT(a.first_ts)} (${fmtDur(now - a.first_ts)})` + (firstSentence ? ` · ${firstSentence}` : "")));
+          `since ${fmtDT(alertItem.first_ts)} (${fmtDur(now - alertItem.first_ts)})` + (firstSentence ? ` · ${firstSentence}` : "")));
       if (disp.sub) card.title = disp.sub;
       activeWrap.append(card);
     }
@@ -1222,15 +1229,15 @@ async function viewAlerts(root, rangeKey = "7d") {
   // Degradation watch: fitted heat rise per session at reference current.
   // Prediction uses the rolling median, which would silently follow a slow
   // increase; this trend is where a developing contact/wiring problem shows.
-  const fits = ((th && th.session_fits) || []).filter((f) => f.rise_ref_c != null);
+  const fits = ((thermalData && thermalData.session_fits) || []).filter((fit) => fit.rise_ref_c != null);
   if (fits.length >= 2) {
-    const drift = th.drift;
+    const drift = thermalData.drift;
     const rise = chartCard("Handle heat rise per session",
-      `Fitted steady-state rise above ambient, normalized to ${fmtNum(th.model.ref_current_a, 0)} A. ` +
+      `Fitted steady-state rise above ambient, normalized to ${fmtNum(thermalData.model.ref_current_a, 0)} A. ` +
       "A sustained climb at the same current means added resistance in the current path — inspect before it becomes heat.");
     root.append(rise.card);
     lineChart(rise.box, {
-      series: [{ name: "Rise (°C)", color: C.s1, points: fits.map((f) => [f.start_ts, f.rise_ref_c]) }],
+      series: [{ name: "Rise (°C)", color: colors.s1, points: fits.map((fit) => [fit.start_ts, fit.rise_ref_c]) }],
       unit: "°C", digits: 1, height: 180,
     });
     if (drift) {
@@ -1244,7 +1251,7 @@ async function viewAlerts(root, rangeKey = "7d") {
   }
 
   root.append(el("h2", {}, "Alert history"));
-  root.append(presetRow(RANGE_PRESETS.slice(2), rangeKey, (k) => render("alerts", k)));
+  root.append(presetRow(RANGE_PRESETS.slice(2), rangeKey, (key) => render("alerts", key)));
   const wrap = el("div", { class: "tbl-wrap" });
   if (!data.history.length) {
     wrap.append(el("div", { class: "empty" }, "No alerts recorded in this range."));
@@ -1254,16 +1261,16 @@ async function viewAlerts(root, rangeKey = "7d") {
         el("th", {}, "Alert"), el("th", {}, "Source"), el("th", {}, "First seen"),
         el("th", {}, "Cleared"), el("th", { class: "num" }, "Duration"), el("th", {}, "Status"))));
     const tbody = el("tbody", {});
-    for (const a of data.history) {
-      const disp = alertDisplay(a.alert, a.source);
+    for (const alertItem of data.history) {
+      const disp = alertDisplay(alertItem.alert, alertItem.source);
       const cell = el("td", {}, disp.label);
       if (disp.sub) cell.title = disp.sub;
       tbody.append(el("tr", {},
-        cell, el("td", {}, a.source),
-        el("td", {}, fmtDT(a.first_ts)),
-        el("td", {}, a.cleared_ts ? fmtDT(a.cleared_ts) : "—"),
-        el("td", { class: "num" }, fmtDur((a.cleared_ts ?? now) - a.first_ts)),
-        el("td", {}, a.active ? chipFor("critical", "active") : chipFor("good", "cleared"))));
+        cell, el("td", {}, alertItem.source),
+        el("td", {}, fmtDT(alertItem.first_ts)),
+        el("td", {}, alertItem.cleared_ts ? fmtDT(alertItem.cleared_ts) : "—"),
+        el("td", { class: "num" }, fmtDur((alertItem.cleared_ts ?? now) - alertItem.first_ts)),
+        el("td", {}, alertItem.active ? chipFor("critical", "active") : chipFor("good", "cleared"))));
     }
     tbl.append(tbody);
     wrap.append(tbl);
@@ -1283,11 +1290,11 @@ async function viewAlerts(root, rangeKey = "7d") {
     const rtbl = el("table", {},
       el("thead", {}, el("tr", {}, el("th", {}, "LED"), el("th", {}, "Fault"), el("th", {}, "Meaning / action"))));
     const rbody = el("tbody", {});
-    for (const c of cats) {
+    for (const category of cats) {
       rbody.append(el("tr", {},
-        el("td", {}, c.led),
-        el("td", {}, c.label),
-        el("td", { style: "white-space:normal" }, c.description)));
+        el("td", {}, category.led),
+        el("td", {}, category.label),
+        el("td", { style: "white-space:normal" }, category.description)));
     }
     rtbl.append(rbody);
     root.append(el("div", { class: "tbl-wrap" }, rtbl));
@@ -1317,8 +1324,8 @@ async function render(view, arg) {
   const root = $("#view");
   root.style.minHeight = sameView ? `${root.offsetHeight}px` : "";
   root.textContent = "";
-  document.querySelectorAll(".tabs a").forEach((a) => {
-    a.classList.toggle("active", a.dataset.view === (view === "session" ? "sessions" : view));
+  document.querySelectorAll(".tabs a").forEach((tab) => {
+    tab.classList.toggle("active", tab.dataset.view === (view === "session" ? "sessions" : view));
   });
   try {
     if (view === "live") cleanup = await viewLive(root);

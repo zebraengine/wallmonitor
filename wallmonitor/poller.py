@@ -44,20 +44,20 @@ class EventBus:
         self._subscribers: set[asyncio.Queue] = set()
 
     def subscribe(self) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue(maxsize=500)
-        self._subscribers.add(q)
-        return q
+        queue: asyncio.Queue = asyncio.Queue(maxsize=500)
+        self._subscribers.add(queue)
+        return queue
 
-    def unsubscribe(self, q: asyncio.Queue) -> None:
-        self._subscribers.discard(q)
+    def unsubscribe(self, queue: asyncio.Queue) -> None:
+        self._subscribers.discard(queue)
 
     def publish(self, message: dict) -> None:
-        for q in list(self._subscribers):
+        for queue in list(self._subscribers):
             try:
-                q.put_nowait(message)
+                queue.put_nowait(message)
             except asyncio.QueueFull:
                 # Slow consumer: drop it rather than stall the poller.
-                self._subscribers.discard(q)
+                self._subscribers.discard(queue)
 
 
 def _total_power(raw: dict, split_phase: bool) -> float | None:
@@ -143,7 +143,7 @@ class Poller:
             # Strictly sequential: at most one endpoint polled per iteration.
             # Most-overdue first, so a tight vitals cadence can't starve the
             # slower endpoints.
-            due_now = [ep for ep, t in self._due.items() if now >= t]
+            due_now = [ep for ep, due_ts in self._due.items() if now >= due_ts]
             if due_now:
                 endpoint = min(due_now, key=lambda ep: self._due[ep])
                 await self._poll(endpoint, handlers[endpoint])
@@ -287,7 +287,7 @@ class Poller:
             await self._event(ts, "evse_not_ready_change", {"from": reasons_prev, "to": reasons_now})
 
         # Device alert diffing
-        alerts_now = {str(a) for a in raw.get("current_alerts") or []}
+        alerts_now = {str(alert_id) for alert_id in raw.get("current_alerts") or []}
         for alert in alerts_now - self._active_alerts:
             await asyncio.to_thread(self.db.raise_alert, ts, alert, "device")
             await self._event(ts, "alert_raised", {"alert": alert})

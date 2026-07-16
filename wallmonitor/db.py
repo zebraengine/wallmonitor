@@ -174,7 +174,7 @@ class Database:
     # ---------- writes ----------
 
     def insert_vitals(self, ts: float, raw: dict, session_id: int | None, total_power_w: float | None) -> int:
-        cols = {c: raw.get(k) for c, k in VITALS_COLUMNS.items()}
+        cols = {col: raw.get(json_key) for col, json_key in VITALS_COLUMNS.items()}
         with self._lock:
             cur = self._execute(
                 f"""INSERT INTO vitals_samples
@@ -327,13 +327,13 @@ class Database:
             rows = self._conn.execute(
                 "SELECT * FROM alerts WHERE active = 1 ORDER BY first_ts DESC"
             ).fetchall()
-            return [dict(r) for r in rows]
+            return [dict(row) for row in rows]
 
     # ---------- reads ----------
 
     def _rows(self, sql: str, params: tuple = ()) -> list[dict]:
         with self._lock:
-            return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+            return [dict(row) for row in self._conn.execute(sql, params).fetchall()]
 
     def latest_vitals(self) -> dict | None:
         rows = self._rows("SELECT * FROM vitals_samples ORDER BY ts DESC LIMIT 1")
@@ -353,16 +353,16 @@ class Database:
 
     def vitals_range(self, t_from: float, t_to: float, max_points: int = 1500) -> list[dict]:
         """Vitals samples in a range, bucket-averaged down to at most max_points."""
-        n = self._rows(
+        sample_count = self._rows(
             "SELECT COUNT(*) AS n FROM vitals_samples WHERE ts >= ? AND ts <= ?", (t_from, t_to)
         )[0]["n"]
         # The device reports 255 (0xFF) for a temperature when the sensor read
         # is momentarily invalid (seen on the handle during connector state
         # transitions). Raw JSON keeps the sentinel; interpreted queries
         # return NULL instead so charts and averages are never poisoned.
-        temp = "CASE WHEN {c} >= 255 THEN NULL ELSE {c} END"
+        temp = "CASE WHEN {col} >= 255 THEN NULL ELSE {col} END"
         t_pcba, t_handle, t_mcu = (
-            temp.format(c=c) for c in ("pcba_temp_c", "handle_temp_c", "mcu_temp_c")
+            temp.format(col=col) for col in ("pcba_temp_c", "handle_temp_c", "mcu_temp_c")
         )
         # Handshake diagnostics live only in the raw JSON; json_extract makes
         # them chartable retroactively for every sample ever recorded.
@@ -371,7 +371,7 @@ class Database:
                   json_extract(raw, '$.prox_v') AS prox_v,
                   COALESCE(json_extract(raw, '$.relay_k1_v'), json_extract(raw, '$.relay_coil_v')) AS relay_k1_v,
                   json_extract(raw, '$.relay_k2_v') AS relay_k2_v"""
-        if n <= max_points:
+        if sample_count <= max_points:
             return self._rows(
                 f"""SELECT ts, total_power_w, vehicle_current_a, current_a_a, current_b_a, current_c_a,
                           voltage_a_v, voltage_b_v, voltage_c_v, grid_v, grid_hz,
@@ -410,8 +410,10 @@ class Database:
     def lifetime_range(self, t_from: float, t_to: float, max_points: int = 3000) -> list[dict]:
         """Lifetime counter samples in a range (counters are monotonic, so
         buckets keep the last/max value)."""
-        n = self._rows("SELECT COUNT(*) AS n FROM lifetime_samples WHERE ts >= ? AND ts <= ?", (t_from, t_to))[0]["n"]
-        if n <= max_points:
+        sample_count = self._rows(
+            "SELECT COUNT(*) AS n FROM lifetime_samples WHERE ts >= ? AND ts <= ?", (t_from, t_to)
+        )[0]["n"]
+        if sample_count <= max_points:
             return self._rows(
                 """SELECT ts, energy_wh, charge_starts, charging_time_s
                    FROM lifetime_samples WHERE ts >= ? AND ts <= ? ORDER BY ts""",
@@ -427,8 +429,10 @@ class Database:
         )
 
     def wifi_range(self, t_from: float, t_to: float, max_points: int = 1000) -> list[dict]:
-        n = self._rows("SELECT COUNT(*) AS n FROM wifi_samples WHERE ts >= ? AND ts <= ?", (t_from, t_to))[0]["n"]
-        if n <= max_points:
+        sample_count = self._rows(
+            "SELECT COUNT(*) AS n FROM wifi_samples WHERE ts >= ? AND ts <= ?", (t_from, t_to)
+        )[0]["n"]
+        if sample_count <= max_points:
             return self._rows(
                 """SELECT ts, connected, internet, signal_strength, rssi, snr
                    FROM wifi_samples WHERE ts >= ? AND ts <= ? ORDER BY ts""",

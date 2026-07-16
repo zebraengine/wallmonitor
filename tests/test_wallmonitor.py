@@ -48,7 +48,7 @@ async def test_poller_records_and_sessions(db):
         min_interval=0.01,
     )
     bus = EventBus()
-    q = bus.subscribe()
+    queue = bus.subscribe()
     async with aiohttp.ClientSession() as client:
         poller = Poller(cfg, db, bus, client)
         await poller.start()
@@ -58,7 +58,7 @@ async def test_poller_records_and_sessions(db):
             await _wait_for(lambda: db.counts()["sessions"] >= 1)
             # Wait for a session to complete (end_ts set).
             closed = await _wait_for(
-                lambda: [s for s in db.sessions_range(0, time.time() + 1) if s["end_ts"]] or None
+                lambda: [session for session in db.sessions_range(0, time.time() + 1) if session["end_ts"]] or None
             )
             session = closed[0]
             assert session["energy_wh"] and session["energy_wh"] > 0
@@ -71,13 +71,13 @@ async def test_poller_records_and_sessions(db):
 
     # Events recorded with the same clock
     events = db.events_range(0, time.time() + 1)
-    kinds = {e["kind"] for e in events}
+    kinds = {event["kind"] for event in events}
     assert "monitor_start" in kinds
     assert "session_start" in kinds
     assert "session_end" in kinds
     assert "charging_start" in kinds
     # SSE bus delivered live messages
-    assert not q.empty()
+    assert not queue.empty()
     # Raw fidelity: full JSON retained
     latest = db.latest_vitals()
     assert latest is not None and latest["raw"].startswith("{")
@@ -162,7 +162,7 @@ async def test_web_api(db):
         detail = await (await client.get(f"/api/sessions/{sid}")).json()
         assert detail["session"]["id"] == sid
         assert len(detail["samples"]) == 50
-        assert any(e["kind"] == "session_end" for e in detail["events"])
+        assert any(event["kind"] == "session_end" for event in detail["events"])
 
         vit = await (await client.get(f"/api/vitals?from={now - 400}&to={now}")).json()
         assert len(vit["samples"]) == 50
@@ -172,7 +172,7 @@ async def test_web_api(db):
         assert len(vit2["samples"]) <= 12
 
         events = await (await client.get("/api/events")).json()
-        assert any(e["kind"] == "session_end" for e in events["events"])
+        assert any(event["kind"] == "session_end" for event in events["events"])
 
         alerts = await (await client.get("/api/alerts")).json()
         assert alerts["active"] == []
@@ -188,7 +188,7 @@ async def test_temp_sentinel_excluded_from_queries(db):
     for i, handle in enumerate([33.0, 255.0, 33.2]):
         db.insert_vitals(now - 10 + i, {"handle_temp_c": handle, "pcba_temp_c": 35.0, "mcu_temp_c": 42.0}, None, 0.0)
     rows = db.vitals_range(now - 20, now)
-    assert [r["handle_temp_c"] for r in rows] == [33.0, None, 33.2]
+    assert [row["handle_temp_c"] for row in rows] == [33.0, None, 33.2]
     # Bucketed averages must ignore the sentinel, not blend it in.
     bucketed = db.vitals_range(now - 20, now, max_points=1)
     assert abs(bucketed[0]["handle_temp_c"] - 33.1) < 0.01
@@ -218,8 +218,8 @@ async def test_session_start_backdated_from_charger_timer(db):
     events = db.events_range(0, time.time() + 1, kinds=["session_start"])
     import json as _json
 
-    details = [_json.loads(e["detail"]) for e in events if e["detail"]]
-    assert any(d.get("backdated_s", 0) > 60 for d in details)
+    details = [_json.loads(event["detail"]) for event in events if event["detail"]]
+    assert any(detail.get("backdated_s", 0) > 60 for detail in details)
 
 
 async def test_not_ready_reason_change_event(db):
@@ -270,11 +270,11 @@ async def test_device_alert_decoding_pipeline(db):
         poller = Poller(cfg, db, EventBus(), client)
         await poller.start()
         try:
-            await _wait_for(lambda: [a for a in db.active_alerts() if a["source"] == "device"] or None, timeout=15.0)
+            await _wait_for(lambda: [alert for alert in db.active_alerts() if alert["source"] == "device"] or None, timeout=15.0)
         finally:
             await poller.stop()
         await sim_runner.cleanup()
-    device_alerts = [a for a in db.alerts_range(0, time.time() + 1) if a["source"] == "device"]
+    device_alerts = [alert for alert in db.alerts_range(0, time.time() + 1) if alert["source"] == "device"]
     assert device_alerts and device_alerts[0]["alert"] == "27"
 
     app = make_app(db, EventBus(), None)
@@ -312,7 +312,7 @@ async def test_monitor_gap_event_on_restart(db):
             await poller.stop()
         await sim_runner.cleanup()
 
-    gaps = [e for e in db.events_range(0, time.time() + 1) if e["kind"] == "monitor_gap"]
+    gaps = [event for event in db.events_range(0, time.time() + 1) if event["kind"] == "monitor_gap"]
     assert len(gaps) == 1
     import json as _json
 
@@ -367,15 +367,15 @@ async def test_thermal_predict_charging_trajectory(db):
     params = thermal.ThermalParams()  # defaults; prediction should still land
     out = thermal.predict(db, now, params)
     assert out["state"] == "charging"
-    f = out["forecast"]
-    assert f["basis"] == "trajectory"
-    assert f["will_trip"] is True
+    forecast = out["forecast"]
+    assert forecast["basis"] == "trajectory"
+    assert forecast["will_trip"] is True
     # Analytic time-to-trip from the seeded model is ~8.8 min.
-    assert 5.0 < f["minutes_to_trip"] < 13.0
-    assert f["steady_state_c"] > thermal.TRIP_HANDLE_C
+    assert 5.0 < forecast["minutes_to_trip"] < 13.0
+    assert forecast["steady_state_c"] > thermal.TRIP_HANDLE_C
     # Seeded ambient 35.4 C implies a ~42 A cap avoids the trip entirely.
-    assert f["suggested_max_a"] is not None
-    assert abs(f["suggested_max_a"] - 42.0) <= 1.0
+    assert forecast["suggested_max_a"] is not None
+    assert abs(forecast["suggested_max_a"] - 42.0) <= 1.0
 
 
 async def test_thermal_predict_cooling_after_current_cut(db):
@@ -407,12 +407,12 @@ async def test_thermal_predict_cooling_after_current_cut(db):
 
     out = thermal.predict(db, now, thermal.ThermalParams())
     assert out["state"] == "charging"
-    f = out["forecast"]
-    assert f["basis"] == "trajectory"
-    assert f["will_trip"] is False
+    forecast = out["forecast"]
+    assert forecast["basis"] == "trajectory"
+    assert forecast["will_trip"] is False
     # Cooling toward ~49 C while the handle still reads ~56 C.
-    assert f["steady_state_c"] < out["handle_c"] - 3.0
-    assert abs(f["steady_state_c"] - t_low) < 3.0
+    assert forecast["steady_state_c"] < out["handle_c"] - 3.0
+    assert abs(forecast["steady_state_c"] - t_low) < 3.0
 
 
 async def test_thermal_minutes_to_trip_ordering():
@@ -431,11 +431,11 @@ async def test_thermal_predict_idle_forecast(db):
     assert out["state"] == "idle"
     assert abs(out["ambient_c"] - 35.4) < 0.3
     assert out["ambient_stable"] is True
-    f = out["forecast"]
-    assert f["will_trip"] is True  # 35.4 + 36 rise is well past the 65 C trip
-    assert 12.0 < f["minutes_to_trip"] < 30.0
-    assert abs(f["safe_ambient_max_c"] - 29.0) < 0.1
-    assert f["suggested_max_a"] == 42.0  # floor(48*sqrt((63-35.4)/36))
+    forecast = out["forecast"]
+    assert forecast["will_trip"] is True  # 35.4 + 36 rise is well past the 65 C trip
+    assert 12.0 < forecast["minutes_to_trip"] < 30.0
+    assert abs(forecast["safe_ambient_max_c"] - 29.0) < 0.1
+    assert forecast["suggested_max_a"] == 42.0  # floor(48*sqrt((63-35.4)/36))
 
     # A cool garage never trips at full rate, so there is no cap to suggest.
     cool = Database(":memory:")
@@ -514,9 +514,9 @@ async def test_thermal_drift_poller_alert(db):
         poller = Poller(cfg, db, bus, client)
         await poller._check_thermal_drift(now)
     alerts = db.active_alerts()
-    assert any(a["alert"] == thermal.DRIFT_ALERT and a["source"] == "monitor" for a in alerts)
+    assert any(alert["alert"] == thermal.DRIFT_ALERT and alert["source"] == "monitor" for alert in alerts)
     events = db.events_range(now - 1, now + 1)
-    assert any(e["kind"] == "thermal_drift" for e in events)
+    assert any(event["kind"] == "thermal_drift" for event in events)
 
 
 async def test_thermal_suggest_max_current():
@@ -569,4 +569,4 @@ async def test_backoff_on_unreachable_host(db, unused_tcp_port):
         finally:
             await poller.stop()
     alerts = db.active_alerts()
-    assert any(a["alert"] == "Wall Connector unreachable" for a in alerts)
+    assert any(alert["alert"] == "Wall Connector unreachable" for alert in alerts)
