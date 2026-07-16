@@ -31,7 +31,11 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
    codes the local API reports, so only verified entries are labeled; unknown
    codes render honestly with guidance (the Tesla app names active alerts —
    confirm a code there, then add it to the JSON). The Alerts page includes
-   Tesla's official LED fault categories as a reference.
+   Tesla's official LED fault categories as a reference. The same
+   verify-before-label policy covers EVSE state names: the two states that
+   matter most (9 and 11) are named from telemetry cross-checked against
+   contactor and power — the community-circulated names had them swapped —
+   and the UI marks every state label as verified or community-reported.
 6. **Thermal derate forecast** — the Gen 3 raises alert 40 ("high temperature
    detected") when its plug-handle sensor hits 65 °C, halving charge current
    for the rest of the session. The handle warms along a first-order lag whose
@@ -48,7 +52,14 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
    unchanged current means added resistance (loose lug, degrading contact),
    so when recent sessions' fitted rise climbs past the baseline the poller
    raises a monitor alert and the Alerts page charts the per-session trend.
-   Exposed at `/api/thermal`.
+   During cool-down — after a current cut or a derate — the forecast reports
+   the true lower equilibrium the handle is settling toward ("recovering",
+   not "tripping"). **Field-validated live:** steering the vehicle's charge
+   current down on the forecast's advice kept a session 0.7 °C under the
+   trip point, and in a deliberate full-rate test the trajectory forecast
+   predicted the actual alert-40 raise to within seconds. `/api/thermal`
+   returns the fitted model, the live forecast, every per-session fit, and
+   the drift verdict.
 7. **One synchronized clock** — every sample, session boundary, alert, and
    event is stamped with the host's UTC time the moment it was observed, and
    rendered in your local timezone by one shared formatter, so you can line up
@@ -164,4 +175,8 @@ uv run pytest
 ```
 
 The suite runs the full pipeline against the simulator: polling, session
-detection, alert lifecycle, backoff when unreachable, and the web API.
+detection, alert lifecycle, backoff when unreachable, and the web API — plus
+the thermal model end to end: fit recovery from synthetic session ramps,
+trip-time prediction, cool-down and recovery handling, the suggested-cap
+math, drift detection, and regressions seeded from real recorded session
+shapes (current ramp-up, mid-session derate).
