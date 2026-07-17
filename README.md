@@ -54,7 +54,10 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
    raises a monitor alert and the Alerts page charts the per-session trend.
    During cool-down — after a current cut or a derate — the forecast reports
    the true lower equilibrium the handle is settling toward ("recovering",
-   not "tripping"). **Field-validated live:** steering the vehicle's charge
+   not "tripping"). When a mid-session current change resets the live
+   trajectory window, or sessions run back-to-back with no idle gap to read
+   ambient from, the forecast bridges with ambient inferred from the newest
+   steady run still in the buffer instead of going dark. **Field-validated live:** steering the vehicle's charge
    current down on the forecast's advice kept a session 0.7 °C under the
    trip point, and in a deliberate full-rate test the trajectory forecast
    predicted the actual alert-40 raise to within seconds. `/api/thermal`

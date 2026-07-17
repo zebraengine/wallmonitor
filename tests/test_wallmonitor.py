@@ -415,6 +415,81 @@ async def test_thermal_predict_cooling_after_current_cut(db):
     assert abs(forecast["steady_state_c"] - t_low) < 3.0
 
 
+async def test_thermal_predict_current_step_in_back_to_back_session(db):
+    # Field-observed gap: a session that starts back-to-back (no idle stretch
+    # to read ambient from) and then steps its charge current. The step resets
+    # the live trajectory window, pre-session ambient is unavailable, and the
+    # old code went dark ("insufficient") minutes into an active session. The
+    # steady run still in the buffer implies the ambient instead.
+    now = time.time()
+    tau_s, ambient, rise = 720.0, 30.0, 36.0
+    sid = db.start_session(now - 700)
+    t_inf_hi = ambient + rise * (40.0 / 48.0) ** 2
+    ts = now - 700
+    while ts < now - 60:  # ~10.5 min steady at 40 A
+        temp = t_inf_hi - (t_inf_hi - 32.0) * math.exp(-(ts - (now - 700)) / tau_s)
+        db.insert_vitals(ts, {
+            "vehicle_connected": 1, "contactor_closed": 1, "vehicle_current_a": 40.0,
+            "handle_temp_c": round(temp, 3), "pcba_temp_c": 55.0, "mcu_temp_c": 50.0,
+        }, sid, 9300.0)
+        ts += 10.0
+    peak = temp
+    t_inf_lo = ambient + rise * (32.0 / 48.0) ** 2
+    while ts <= now:  # only ~60 s at the new 32 A — too short for a live window
+        temp = t_inf_lo + (peak - t_inf_lo) * math.exp(-(ts - (now - 60)) / tau_s)
+        db.insert_vitals(ts, {
+            "vehicle_connected": 1, "contactor_closed": 1, "vehicle_current_a": 32.0,
+            "handle_temp_c": round(temp, 3), "pcba_temp_c": 55.0, "mcu_temp_c": 50.0,
+        }, sid, 7400.0)
+        ts += 10.0
+
+    out = thermal.predict(db, now, thermal.ThermalParams())
+    assert out["state"] == "charging"
+    forecast = out["forecast"]
+    assert forecast["basis"] == "model"
+    assert forecast["ambient_source"] == "recent_trajectory"
+    # Steady state rescaled to the new 32 A: ambient + 36*(32/48)^2 = 46 C.
+    assert abs(forecast["steady_state_c"] - t_inf_lo) < 2.5
+    assert forecast["will_trip"] is False
+
+
+async def test_thermal_predict_insufficient_reports_why(db):
+    # With no usable window, no pre-session idle, and no earlier steady run,
+    # the forecast is honestly "insufficient" — but distinguishes a session
+    # that truly just started from one whose current just changed.
+    now = time.time()
+    sid = db.start_session(now - 50)
+    ts = now - 50
+    while ts <= now:
+        db.insert_vitals(ts, {
+            "vehicle_connected": 1, "contactor_closed": 1, "vehicle_current_a": 48.0,
+            "handle_temp_c": 33.0, "pcba_temp_c": 55.0, "mcu_temp_c": 50.0,
+        }, sid, 11200.0)
+        ts += 10.0
+    out = thermal.predict(db, now, thermal.ThermalParams())
+    assert out["state"] == "charging"
+    assert out["forecast"] == {"basis": "insufficient", "will_trip": None, "reason": "warming_up"}
+
+    stepped = Database(":memory:")
+    try:
+        # 100 s at 40 A, 100 s at 46 A, 40 s at 32 A: every run too short for
+        # a window, but the session is past its opening ramp — the honest
+        # story is "current changed", not "just started".
+        sid = stepped.start_session(now - 240)
+        ts = now - 240
+        while ts <= now:
+            amps = 40.0 if ts < now - 140 else 46.0 if ts < now - 40 else 32.0
+            stepped.insert_vitals(ts, {
+                "vehicle_connected": 1, "contactor_closed": 1, "vehicle_current_a": amps,
+                "handle_temp_c": 33.0, "pcba_temp_c": 55.0, "mcu_temp_c": 50.0,
+            }, sid, amps * 233.0)
+            ts += 10.0
+        out = thermal.predict(stepped, now, thermal.ThermalParams())
+        assert out["forecast"] == {"basis": "insufficient", "will_trip": None, "reason": "current_changed"}
+    finally:
+        stepped.close()
+
+
 async def test_thermal_minutes_to_trip_ordering():
     # Settling below the trip point wins over "currently above it": a handle
     # at 66 C cooling toward 47 C is recovering from a derate, not tripping.

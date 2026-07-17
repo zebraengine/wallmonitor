@@ -750,9 +750,13 @@ async function viewLive(root) {
       }
       lines.push(forecast.basis === "trajectory"
         ? "Based on the handle's temperature trajectory over the last few minutes."
-        : "Based on pre-session ambient and charge current — refines as the session warms up.");
+        : forecast.ambient_source === "recent_trajectory"
+          ? "Based on ambient inferred from the last steady stretch of charging — switches to the live trajectory once the current holds steady for a couple of minutes."
+          : "Based on pre-session ambient and charge current — refines as the session warms up.");
     } else if (data.state === "charging") {
-      lines.push("Charging just started — the forecast needs a few minutes of steady data.");
+      lines.push(forecast && forecast.reason === "current_changed"
+        ? "Charge current changed a moment ago — the forecast rebuilds after a couple of minutes at the new rate."
+        : "Charging just started — the forecast needs a few minutes of steady data.");
     } else if (data.state === "idle" && forecast) {
       const amb = `${fmtNum(data.ambient_c, 1)} °C (${fmtNum(cToF(data.ambient_c), 0)} °F)`;
       if (forecast.will_trip) {
