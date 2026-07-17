@@ -43,6 +43,11 @@ MAX_FIT_RMSE_C = 0.6
 TAU_RANGE_MIN = (3.0, 40.0)
 RISE_RANGE_C = (10.0, 80.0)
 
+# Live-forecast gate: a steady-current window must hold this many samples
+# over this much time before its trajectory is projected.
+TRAJECTORY_MIN_SAMPLES = 8
+TRAJECTORY_MIN_SPAN_S = 120.0
+
 
 @dataclass
 class ThermalParams:
@@ -294,6 +299,62 @@ def suggest_max_current(ambient_c: float, params: ThermalParams) -> float | None
     return float(amps)
 
 
+def _project_t_inf(window: list[tuple[float, float]], tau_min: float) -> float:
+    """Steady state projected from a steady-current window's trajectory.
+
+    With tau known, T(t) = T_inf - C*exp(-t/tau) is linear in (T_inf, C), so
+    an ordinary least-squares line on x = exp(-t/tau) gives an unbiased T_inf
+    (a straight-line slope would read the window's average rate and overshoot
+    during a fast ramp). No ambient input needed. A flat window (variance ~0,
+    i.e. already converged) reads as the latest temperature.
+    """
+    count = len(window)
+    decays = [math.exp(-(ts - window[0][0]) / (tau_min * 60.0)) for ts, _ in window]
+    mean_decay = sum(decays) / count
+    mean_temp = sum(temp for _, temp in window) / count
+    var = sum((decay - mean_decay) ** 2 for decay in decays)
+    cov = sum(
+        (decay - mean_decay) * (temp - mean_temp)
+        for decay, (_, temp) in zip(decays, window)
+    )
+    return mean_temp - (cov / var) * mean_decay if var > 1e-9 else window[-1][1]
+
+
+def _recent_steady_ambient(recent: list[dict], params: ThermalParams) -> float | None:
+    """Ambient inferred from the newest steady-current run in the buffer.
+
+    Back-to-back sessions leave no idle gap to read ambient from, and a
+    mid-session current change resets the live trajectory window — but the
+    buffer usually still holds an earlier steady run (this session's stretch
+    before the change, or the previous session's tail). Its projected steady
+    state at that run's current implies the ambient, which the I^2 model then
+    rescales to the present current.
+    """
+    runs: list[list[dict]] = [[]]
+    for sample in recent:
+        current = sample.get("vehicle_current_a") or 0.0
+        run = runs[-1]
+        if not sample.get("contactor_closed") or current < 6.0:
+            if run:
+                runs.append([])
+            continue
+        ref = run[0]["vehicle_current_a"] if run else current
+        if abs(current - ref) > max(2.0, 0.1 * ref):
+            runs.append([sample])
+            continue
+        run.append(sample)
+    for run in reversed(runs):
+        if len(run) < TRAJECTORY_MIN_SAMPLES or run[-1]["ts"] - run[0]["ts"] < TRAJECTORY_MIN_SPAN_S:
+            continue
+        window = [(sample["ts"], sample["handle_temp_c"]) for sample in run]
+        t_inf = _project_t_inf(window, params.tau_min)
+        run_current = median(sample["vehicle_current_a"] for sample in run)
+        ambient = t_inf - params.rise_ref_c * (run_current / REF_CURRENT_A) ** 2
+        if -30.0 <= ambient <= TRIP_HANDLE_C:
+            return ambient
+    return None
+
+
 def predict(db: Database, now: float, params: ThermalParams) -> dict:
     """Forecast alert-40 for the current state (live session or idle)."""
     out: dict = {"model": params.as_dict(), "state": "no_data", "forecast": None}
@@ -322,45 +383,44 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
         out["state"] = "charging"
         band = max(2.0, 0.1 * current)
         window: list[tuple[float, float]] = []
+        # Why the window ended matters when the forecast comes up empty:
+        # breaking on an out-of-band sample means the current just changed
+        # mid-session, not that charging began moments ago.
+        gap_reason = "warming_up"
         for sample in reversed(recent):
-            if (
-                not sample.get("contactor_closed")
-                or abs((sample.get("vehicle_current_a") or 0) - current) > band
-                or last["ts"] - sample["ts"] > 360
-            ):
+            if not sample.get("contactor_closed") or last["ts"] - sample["ts"] > 360:
+                break
+            if abs((sample.get("vehicle_current_a") or 0) - current) > band:
+                gap_reason = "current_changed"
                 break
             window.append((sample["ts"], sample["handle_temp_c"]))
         window.reverse()
         forecast: dict = {}
-        if len(window) >= 8 and window[-1][0] - window[0][0] >= 120:
-            # Project the steady state from the recent trajectory: with tau
-            # known, T(t) = T_inf - C*exp(-t/tau) is linear in (T_inf, C), so
-            # an ordinary least-squares line on x = exp(-t/tau) gives an
-            # unbiased T_inf (a straight-line slope would read the window's
-            # average rate and overshoot during a fast ramp). No ambient
-            # input needed.
-            count = len(window)
-            decays = [math.exp(-(ts - window[0][0]) / (tau_min * 60.0)) for ts, _ in window]
-            mean_decay = sum(decays) / count
-            mean_temp = sum(temp for _, temp in window) / count
-            var = sum((decay - mean_decay) ** 2 for decay in decays)
-            cov = sum(
-                (decay - mean_decay) * (temp - mean_temp)
-                for decay, (_, temp) in zip(decays, window)
-            )
-            t_inf = mean_temp - (cov / var) * mean_decay if var > 1e-9 else last["handle_temp_c"]
+        if len(window) >= TRAJECTORY_MIN_SAMPLES and window[-1][0] - window[0][0] >= TRAJECTORY_MIN_SPAN_S:
+            t_inf = _project_t_inf(window, tau_min)
             forecast["basis"] = "trajectory"
         else:
-            # Too early in the session for a slope: model from pre-session
-            # ambient and the present current scaled by I^2.
+            # Too early at this current for a slope: model from ambient and
+            # the present current scaled by I^2. Ambient comes from the idle
+            # stretch before the session, or — when sessions run back-to-back
+            # and there was none — from the newest steady run in the buffer.
             sid = last.get("session_id")
             sess = db.session(int(sid)) if sid else None
             ambient = _ambient_before(db, sess["start_ts"]) if sess else None
+            source = "pre_session"
             if ambient is None:
-                out["forecast"] = {"basis": "insufficient", "will_trip": None}
+                ambient = _recent_steady_ambient(recent, params)
+                source = "recent_trajectory"
+            if ambient is None:
+                # A session's opening ramp also breaks the band; within the
+                # first minutes "just started" is the truthful story even so.
+                if sess and last["ts"] - sess["start_ts"] < 180:
+                    gap_reason = "warming_up"
+                out["forecast"] = {"basis": "insufficient", "will_trip": None, "reason": gap_reason}
                 return out
             t_inf = ambient + params.rise_ref_c * (current / REF_CURRENT_A) ** 2
             forecast["basis"] = "model"
+            forecast["ambient_source"] = source
         # No flooring of t_inf at the current temperature: a steady state
         # below the handle is real, not noise — it's what cooling toward a
         # lower equilibrium looks like after a current cut or a derate.
