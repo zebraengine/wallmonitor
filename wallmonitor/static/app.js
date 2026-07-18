@@ -58,19 +58,36 @@ const COLORS = () => ({
   s1: CSSVAR("--series-1"), s2: CSSVAR("--series-2"), s3: CSSVAR("--series-3"), s5: CSSVAR("--series-5"),
 });
 
-// Tesla doesn't document evse_state. States 9 and 11 are verified against
-// this monitor's own telemetry on firmware 26.18.0: every state-11 sample
-// carries the charging load (contactor closed, full power) and every state-9
-// sample has the contactor open at ~0 W — the community lists 9 as "Charging"
-// and 11 as "Charging paused", i.e. swapped. The rest remain community-
-// reported and unverified; notably state 8 never appeared even during a real
+// Tesla doesn't document evse_state. Labels below are verified against this
+// monitor's own telemetry on firmware 26.18.0 (cross-tab of a week of samples
+// vs vehicle_connected/contactor_closed, ~132k samples):
+//   1  — vehicle_connected false in all 35,785 samples; every unplug lands
+//        here. Verified.
+//   4  — vehicle_connected true in all 31,009 samples, contactor always open.
+//        Pilot swings ±12 V (J1772 state B: vehicle present, not ready), vs
+//        state 9's low pilot levels — consistent with the car asleep, hence
+//        "idle", but the asleep reading itself is inference. Verified as
+//        connected-not-charging.
+//   9  — contactor open at ~0 W in all 53,148 samples. Verified. (Community
+//        lists 9 as "Charging" and 11 as "Charging paused", i.e. swapped.)
+//   11 — contactor closed, full power, in all 12,021 samples. Verified.
+// Contradicted community labels: 7 ("Error") appeared only as a benign 5-6 s
+// plug-in transient (1 → 7 → 11, charging started normally) — same handshake
+// slot where 2 and 3 also occur; too few samples to verify a meaning, but not
+// an error state. 5 ("Scheduled charging") never appeared even with a
+// vehicle-side scheduled charge armed overnight — the charger just sat in
+// 9/4; the schedule lives in the car. 8 never appeared even during a real
 // thermal derate (the charger stayed in 11 and signaled via alert 40 only).
+// evse_not_ready_reasons are likewise undocumented; observed correlations:
+// [4,8] when no vehicle, narrowing to [4] during the plug-in handshake, then
+// [1] whenever a vehicle is connected (including while charging) — meanings
+// unverified, so the UI shows the raw codes.
 const EVSE_STATES = {
   0: "Booting", 1: "Standby — no vehicle", 2: "Vehicle detected", 3: "Ready",
-  4: "Vehicle connected", 5: "Scheduled charging", 6: "Negotiating", 7: "Error",
+  4: "Connected, idle", 5: "Scheduled charging", 6: "Negotiating", 7: "Plug-in transition",
   8: "Charging (de-rated)", 9: "Connected, not charging", 10: "Charging finished", 11: "Charging",
 };
-const EVSE_VERIFIED = new Set([9, 11]);
+const EVSE_VERIFIED = new Set([1, 4, 9, 11]);
 const evseLabel = (state) => state == null ? "—" : `${EVSE_STATES[state] || "State"} (${state})`;
 
 const EVENT_META = {

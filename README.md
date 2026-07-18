@@ -32,10 +32,10 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
    codes render honestly with guidance (the Tesla app names active alerts —
    confirm a code there, then add it to the JSON). The Alerts page includes
    Tesla's official LED fault categories as a reference. The same
-   verify-before-label policy covers EVSE state names: the two states that
-   matter most (9 and 11) are named from telemetry cross-checked against
-   contactor and power — the community-circulated names had them swapped —
-   and the UI marks every state label as verified or community-reported.
+   verify-before-label policy covers EVSE state names: states 1, 4, 9, and 11
+   are named from telemetry cross-checked against vehicle presence, contactor,
+   and power (the community-circulated names had 9 and 11 swapped), and the
+   UI marks every state label as verified or community-reported.
 6. **Thermal derate forecast** — the Gen 3 raises alert 40 ("high temperature
    detected") when its plug-handle sensor hits 65 °C, halving charge current
    for the rest of the session. The handle warms along a first-order lag whose
@@ -95,9 +95,10 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
   tiles, and downsampled averages — treats ≥255 °C as "no reading" so a
   phantom 255 °C spike (or a poisoned bucket average) never appears.
 - **Recorded event kinds:** session start/end, charging start/stop, EVSE
-  state changes (states 9/11 named from telemetry verified against contactor
-  and power — the community-reported names for those two are swapped — the
-  rest community-reported), device alerts
+  state changes (states 1/4/9/11 named from telemetry verified against
+  vehicle presence, contactor, and power — the community-reported names for
+  9/11 are swapped, and 7 "Error" is contradicted: it only appears as a
+  benign plug-in transient — the rest community-reported), device alerts
   raised/cleared, charger reboots (uptime went backwards), charger
   unreachable/recovered, Wi-Fi disconnect/reconnect, internet lost/restored,
   firmware version changes, and monitor start/stop/gap.
