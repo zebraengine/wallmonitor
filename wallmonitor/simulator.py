@@ -84,7 +84,9 @@ class SimState:
         if cycle_n >= self.alert_after_cycles and name == "charging" and 60 < into < 120:
             # Real firmware reports numeric alert IDs (e.g. [27]).
             alerts = [27]
-        evse_state = {"idle": 1, "connected": 4, "charging": 9, "complete": 11}[name]
+        # Telemetry-verified states: 1 no vehicle, 4 connected idle,
+        # 11 charging (contactor closed), 9 connected not charging.
+        evse_state = {"idle": 1, "connected": 4, "charging": 11, "complete": 9}[name]
         handle_temp = 20.0 + (12.0 * min(1.0, into / 120.0) if charging else 0.0) + rng.uniform(-0.3, 0.3)
         data = {
             "contactor_closed": charging,
@@ -113,7 +115,9 @@ class SimState:
             "config_status": 5,
             "evse_state": evse_state,
             "current_alerts": alerts,
-            "evse_not_ready_reasons": [] if charging else [1],
+            # Real firmware reports [1] whenever a vehicle is connected (even
+            # while charging) and [4, 8] when unplugged.
+            "evse_not_ready_reasons": [1] if connected else [4, 8],
         }
         return data
 
