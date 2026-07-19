@@ -557,6 +557,60 @@ async def test_thermal_fit_survives_ramp_and_midsession_derate(db):
     assert fits[0]["rise_ref_c"] is not None and abs(fits[0]["rise_ref_c"] - rise) < 3.0
 
 
+async def test_thermal_fit_covers_late_charging_segments(db):
+    # A session shaped like real overnight use: a plug-in burst too short to
+    # fit, hours of connected idle, then distinct charging segments (vehicle
+    # top-off, preconditioning, or a charging schedule) long after session
+    # start. The fitter must find each qualifying ramp where it actually is —
+    # not only inside the session's first 45 minutes.
+    now = time.time()
+    start = now - 11 * 3600
+    ambient, tau_s, rise, amps = 23.0, 720.0, 36.0, 48.6
+    _seed_idle(db, start - 1800, start, ambient)
+    sid = db.start_session(start)
+    t0_temp = ambient + thermal.IDLE_OFFSET_C
+    t_inf = ambient + rise * (amps / thermal.REF_CURRENT_A) ** 2
+
+    def charge(seg_start, seg_len):
+        ts = seg_start
+        while ts <= seg_start + seg_len:
+            temp = t_inf - (t_inf - t0_temp) * math.exp(-(ts - seg_start) / tau_s)
+            db.insert_vitals(ts, {
+                "vehicle_connected": 1, "contactor_closed": 1, "vehicle_current_a": amps,
+                "handle_temp_c": round(temp, 3), "pcba_temp_c": 55.0, "mcu_temp_c": 50.0,
+            }, sid, amps * 233.0)
+            ts += 10.0
+        return ts
+
+    def idle(t_from, t_to):
+        ts = t_from
+        while ts < t_to:
+            db.insert_vitals(ts, {
+                "vehicle_connected": 1, "contactor_closed": 0, "vehicle_current_a": 0.0,
+                "handle_temp_c": round(ambient + thermal.IDLE_OFFSET_C, 2),
+                "pcba_temp_c": 38.0, "mcu_temp_c": 46.0,
+            }, sid, 0.0)
+            ts += 10.0
+
+    ts = charge(start, 300.0)               # plug-in burst, below MIN_SEGMENT_S
+    idle(ts, start + 4 * 3600)
+    seg_a = start + 4 * 3600
+    ts = charge(seg_a, 1500.0)              # first qualifying ramp, 4 h in
+    idle(ts, start + 8 * 3600)
+    seg_b = start + 8 * 3600
+    ts = charge(seg_b, 1500.0)              # second qualifying ramp, 8 h in
+    db.close_session(sid, ts, "vehicle_disconnected")
+
+    fits = thermal.fit_sessions(db, now)
+    assert len(fits) == 2, "both late ramps fit; the short burst does not"
+    assert all(fit["session_id"] == sid for fit in fits)
+    assert abs(fits[0]["start_ts"] - seg_a) < 120
+    assert abs(fits[1]["start_ts"] - seg_b) < 120
+    for fit in fits:
+        assert fit["rise_ref_c"] is not None and abs(fit["rise_ref_c"] - rise) < 3.0
+        assert abs(fit["current_a"] - amps) < 1.0
+
+
 async def test_thermal_drift_detection(db):
     now = time.time()
     # Four healthy sessions, then three running hotter at the same current —
