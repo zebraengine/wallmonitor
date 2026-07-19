@@ -23,6 +23,10 @@ class Config:
     db_path: str = "wallmonitor.db"
     demo: bool = False
     split_phase: bool = False
+    # Optional LAN webhook: actionable warnings are POSTed here as JSON.
+    # Local-only by design — point it at something on your own network
+    # (Home Assistant, a self-hosted ntfy, node-RED); leave empty to disable.
+    notify_url: str = ""
     # Poll cadence (seconds). Vitals tighten while a vehicle is connected.
     vitals_interval_active: float = 2.0
     vitals_interval_idle: float = 5.0
@@ -102,6 +106,12 @@ def parse_args(argv: list[str] | None = None) -> Config:
         default=_env("WM_SPLIT_PHASE", False),
         help="Compute total power for a North American split-phase install (env: WM_SPLIT_PHASE)",
     )
+    parser.add_argument(
+        "--notify-url",
+        default=_env("WM_NOTIFY_URL", ""),
+        help="Optional LAN webhook that receives actionable warnings as JSON POSTs, "
+        "e.g. Home Assistant or a self-hosted ntfy on your own network (env: WM_NOTIFY_URL)",
+    )
     args = parser.parse_args(argv)
 
     if not args.demo and not args.host:
@@ -114,6 +124,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         db_path=args.db_path,
         demo=bool(args.demo),
         split_phase=bool(args.split_phase),
+        notify_url=args.notify_url,
         vitals_interval_active=args.vitals_active,
         vitals_interval_idle=args.vitals_idle,
         wifi_interval=args.wifi_interval,

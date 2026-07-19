@@ -274,6 +274,12 @@ DRIFT_MIN_BASELINE_N = 3
 DRIFT_WARN_C = 2.5
 DRIFT_ALERT = "Handle heat rise increasing (check connector/wiring)"
 
+# Actionable warning: the live forecast puts the 65 C trip inside this
+# horizon, so the user still has time to lower the vehicle's charge current
+# and keep a sustained rate instead of eating the 50% foldback.
+DERATE_WARN_MIN = 15.0
+DERATE_ALERT = "Derate predicted (lower vehicle charge current to avoid it)"
+
 
 def detect_drift(fits: list[dict]) -> dict | None:
     """Compare the last few sessions' fitted rise against the baseline.

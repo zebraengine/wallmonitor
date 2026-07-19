@@ -674,6 +674,81 @@ async def test_thermal_drift_poller_alert(db):
     assert any(event["kind"] == "thermal_drift" for event in events)
 
 
+async def test_derate_forecast_warns_then_clears(db):
+    # A charging handle on a trajectory toward 65 °C inside the warning
+    # horizon must raise the actionable alert with a suggested current cap,
+    # and the warning must clear when charging stops.
+    now = time.time()
+    ambient, tau_s, amps = 33.0, 720.0, 48.0
+    t_inf = ambient + thermal.DEFAULT_RISE_REF_C  # 69 °C steady state at 48 A
+    t0_temp = ambient + thermal.IDLE_OFFSET_C
+    start = now - 810.0
+    ts = start
+    while ts <= now:
+        temp = t_inf - (t_inf - t0_temp) * math.exp(-(ts - start) / tau_s)
+        db.insert_vitals(ts, {
+            "vehicle_connected": 1, "contactor_closed": 1, "vehicle_current_a": amps,
+            "handle_temp_c": round(temp, 3), "pcba_temp_c": 55.0, "mcu_temp_c": 50.0,
+        }, None, amps * 233.0)
+        ts += 10.0
+
+    cfg = Config(host="127.0.0.1:1")
+    bus = EventBus()
+    async with aiohttp.ClientSession() as client:
+        poller = Poller(cfg, db, bus, client)
+        await poller._check_derate_forecast(now, {"contactor_closed": 1, "vehicle_current_a": amps})
+        alerts = db.active_alerts()
+        assert any(a["alert"] == thermal.DERATE_ALERT and a["source"] == "monitor" for a in alerts)
+        events = db.events_range(now - 1, now + 1, kinds=["derate_warning"])
+        assert events, "derate_warning event must be recorded"
+        import json as _json
+        detail = _json.loads(events[0]["detail"])
+        assert 0 < detail["minutes_to_trip"] <= thermal.DERATE_WARN_MIN
+        assert detail["suggested_max_a"] == 43.0
+
+        # Charging stops -> warning clears.
+        await poller._check_derate_forecast(now + 1, {"contactor_closed": 0, "vehicle_current_a": 0.0})
+        assert not any(a["alert"] == thermal.DERATE_ALERT for a in db.active_alerts())
+        assert db.events_range(now - 1, now + 2, kinds=["derate_warning_cleared"])
+
+
+async def test_notify_webhook_posts_actionable_warning(db):
+    from aiohttp import web as aioweb
+
+    received = []
+
+    async def hook(request):
+        received.append(await request.json())
+        return aioweb.Response()
+
+    app = aioweb.Application()
+    app.router.add_post("/hook", hook)
+    runner = aioweb.AppRunner(app)
+    await runner.setup()
+    site = aioweb.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        cfg = Config(host="127.0.0.1:1", notify_url=f"http://127.0.0.1:{port}/hook")
+        bus = EventBus()
+        async with aiohttp.ClientSession() as client:
+            poller = Poller(cfg, db, bus, client)
+            await poller._notify("derate_warning", "Thermal derate predicted",
+                                 "cap at 43 A", {"suggested_max_a": 43.0})
+        assert len(received) == 1
+        assert received[0]["kind"] == "derate_warning"
+        assert received[0]["detail"]["suggested_max_a"] == 43.0
+
+        # No URL configured -> no-op, no error.
+        cfg2 = Config(host="127.0.0.1:1")
+        async with aiohttp.ClientSession() as client:
+            poller = Poller(cfg2, db, bus, client)
+            await poller._notify("x", "t", "b", None)
+        assert len(received) == 1
+    finally:
+        await runner.cleanup()
+
+
 async def test_thermal_drift_alert_clears_when_history_too_thin(db):
     # An active drift alert must not linger once there is no longer enough
     # comparable history for a verdict (detect_drift -> None).
