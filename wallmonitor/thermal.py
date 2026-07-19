@@ -47,6 +47,15 @@ RISE_RANGE_C = (10.0, 80.0)
 # over this much time before its trajectory is projected.
 TRAJECTORY_MIN_SAMPLES = 8
 TRAJECTORY_MIN_SPAN_S = 120.0
+# A session is one plug-in, but charging within it comes in distinct
+# segments, often hours apart: the vehicle's own state-of-charge top-offs,
+# scheduled-departure preconditioning, or a charging schedule. (The charger
+# itself exposes no "scheduled charging" state — verified on firmware
+# 26.18.0: with a vehicle-side schedule armed overnight it idles in plain
+# connected states until the car starts drawing.) Charging gaps longer than
+# this split segments; each segment's opening ramp is a fit candidate.
+SEGMENT_SPLIT_GAP_S = 300.0
+MAX_SEGMENTS_PER_SESSION = 4
 
 
 @dataclass
@@ -130,6 +139,8 @@ def _steady_current_prefix(samples: list[dict]) -> list[dict]:
     band = max(2.0, 0.1 * i_ref)
     prefix: list[dict] = []
     for sample in charging:
+        if prefix and sample["ts"] - prefix[-1]["ts"] > SEGMENT_SPLIT_GAP_S:
+            break  # a charging gap: the next samples belong to a later segment
         if abs(sample["vehicle_current_a"] - i_ref) > band:
             if prefix:
                 break  # the steady run ended (derate or charge stop)
@@ -138,6 +149,25 @@ def _steady_current_prefix(samples: list[dict]) -> list[dict]:
         if sample["ts"] - prefix[0]["ts"] > 1800:  # first 30 min is where the ramp lives
             break
     return prefix
+
+
+def _segment_starts(rows: list[dict]) -> list[float]:
+    """Start timestamps of distinct charging segments in a session's samples.
+
+    Works on bucket-averaged rows as well as raw ones: a bucket that saw any
+    charging keeps contactor_closed via MAX(), and its MIN(ts) lands at or
+    before the actual charge start, so the per-segment raw fetch that follows
+    never misses the ramp's beginning.
+    """
+    starts: list[float] = []
+    prev: float | None = None
+    for row in rows:
+        if not row.get("contactor_closed"):
+            continue
+        if prev is None or row["ts"] - prev > SEGMENT_SPLIT_GAP_S:
+            starts.append(row["ts"])
+        prev = row["ts"]
+    return starts
 
 
 def _ambient_before(db: Database, start_ts: float) -> float | None:
@@ -156,9 +186,12 @@ def _ambient_before(db: Database, start_ts: float) -> float | None:
 
 
 def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list[dict]:
-    """Per-session fits, oldest first: one dict per session whose charging
-    ramp passed the quality gates. rise_ref_c is None when there was no
-    stable pre-session idle to estimate ambient from."""
+    """Per-segment fits, oldest first: one dict per charging segment whose
+    ramp passed the quality gates. A session that idles for hours and then
+    charges (a vehicle top-off, preconditioning, a charging schedule) yields
+    its fits from wherever the ramps actually are, not just the plug-in
+    moment. rise_ref_c is None when there was no stable idle before the
+    segment to estimate ambient from (e.g. a resume minutes after a derate)."""
     sessions = [
         session
         for session in db.sessions_range(now - lookback_days * 86400, now)
@@ -166,44 +199,49 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
     ][:40]
     fits: list[dict] = []
     for sess in sessions:
-        # Only the first ~45 min matters (the ramp), and the narrow window
-        # keeps a multi-hour session under the bucket-averaging threshold so
-        # the fit sees raw-resolution samples.
-        t_hi = min(sess["end_ts"], sess["start_ts"] + 2700)
-        samples = db.vitals_range(sess["start_ts"] - 1, t_hi + 1, 5000)
-        prefix = _steady_current_prefix(samples)
-        seg = [
-            (sample["ts"], sample["handle_temp_c"])
-            for sample in prefix
-            if sample.get("handle_temp_c") is not None
-        ]
-        if len(seg) < MIN_SEGMENT_SAMPLES or seg[-1][0] - seg[0][0] < MIN_SEGMENT_S:
-            continue
-        if max(temp for _, temp in seg) - seg[0][1] < MIN_RISE_SEEN_C:
-            continue
-        fit = _fit_exponential(seg)
-        if fit is None:
-            continue
-        tau_s, t_inf, rmse = fit
-        if rmse > MAX_FIT_RMSE_C or t_inf <= seg[0][1] + 3.0:
-            continue
-        i_med = median(sample["vehicle_current_a"] for sample in prefix)
-        ambient = _ambient_before(db, sess["start_ts"])
-        rise = None
-        if ambient is not None:
-            rise = (t_inf - ambient) * (REF_CURRENT_A / i_med) ** 2
-            if not (RISE_RANGE_C[0] <= rise <= RISE_RANGE_C[1]):
-                rise = None
-        fits.append(
-            {
-                "session_id": sess["id"],
-                "start_ts": sess["start_ts"],
-                "tau_min": round(tau_s / 60.0, 2),
-                "rise_ref_c": round(rise, 2) if rise is not None else None,
-                "rmse_c": round(rmse, 3),
-                "current_a": round(i_med, 1),
-            }
-        )
+        # Coarse pass over the whole session to locate charging segments —
+        # bucket-averaged is fine here (and keeps a multi-day session cheap);
+        # each segment then gets a narrow raw-resolution fetch, since only
+        # the ramp's first ~45 min carries the thermal signal.
+        coarse = db.vitals_range(sess["start_ts"] - 1, sess["end_ts"] + 1, 2000)
+        starts = _segment_starts(coarse)[:MAX_SEGMENTS_PER_SESSION]
+        for idx, seg_start in enumerate(starts):
+            next_start = starts[idx + 1] if idx + 1 < len(starts) else sess["end_ts"] + 1
+            t_hi = min(sess["end_ts"], seg_start + 2700, next_start - 1)
+            samples = db.vitals_range(seg_start - 1, t_hi + 1, 5000)
+            prefix = _steady_current_prefix(samples)
+            seg = [
+                (sample["ts"], sample["handle_temp_c"])
+                for sample in prefix
+                if sample.get("handle_temp_c") is not None
+            ]
+            if len(seg) < MIN_SEGMENT_SAMPLES or seg[-1][0] - seg[0][0] < MIN_SEGMENT_S:
+                continue
+            if max(temp for _, temp in seg) - seg[0][1] < MIN_RISE_SEEN_C:
+                continue
+            fit = _fit_exponential(seg)
+            if fit is None:
+                continue
+            tau_s, t_inf, rmse = fit
+            if rmse > MAX_FIT_RMSE_C or t_inf <= seg[0][1] + 3.0:
+                continue
+            i_med = median(sample["vehicle_current_a"] for sample in prefix)
+            ambient = _ambient_before(db, seg_start)
+            rise = None
+            if ambient is not None:
+                rise = (t_inf - ambient) * (REF_CURRENT_A / i_med) ** 2
+                if not (RISE_RANGE_C[0] <= rise <= RISE_RANGE_C[1]):
+                    rise = None
+            fits.append(
+                {
+                    "session_id": sess["id"],
+                    "start_ts": seg[0][0],
+                    "tau_min": round(tau_s / 60.0, 2),
+                    "rise_ref_c": round(rise, 2) if rise is not None else None,
+                    "rmse_c": round(rmse, 3),
+                    "current_a": round(i_med, 1),
+                }
+            )
     fits.sort(key=lambda fit: fit["start_ts"])
     return fits
 

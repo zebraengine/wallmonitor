@@ -40,18 +40,27 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
    detected") when its plug-handle sensor hits 65 °C, halving charge current
    for the rest of the session. The handle warms along a first-order lag whose
    parameters (`wallmonitor/thermal.py`) are fitted per-install from your own
-   recorded session ramps (with defaults from a telemetry-verified alert-40
+   recorded charging ramps (with defaults from a telemetry-verified alert-40
    event), and the idle handle sits ~2 °C above ambient, so the charger doubles
-   as its own thermometer. The Live page forecasts: during charging, whether
+   as its own thermometer. Fitting is per charging **segment**, not per
+   session: one plug-in routinely contains several distinct draws hours
+   apart — the vehicle's own state-of-charge top-offs, scheduled-departure
+   preconditioning, or a charging schedule (common with time-of-use rates or
+   home batteries). The charger reports no "scheduled charging" state for any
+   of these (telemetry-verified: with a vehicle-side schedule armed overnight
+   it idles in ordinary connected states until the car draws), so the fitter
+   finds each segment's opening ramp wherever it occurs in the session and
+   lets the quality gates decide what teaches the model — no configuration or
+   "monitoring mode" needed. The Live page forecasts: during charging, whether
    and when the current session will derate (from the handle's live
    trajectory); when idle, the estimated ambient and whether a full-rate
    charge started now would trip. When a derate is coming it also suggests
    the highest vehicle charge-current cap that stays under the limit —
    a steady capped rate charges faster than full rate folding back to 50%.
-   The same per-session fits feed a **degradation watch**: rising heat at
+   The same per-segment fits feed a **degradation watch**: rising heat at
    unchanged current means added resistance (loose lug, degrading contact),
-   so when recent sessions' fitted rise climbs past the baseline the poller
-   raises a monitor alert and the Alerts page charts the per-session trend.
+   so when recent segments' fitted rise climbs past the baseline the poller
+   raises a monitor alert and the Alerts page charts the fitted-rise trend.
    During cool-down — after a current cut or a derate — the forecast reports
    the true lower equilibrium the handle is settling toward ("recovering",
    not "tripping"). When a mid-session current change resets the live
@@ -61,7 +70,7 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
    current down on the forecast's advice kept a session 0.7 °C under the
    trip point, and in a deliberate full-rate test the trajectory forecast
    predicted the actual alert-40 raise to within seconds. `/api/thermal`
-   returns the fitted model, the live forecast, every per-session fit, and
+   returns the fitted model, the live forecast, every per-segment fit, and
    the drift verdict.
 7. **One synchronized clock** — every sample, session boundary, alert, and
    event is stamped with the host's UTC time the moment it was observed, and

@@ -1250,13 +1250,13 @@ async function viewAlerts(root, rangeKey = "7d") {
   }
   root.append(activeWrap);
 
-  // Degradation watch: fitted heat rise per session at reference current.
-  // Prediction uses the rolling median, which would silently follow a slow
-  // increase; this trend is where a developing contact/wiring problem shows.
+  // Degradation watch: fitted heat rise per charging segment at reference
+  // current. Prediction uses the rolling median, which would silently follow
+  // a slow increase; this trend is where a contact/wiring problem shows.
   const fits = ((thermalData && thermalData.session_fits) || []).filter((fit) => fit.rise_ref_c != null);
   if (fits.length >= 2) {
     const drift = thermalData.drift;
-    const rise = chartCard("Handle heat rise per session",
+    const rise = chartCard("Handle heat rise per charging segment",
       `Fitted steady-state rise above ambient, normalized to ${fmtNum(thermalData.model.ref_current_a, 0)} A. ` +
       "A sustained climb at the same current means added resistance in the current path — inspect before it becomes heat.");
     root.append(rise.card);
