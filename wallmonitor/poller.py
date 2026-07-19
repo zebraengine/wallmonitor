@@ -79,6 +79,7 @@ class Poller:
         self.cfg = cfg
         self.db = db
         self.bus = bus
+        self._http = session
         self.wc = WallConnector(host=cfg.host, timeout=cfg.request_timeout, session=session)
         self._verify_resumed = False
         # per-endpoint scheduling state: next due time and current backoff interval
@@ -91,6 +92,12 @@ class Poller:
         self._active_alerts: set[str] = set()
         self._offline = False
         self._had_success = False
+        # Thermal params for the in-poller derate forecast: fitted lazily,
+        # refreshed whenever a session closes (the only time fits change).
+        self._params: thermal.ThermalParams | None = None
+        self._next_forecast_ts = 0.0
+        self._derate_active = False
+        self._alert_labels: dict | None = None
         self.last_poll_ok_ts: float | None = None
         self.last_poll_error: str | None = None
         self.started_ts = time.time()
@@ -123,6 +130,8 @@ class Poller:
         for alert in self.db.active_alerts():
             if alert["source"] == "device":
                 self._active_alerts.add(alert["alert"])
+            elif alert["alert"] == thermal.DERATE_ALERT:
+                self._derate_active = True
 
     async def stop(self) -> None:
         self._stop.set()
@@ -210,6 +219,12 @@ class Poller:
             self.bus.publish(
                 {"type": "event", "ts": ts, "kind": "poll_error", "detail": {"endpoint": endpoint, "error": str(ex)}}
             )
+            await self._notify(
+                "poll_error",
+                "Charger unreachable",
+                "Repeated polls failed — check the breaker, Wi-Fi, or the charger itself.",
+                {"endpoint": endpoint, "error": str(ex)},
+            )
 
     # ---------- handlers ----------
 
@@ -291,12 +306,19 @@ class Poller:
         for alert in alerts_now - self._active_alerts:
             await asyncio.to_thread(self.db.raise_alert, ts, alert, "device")
             await self._event(ts, "alert_raised", {"alert": alert})
+            await self._notify(
+                "alert_raised",
+                "Wall Connector alert",
+                f"{self._alert_label(alert)} — see the Alerts page for details.",
+                {"alert": alert},
+            )
         for alert in self._active_alerts - alerts_now:
             await asyncio.to_thread(self.db.clear_alert, ts, alert, "device")
             await self._event(ts, "alert_cleared", {"alert": alert})
         self._active_alerts = alerts_now
 
         row_id = await asyncio.to_thread(self.db.insert_vitals, ts, raw, self._session_id, power)
+        await self._check_derate_forecast(ts, raw)
         self._prev_vitals = raw
         self.bus.publish(
             {
@@ -349,11 +371,12 @@ class Poller:
     async def _check_thermal_drift(self, ts: float) -> None:
         """After a session closes: refit history and raise/clear the
         degradation alert. Drift only changes when a session completes, so
-        this is the one place it needs evaluating."""
+        this is the one place it needs evaluating (and the one place the
+        cached forecast params need refreshing)."""
         try:
-            drift = await asyncio.to_thread(
-                lambda: thermal.detect_drift(thermal.fit_sessions(self.db, ts))
-            )
+            fits = await asyncio.to_thread(thermal.fit_sessions, self.db, ts)
+            self._params = await asyncio.to_thread(thermal.fit_history, self.db, ts, fits=fits)
+            drift = thermal.detect_drift(fits)
         except Exception:
             log.exception("thermal drift check failed")
             return
@@ -369,10 +392,113 @@ class Poller:
             _, newly = await asyncio.to_thread(self.db.raise_alert, ts, thermal.DRIFT_ALERT, "monitor")
             if newly:
                 await self._event(ts, "thermal_drift", drift)
+                await self._notify(
+                    "thermal_drift",
+                    "Heat rise climbing vs baseline",
+                    f"Recent sessions run +{drift['recent_rise_c']:.1f} °C vs a +{drift['baseline_rise_c']:.1f} °C "
+                    "baseline at the same current — inspect the handle and charge-port pins, and have the "
+                    "terminal torque checked.",
+                    drift,
+                )
         else:
             cleared = await asyncio.to_thread(self.db.clear_alert, ts, thermal.DRIFT_ALERT, "monitor")
             if cleared:
                 await self._event(ts, "thermal_drift_cleared", drift)
+
+    async def _check_derate_forecast(self, ts: float, raw: dict) -> None:
+        """While charging: warn while the user can still act — a capped
+        current sustains, a tripped one folds back to 50% for the session."""
+        charging = bool(raw.get("contactor_closed")) and (raw.get("vehicle_current_a") or 0) >= 6
+        if not charging:
+            await self._clear_derate(ts)
+            return
+        if ts < self._next_forecast_ts:
+            return
+        self._next_forecast_ts = ts + 30.0
+        try:
+            if self._params is None:
+                fits = await asyncio.to_thread(thermal.fit_sessions, self.db, ts)
+                self._params = await asyncio.to_thread(thermal.fit_history, self.db, ts, fits=fits)
+            out = await asyncio.to_thread(thermal.predict, self.db, ts, self._params)
+        except Exception:
+            log.exception("derate forecast check failed")
+            return
+        if out.get("state") != "charging":
+            return
+        forecast = out.get("forecast") or {}
+        will_trip = forecast.get("will_trip")
+        minutes = forecast.get("minutes_to_trip")
+        if will_trip is True and minutes is not None and minutes <= thermal.DERATE_WARN_MIN:
+            _, newly = await asyncio.to_thread(self.db.raise_alert, ts, thermal.DERATE_ALERT, "monitor")
+            if newly:
+                self._derate_active = True
+                detail = {
+                    "minutes_to_trip": minutes,
+                    "steady_state_c": forecast.get("steady_state_c"),
+                    "suggested_max_a": forecast.get("suggested_max_a"),
+                    "basis": forecast.get("basis"),
+                    "current_a": raw.get("vehicle_current_a"),
+                }
+                await self._event(ts, "derate_warning", detail)
+                cap = forecast.get("suggested_max_a")
+                action = (
+                    f"Set the vehicle's charge current to ≤{cap:.0f} A to keep a sustained rate."
+                    if cap
+                    else "Reduce the vehicle's charge current."
+                )
+                await self._notify(
+                    "derate_warning",
+                    "Thermal derate predicted",
+                    f"~{max(round(minutes), 1)} min until the handle hits 65 °C and charging folds "
+                    f"back to 50%. {action}",
+                    detail,
+                )
+        elif will_trip is False:
+            # will_trip None (insufficient data) is unknown, not safe — leave
+            # an active warning standing until the forecast actually recovers.
+            await self._clear_derate(ts)
+
+    async def _clear_derate(self, ts: float) -> None:
+        if not self._derate_active:
+            return
+        self._derate_active = False
+        cleared = await asyncio.to_thread(self.db.clear_alert, ts, thermal.DERATE_ALERT, "monitor")
+        if cleared:
+            await self._event(ts, "derate_warning_cleared", None)
+
+    def _alert_label(self, code: str) -> str:
+        if self._alert_labels is None:
+            try:
+                from importlib import resources
+
+                data = json.loads(
+                    resources.files("wallmonitor").joinpath("alert_codes.json").read_text()
+                )
+                self._alert_labels = data.get("codes", {})
+            except Exception:
+                self._alert_labels = {}
+        entry = self._alert_labels.get(str(code))
+        return entry["label"] if entry else f"code {code} (undocumented)"
+
+    async def _notify(self, kind: str, title: str, body: str, detail: dict | None) -> None:
+        """POST an actionable warning to the configured LAN webhook.
+
+        Fire-and-forget: notification failures must never disturb polling,
+        and with no URL configured this is a no-op. Local-only by design —
+        the monitor itself never talks to anything beyond the charger and
+        this user-chosen LAN endpoint.
+        """
+        url = self.cfg.notify_url
+        if not url:
+            return
+        payload = {"ts": time.time(), "kind": kind, "title": title, "body": body, "detail": detail}
+        try:
+            async with self._http.post(
+                url, json=payload, timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                await resp.read()
+        except Exception as ex:
+            log.debug("notify webhook failed: %s", ex)
 
     async def _event(self, ts: float, kind: str, detail: dict | None) -> None:
         await asyncio.to_thread(self.db.add_event, ts, kind, detail)

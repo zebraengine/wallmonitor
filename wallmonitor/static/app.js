@@ -112,6 +112,8 @@ const EVENT_META = {
   monitor_gap: ["Monitoring gap — service was off", "warning"],
   thermal_drift: ["Handle heat rise increasing vs baseline", "serious"],
   thermal_drift_cleared: ["Handle heat rise back to baseline", "good"],
+  derate_warning: ["Derate predicted — lower charge current", "serious"],
+  derate_warning_cleared: ["Derate no longer predicted", "good"],
 };
 const eventLabel = (kind) => (EVENT_META[kind] || [kind, "muted"])[0];
 const eventSeverity = (kind) => (EVENT_META[kind] || [kind, "muted"])[1];
@@ -1145,6 +1147,9 @@ function eventsTable(events) {
       try {
         const detailObj = JSON.parse(ev.detail);
         if (ev.kind === "evse_state_change") detail = `${evseLabel(detailObj.from)} → ${evseLabel(detailObj.to)}`;
+        else if (ev.kind === "derate_warning")
+          detail = `~${fmtNum(detailObj.minutes_to_trip, 0)} min to 65 °C at ${fmtNum(detailObj.current_a, 0)} A` +
+            (detailObj.suggested_max_a ? ` — cap vehicle charge current at ${fmtNum(detailObj.suggested_max_a, 0)} A to keep charging` : "");
         else if (ev.kind === "monitor_gap") detail = `no data since ${fmtDT(detailObj.offline_since)} (${fmtDur(detailObj.gap_s)})`;
         else if (ev.kind === "evse_not_ready_change")
           detail = `codes [${(detailObj.from || []).join(", ")}] → [${(detailObj.to || []).join(", ")}] (undocumented)`;
@@ -1390,8 +1395,63 @@ function tzNote() {
     "recorded internally as UTC from a single host clock.";
 }
 
+/* ---------------- local browser notifications ----------------
+ * Actionable warnings only, fired from the SSE stream while the dashboard
+ * is open in any tab. Entirely local: the Notification API here involves no
+ * push service and no traffic beyond this page — matching the project's
+ * nothing-phones-home rule. (For warnings with the dashboard closed, point
+ * WM_NOTIFY_URL at a LAN endpoint instead.)
+ */
+const NOTIFY_KEY = "wm-notify";
+const NOTIFY_BUILDERS = {
+  derate_warning: (d) => ["Thermal derate predicted",
+    `~${fmtNum((d || {}).minutes_to_trip, 0)} min until the handle hits 65 °C and charging folds back to 50%. ` +
+    ((d || {}).suggested_max_a
+      ? `Set the vehicle's charge current to ≤${fmtNum(d.suggested_max_a, 0)} A to keep a sustained rate.`
+      : "Reduce the vehicle's charge current.")],
+  alert_raised: (d) => {
+    const disp = alertDisplay(String((d || {}).alert), "device");
+    return ["Wall Connector alert", disp.sub ? `${disp.label} — ${disp.sub}` : disp.label];
+  },
+  thermal_drift: (d) => ["Heat rise climbing vs baseline",
+    `Recent sessions run +${fmtNum((d || {}).recent_rise_c, 1)} °C vs a +${fmtNum((d || {}).baseline_rise_c, 1)} °C baseline ` +
+    "at the same current — inspect the handle and charge-port pins, and have the terminal torque checked."],
+  poll_error: () => ["Charger unreachable",
+    "Repeated polls failed — check the breaker, Wi-Fi, or the charger itself."],
+};
+
+function initNotifications() {
+  const btn = $("#notif-btn");
+  if (!btn || !("Notification" in window)) return;
+  btn.hidden = false;
+  const enabled = () => localStorage.getItem(NOTIFY_KEY) === "1" && Notification.permission === "granted";
+  const paint = () => {
+    btn.textContent = enabled() ? "\u{1F514} warnings on" : "\u{1F515} warnings off";
+    btn.classList.toggle("active", enabled());
+  };
+  btn.onclick = async () => {
+    if (enabled()) localStorage.setItem(NOTIFY_KEY, "0");
+    else if ((await Notification.requestPermission()) === "granted") localStorage.setItem(NOTIFY_KEY, "1");
+    paint();
+  };
+  paint();
+  live.listeners.add((msg) => {
+    if (msg.type !== "event" || !enabled()) return;
+    const build = NOTIFY_BUILDERS[msg.kind];
+    if (!build) return;
+    // The dashboard in front of the user already shows it; notify when the
+    // tab is hidden or unfocused (other window, phone in a pocket).
+    if (document.visibilityState === "visible" && document.hasFocus()) return;
+    try {
+      const [title, body] = build(msg.detail);
+      new Notification(title, { body, tag: `wm-${msg.kind}` });
+    } catch { /* denied or unsupported at fire time — nothing to do */ }
+  });
+}
+
 window.addEventListener("hashchange", route);
 connectSSE();
+initNotifications();
 loadAlertCodes().finally(refreshStatus);
 setInterval(refreshStatus, 10000);
 setInterval(tickClock, 1000);

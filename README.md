@@ -72,7 +72,19 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
    predicted the actual alert-40 raise to within seconds. `/api/thermal`
    returns the fitted model, the live forecast, every per-segment fit, and
    the drift verdict.
-7. **One synchronized clock** — every sample, session boundary, alert, and
+7. **Actionable warnings, local-only** — events a user can actually act on
+   are pushed, not just logged: a **predicted derate** while there is still
+   time to intercede (with the computed highest charge current that avoids
+   the trip — capping the vehicle beats the charger's blunt 50% foldback),
+   device alerts as they raise, the degradation watch's inspect-wiring
+   warning, and charger-unreachable. Two delivery paths, both consistent
+   with the nothing-phones-home rule: **browser notifications** from any
+   open dashboard tab (fed by the existing SSE stream — no push service,
+   no external traffic; enable via the bell in the header), and an optional
+   **LAN webhook** (`--notify-url` / `WM_NOTIFY_URL`) that POSTs each
+   warning as JSON to an endpoint on your own network — Home Assistant, a
+   self-hosted ntfy, Node-RED — for warnings while no dashboard is open.
+8. **One synchronized clock** — every sample, session boundary, alert, and
    event is stamped with the host's UTC time the moment it was observed, and
    rendered in your local timezone by one shared formatter, so you can line up
    any error with the exact operating conditions around it. The charger's own
