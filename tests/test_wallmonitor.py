@@ -578,6 +578,32 @@ async def test_thermal_drift_detection(db):
     assert thermal.detect_drift(fits[:4]) is None
 
 
+async def test_thermal_drift_ignores_off_current_sessions(db):
+    now = time.time()
+    # Six healthy sessions at the usual 48.6 A, then one at a reduced 40.6 A
+    # whose fitted rise normalizes high — the (48/40.6)^2 extrapolation
+    # amplifying ordinary error, not a hardware change. It must be excluded
+    # from the comparison rather than allowed to swing the recent median.
+    for i, rise in enumerate([36.0, 36.5, 35.8, 36.2, 36.1, 36.4]):
+        _seed_thermal_session(db, now - (8 - i) * 7200, ambient_c=25.0, rise_ref_c=rise)
+    _seed_thermal_session(db, now - 2 * 7200, ambient_c=25.0, rise_ref_c=42.5, amps=40.6)
+    fits = thermal.fit_sessions(db, now)
+    assert len(fits) == 7
+    drift = thermal.detect_drift(fits)
+    assert drift is not None and drift["drifting"] is False
+    assert drift["off_current_n"] == 1
+    assert abs(drift["typical_current_a"] - 48.6) < 1.0
+
+    # A genuine same-current increase must still be flagged even with the
+    # off-current session in the mix.
+    _seed_thermal_session(db, now - 7200, ambient_c=25.0, rise_ref_c=42.0)
+    _seed_thermal_session(db, now - 3600, ambient_c=25.0, rise_ref_c=41.8)
+    fits = thermal.fit_sessions(db, now)
+    drift = thermal.detect_drift(fits)
+    assert drift is not None and drift["drifting"] is True
+    assert drift["off_current_n"] == 1
+
+
 async def test_thermal_drift_poller_alert(db):
     now = time.time()
     rises = [36.0, 36.5, 35.8, 36.2, 42.0, 41.5, 42.3]
@@ -592,6 +618,21 @@ async def test_thermal_drift_poller_alert(db):
     assert any(alert["alert"] == thermal.DRIFT_ALERT and alert["source"] == "monitor" for alert in alerts)
     events = db.events_range(now - 1, now + 1)
     assert any(event["kind"] == "thermal_drift" for event in events)
+
+
+async def test_thermal_drift_alert_clears_when_history_too_thin(db):
+    # An active drift alert must not linger once there is no longer enough
+    # comparable history for a verdict (detect_drift -> None).
+    now = time.time()
+    db.raise_alert(now - 60, thermal.DRIFT_ALERT, "monitor")
+    cfg = Config(host="127.0.0.1:1")
+    bus = EventBus()
+    async with aiohttp.ClientSession() as client:
+        poller = Poller(cfg, db, bus, client)
+        await poller._check_thermal_drift(now)
+    assert not any(a["alert"] == thermal.DRIFT_ALERT for a in db.active_alerts())
+    events = db.events_range(now - 1, now + 1)
+    assert any(e["kind"] == "thermal_drift_cleared" for e in events)
 
 
 async def test_thermal_suggest_max_current():

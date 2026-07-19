@@ -244,8 +244,21 @@ def detect_drift(fits: list[dict]) -> dict | None:
     verdict dict with the medians compared. Only rise (not tau) is watched:
     added contact resistance changes how much heat is made, not how fast the
     handle mass warms.
+
+    Only sessions charging near the install's typical current are compared.
+    rise_ref_c is normalized by (REF/I)^2, and far from the measured current
+    that normalization amplifies ordinary fit error — a session at 40 A with
+    an unremarkable raw rise extrapolates to an alarming number at 48 A, and
+    with only DRIFT_RECENT_N recent sessions a single such point can swing
+    the median past the threshold and manufacture a drift verdict.
     """
-    rises = [(fit["start_ts"], fit["rise_ref_c"]) for fit in fits if fit["rise_ref_c"] is not None]
+    usable = [fit for fit in fits if fit["rise_ref_c"] is not None]
+    if len(usable) < DRIFT_RECENT_N + DRIFT_MIN_BASELINE_N:
+        return None
+    typical_a = median(fit["current_a"] for fit in usable)
+    band = max(2.0, 0.1 * typical_a)
+    comparable = [fit for fit in usable if abs(fit["current_a"] - typical_a) <= band]
+    rises = [(fit["start_ts"], fit["rise_ref_c"]) for fit in comparable]
     rises.sort(key=lambda entry: entry[0])
     if len(rises) < DRIFT_RECENT_N + DRIFT_MIN_BASELINE_N:
         return None
@@ -261,6 +274,8 @@ def detect_drift(fits: list[dict]) -> dict | None:
         "delta_c": round(delta, 2),
         "recent_n": len(recent),
         "baseline_n": len(baseline),
+        "typical_current_a": round(typical_a, 1),
+        "off_current_n": len(usable) - len(comparable),
         "threshold_c": DRIFT_WARN_C,
     }
 

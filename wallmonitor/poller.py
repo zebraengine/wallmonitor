@@ -358,6 +358,12 @@ class Poller:
             log.exception("thermal drift check failed")
             return
         if drift is None:
+            # No verdict — the comparable history got too thin (sessions aged
+            # out of the lookback, or off-current sessions were set aside). An
+            # active alert can no longer be justified either, so let it clear.
+            cleared = await asyncio.to_thread(self.db.clear_alert, ts, thermal.DRIFT_ALERT, "monitor")
+            if cleared:
+                await self._event(ts, "thermal_drift_cleared", {"reason": "insufficient_history"})
             return
         if drift["drifting"]:
             _, newly = await asyncio.to_thread(self.db.raise_alert, ts, thermal.DRIFT_ALERT, "monitor")
