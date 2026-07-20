@@ -480,6 +480,21 @@ class Poller:
         entry = self._alert_labels.get(str(code))
         return entry["label"] if entry else f"code {code} (undocumented)"
 
+    # ntfy rendering per warning kind: how loudly the phone should interrupt,
+    # and the tag emoji shown before the title.
+    NTFY_PRIORITY = {
+        "derate_warning": "urgent",  # actionable *now* — lower the amps
+        "alert_raised": "high",
+        "thermal_drift": "high",
+        "poll_error": "default",
+    }
+    NTFY_TAGS = {
+        "derate_warning": "zap,warning",
+        "alert_raised": "rotating_light",
+        "thermal_drift": "wrench",
+        "poll_error": "electric_plug,x",
+    }
+
     async def _notify(self, kind: str, title: str, body: str, detail: dict | None) -> None:
         """POST an actionable warning to the configured LAN webhook.
 
@@ -487,16 +502,31 @@ class Poller:
         and with no URL configured this is a no-op. Local-only by design —
         the monitor itself never talks to anything beyond the charger and
         this user-chosen LAN endpoint.
+
+        Format "json" posts one JSON object (for Home Assistant, Node-RED,
+        custom receivers); "ntfy" posts plain text with ntfy's publish
+        headers so notify_url can be a self-hosted ntfy topic directly.
         """
         url = self.cfg.notify_url
         if not url:
             return
-        payload = {"ts": time.time(), "kind": kind, "title": title, "body": body, "detail": detail}
         try:
-            async with self._http.post(
-                url, json=payload, timeout=aiohttp.ClientTimeout(total=5)
-            ) as resp:
-                await resp.read()
+            if self.cfg.notify_format == "ntfy":
+                headers = {
+                    "X-Title": title,
+                    "X-Priority": self.NTFY_PRIORITY.get(kind, "default"),
+                    "X-Tags": self.NTFY_TAGS.get(kind, "warning"),
+                }
+                async with self._http.post(
+                    url, data=body.encode(), headers=headers, timeout=aiohttp.ClientTimeout(total=5)
+                ) as resp:
+                    await resp.read()
+            else:
+                payload = {"ts": time.time(), "kind": kind, "title": title, "body": body, "detail": detail}
+                async with self._http.post(
+                    url, json=payload, timeout=aiohttp.ClientTimeout(total=5)
+                ) as resp:
+                    await resp.read()
         except Exception as ex:
             log.debug("notify webhook failed: %s", ex)
 

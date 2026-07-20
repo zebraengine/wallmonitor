@@ -23,10 +23,14 @@ class Config:
     db_path: str = "wallmonitor.db"
     demo: bool = False
     split_phase: bool = False
-    # Optional LAN webhook: actionable warnings are POSTed here as JSON.
+    # Optional LAN webhook: actionable warnings are POSTed here.
     # Local-only by design — point it at something on your own network
     # (Home Assistant, a self-hosted ntfy, node-RED); leave empty to disable.
     notify_url: str = ""
+    # Payload shape for the webhook: "json" posts one JSON object; "ntfy"
+    # posts plain-text with X-Title/X-Priority/X-Tags headers so notify_url
+    # can be a ntfy topic (e.g. http://<lan-host>:8481/wallmonitor) directly.
+    notify_format: str = "json"
     # Poll cadence (seconds). Vitals tighten while a vehicle is connected.
     vitals_interval_active: float = 2.0
     vitals_interval_idle: float = 5.0
@@ -109,8 +113,15 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser.add_argument(
         "--notify-url",
         default=_env("WM_NOTIFY_URL", ""),
-        help="Optional LAN webhook that receives actionable warnings as JSON POSTs, "
+        help="Optional LAN webhook that receives actionable warnings as POSTs, "
         "e.g. Home Assistant or a self-hosted ntfy on your own network (env: WM_NOTIFY_URL)",
+    )
+    parser.add_argument(
+        "--notify-format",
+        choices=("json", "ntfy"),
+        default=_env("WM_NOTIFY_FORMAT", "json"),
+        help="Webhook payload shape: 'json' for one JSON object per warning, 'ntfy' for "
+        "plain-text + ntfy headers so --notify-url can be a ntfy topic (env: WM_NOTIFY_FORMAT)",
     )
     args = parser.parse_args(argv)
 
@@ -125,6 +136,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         demo=bool(args.demo),
         split_phase=bool(args.split_phase),
         notify_url=args.notify_url,
+        notify_format=args.notify_format,
         vitals_interval_active=args.vitals_active,
         vitals_interval_idle=args.vitals_idle,
         wifi_interval=args.wifi_interval,
