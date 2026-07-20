@@ -1424,8 +1424,29 @@ function initNotifications() {
   const btn = $("#notif-btn");
   if (!btn || !("Notification" in window)) return;
   btn.hidden = false;
+  // Browsers only grant notification permission on secure origins (HTTPS or
+  // localhost). Served over plain http:// on a LAN IP — the normal deploy —
+  // the permission prompt silently auto-denies, so a clickable toggle would
+  // be a lie. Say so instead, and point at the paths that do work.
+  if (!window.isSecureContext) {
+    btn.disabled = true;
+    btn.textContent = "\u{1F515} warnings need HTTPS";
+    btn.title =
+      "Browsers only allow notifications on HTTPS or localhost. Options: open the dashboard " +
+      "through an SSH tunnel (ssh -L 8480:localhost:8480 <host>, then http://localhost:8480), " +
+      "serve it behind HTTPS, or use the WM_NOTIFY_URL webhook — server-side delivery that " +
+      "doesn't involve the browser at all.";
+    return;
+  }
   const enabled = () => localStorage.getItem(NOTIFY_KEY) === "1" && Notification.permission === "granted";
   const paint = () => {
+    if (Notification.permission === "denied") {
+      btn.textContent = "\u{1F515} warnings blocked";
+      btn.title = "Notifications are blocked for this site in the browser's settings — " +
+        "re-allow them there, then click again.";
+      btn.classList.remove("active");
+      return;
+    }
     btn.textContent = enabled() ? "\u{1F514} warnings on" : "\u{1F515} warnings off";
     btn.classList.toggle("active", enabled());
   };

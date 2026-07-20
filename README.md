@@ -80,7 +80,10 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
    warning, and charger-unreachable. Two delivery paths, both consistent
    with the nothing-phones-home rule: **browser notifications** from any
    open dashboard tab (fed by the existing SSE stream — no push service,
-   no external traffic; enable via the bell in the header), and an optional
+   no external traffic; enable via the bell in the header — browsers only
+   permit notifications on HTTPS or localhost, so over plain http:// on a
+   LAN IP the bell explains itself and you need an SSH tunnel to localhost
+   or an HTTPS front-end), and an optional
    **LAN webhook** (`--notify-url` / `WM_NOTIFY_URL`) that POSTs each
    warning as JSON to an endpoint on your own network — Home Assistant, a
    self-hosted ntfy, Node-RED — for warnings while no dashboard is open.
