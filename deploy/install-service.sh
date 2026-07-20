@@ -24,6 +24,7 @@ BIND="0.0.0.0"
 DB_PATH=""
 SPLIT_PHASE="0"
 NOTIFY_URL=""
+NOTIFY_FORMAT=""
 DEMO="0"
 RUN_USER="${SUDO_USER:-$(id -un)}"
 UNINSTALL="0"
@@ -38,6 +39,7 @@ while [[ $# -gt 0 ]]; do
     --db) DB_PATH="$2"; shift 2 ;;
     --split-phase) SPLIT_PHASE="1"; shift ;;
     --notify-url) NOTIFY_URL="$2"; shift 2 ;;
+    --notify-format) NOTIFY_FORMAT="$2"; shift 2 ;;
     --demo) DEMO="1"; shift ;;
     --user) RUN_USER="$2"; shift 2 ;;
     --uninstall) UNINSTALL="1"; shift ;;
@@ -106,6 +108,7 @@ fi
   [[ -n "$DB_PATH" ]] && echo "Environment=WM_DB=${DB_PATH}"
   [[ "$SPLIT_PHASE" == "1" ]] && echo "Environment=WM_SPLIT_PHASE=1"
   [[ -n "$NOTIFY_URL" ]] && echo "Environment=WM_NOTIFY_URL=${NOTIFY_URL}"
+  [[ -n "$NOTIFY_FORMAT" ]] && echo "Environment=WM_NOTIFY_FORMAT=${NOTIFY_FORMAT}"
   [[ "$DEMO" == "1" ]] && echo "Environment=WM_DEMO=1"
   [[ -n "$CAP_LINE" ]] && echo "$CAP_LINE"
   echo "ExecStart=${UV_BIN} run --project ${MONITOR_DIR} python -m wallmonitor"

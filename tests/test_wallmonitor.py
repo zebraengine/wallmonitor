@@ -749,6 +749,47 @@ async def test_notify_webhook_posts_actionable_warning(db):
         await runner.cleanup()
 
 
+async def test_notify_ntfy_format(db):
+    # ntfy format: plain-text body with title/priority/tags headers, so the
+    # webhook URL can be a self-hosted ntfy topic directly.
+    from aiohttp import web as aioweb
+
+    received = []
+
+    async def topic(request):
+        received.append({"headers": dict(request.headers), "text": await request.text()})
+        return aioweb.Response()
+
+    app = aioweb.Application()
+    app.router.add_post("/wallmonitor", topic)
+    runner = aioweb.AppRunner(app)
+    await runner.setup()
+    site = aioweb.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        cfg = Config(
+            host="127.0.0.1:1",
+            notify_url=f"http://127.0.0.1:{port}/wallmonitor",
+            notify_format="ntfy",
+        )
+        bus = EventBus()
+        async with aiohttp.ClientSession() as client:
+            poller = Poller(cfg, db, bus, client)
+            await poller._notify(
+                "derate_warning", "Thermal derate predicted",
+                "~12 min until the handle hits 65 °C. Set the vehicle's charge current to ≤43 A.",
+                {"suggested_max_a": 43.0},
+            )
+        assert len(received) == 1
+        assert received[0]["headers"]["X-Title"] == "Thermal derate predicted"
+        assert received[0]["headers"]["X-Priority"] == "urgent"
+        assert "zap" in received[0]["headers"]["X-Tags"]
+        assert "65 °C" in received[0]["text"]
+    finally:
+        await runner.cleanup()
+
+
 async def test_thermal_drift_alert_clears_when_history_too_thin(db):
     # An active drift alert must not linger once there is no longer enough
     # comparable history for a verdict (detect_drift -> None).

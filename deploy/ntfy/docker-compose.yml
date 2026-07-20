@@ -1,0 +1,47 @@
+# Self-hosted ntfy for wallmonitor's actionable warnings — phone delivery
+# with message content that never leaves your LAN.
+#
+#   cd deploy/ntfy
+#   docker compose up -d
+#
+# Then reinstall the wallmonitor service with the webhook pointed here:
+#
+#   sudo ../install-service.sh --host <wall-connector-ip> [your other flags] \
+#     --notify-url http://127.0.0.1:8481/wallmonitor --notify-format ntfy
+#
+# Phone setup (ntfy app, iOS or Android):
+#   1. In the app settings, set the default server to http://<this-box-lan-ip>:8481
+#   2. Subscribe to the topic "wallmonitor"
+#
+# iOS note: Apple only delivers instant background pushes through its own
+# push service, so with a purely self-hosted server the iOS app refreshes
+# on open / periodically rather than instantly. For instant delivery,
+# uncomment NTFY_UPSTREAM_BASE_URL below: only a wake-up ping ("check your
+# server") transits ntfy.sh and Apple's push service — the message content
+# is still fetched from this box over your LAN. Android needs neither.
+#
+# There is no auth here (NTFY_AUTH_DEFAULT_ACCESS=read-write): anyone on
+# your LAN can read and publish topics, same trust model as the monitor UI
+# itself. Your firewall is the access control; add ntfy users/ACLs if your
+# network is shared.
+
+services:
+  ntfy:
+    image: binwiederhier/ntfy
+    container_name: ntfy
+    command: serve
+    restart: unless-stopped
+    ports:
+      - "8481:80"
+    volumes:
+      - ./cache:/var/cache/ntfy
+    environment:
+      # Set to the URL your phone uses to reach this box, e.g.
+      # http://192.168.1.50:8481 — required for attachments and upstream.
+      NTFY_BASE_URL: "http://CHANGE-ME-LAN-IP:8481"
+      NTFY_CACHE_FILE: /var/cache/ntfy/cache.db
+      NTFY_CACHE_DURATION: "72h"
+      NTFY_AUTH_DEFAULT_ACCESS: read-write
+      # Uncomment for instant iOS delivery (wake-up ping via ntfy.sh only;
+      # message content stays on your LAN):
+      # NTFY_UPSTREAM_BASE_URL: "https://ntfy.sh"
