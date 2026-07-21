@@ -611,6 +611,62 @@ async def test_thermal_fit_covers_late_charging_segments(db):
         assert abs(fit["current_a"] - amps) < 1.0
 
 
+async def test_thermal_fit_cooldown_tail_ambient(db):
+    # Stop/resume: the second ramp starts 8 minutes after the first charge
+    # stopped, on a handle still ~15 °C above idle — no flat idle window
+    # exists, so pre-idle ambient fails. The cool-down tail (exponential
+    # decay toward ambient + idle offset at the shared tau) must supply
+    # ambient instead, so the hardest-working segments still feed the
+    # degradation watch.
+    now = time.time()
+    start = now - 3 * 3600
+    ambient, tau_s, rise, amps = 25.0, 720.0, 36.0, 48.6
+    idle_temp = ambient + thermal.IDLE_OFFSET_C
+    t_inf = ambient + rise * (amps / thermal.REF_CURRENT_A) ** 2
+    _seed_idle(db, start - 1800, start, ambient)
+    sid = db.start_session(start)
+
+    def charge(seg_start, seg_len, temp0):
+        ts = seg_start
+        while ts <= seg_start + seg_len:
+            temp = t_inf - (t_inf - temp0) * math.exp(-(ts - seg_start) / tau_s)
+            db.insert_vitals(ts, {
+                "vehicle_connected": 1, "contactor_closed": 1, "vehicle_current_a": amps,
+                "handle_temp_c": round(temp, 3), "pcba_temp_c": 55.0, "mcu_temp_c": 50.0,
+            }, sid, amps * 233.0)
+            ts += 10.0
+        return ts, temp
+
+    def cooldown(t_from, t_to, temp0):
+        ts, temp = t_from, temp0
+        while ts < t_to:
+            temp = idle_temp + (temp0 - idle_temp) * math.exp(-(ts - t_from) / tau_s)
+            db.insert_vitals(ts, {
+                "vehicle_connected": 1, "contactor_closed": 0, "vehicle_current_a": 0.0,
+                "handle_temp_c": round(temp, 3), "pcba_temp_c": 40.0, "mcu_temp_c": 46.0,
+            }, sid, 0.0)
+            ts += 10.0
+        return temp
+
+    ts, end_temp = charge(start, 1500.0, idle_temp)      # first ramp, from idle temp
+    resume_at = ts + 480.0                                # 8-min gap: splits segments,
+    hot_temp = cooldown(ts, resume_at, end_temp)          # handle still hot at resume
+    assert hot_temp - idle_temp > 10.0, "test setup: handle must still be hot at resume"
+    ts, _ = charge(resume_at, 1500.0, hot_temp)           # resumed ramp from hot start
+    db.close_session(sid, ts, "vehicle_disconnected")
+
+    fits = thermal.fit_sessions(db, now)
+    assert len(fits) == 2
+    first, second = fits
+    assert first["ambient_source"] == "pre_idle"
+    assert abs(first["rise_ref_c"] - rise) < 3.0
+    # The resumed segment previously lost its rise fit entirely; now the
+    # cool-down tail supplies ambient and the fit lands on the seeded rise.
+    assert second["ambient_source"] == "cooldown_tail"
+    assert second["rise_ref_c"] is not None
+    assert abs(second["rise_ref_c"] - rise) < 3.0
+
+
 async def test_thermal_drift_detection(db):
     now = time.time()
     # Four healthy sessions, then three running hotter at the same current —
