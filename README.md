@@ -51,7 +51,12 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
    it idles in ordinary connected states until the car draws), so the fitter
    finds each segment's opening ramp wherever it occurs in the session and
    lets the quality gates decide what teaches the model — no configuration or
-   "monitoring mode" needed. The Live page forecasts: during charging, whether
+   "monitoring mode" needed. Each fit reads ambient from the flat idle
+   stretch before its segment, or — when a segment starts on a still-warm
+   handle (stop/resume, a post-derate resume) — from the previous charge's
+   **cool-down tail** extrapolated to its asymptote at the install's fitted
+   τ, so exactly the hardest-working segments aren't the ones excluded from
+   degradation tracking. The Live page forecasts: during charging, whether
    and when the current session will derate (from the handle's live
    trajectory); when idle, the estimated ambient and whether a full-rate
    charge started now would trip. When a derate is coming it also suggests

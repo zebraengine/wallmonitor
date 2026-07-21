@@ -185,13 +185,85 @@ def _ambient_before(db: Database, start_ts: float) -> float | None:
     return median(idle) - IDLE_OFFSET_C
 
 
+# Cool-down-tail ambient: gates for reading ambient from a still-warm
+# handle's decay when no flat idle window exists before a segment.
+COOLDOWN_MIN_SAMPLES = 10
+COOLDOWN_MIN_SPAN_S = 300.0
+COOLDOWN_MIN_DROP_C = 1.0
+COOLDOWN_MAX_RMSE_C = 0.5
+
+
+def _ambient_from_cooldown(db: Database, start_ts: float, tau_min: float) -> float | None:
+    """Ambient from the cool-down tail before a segment that starts warm.
+
+    A stop/resume or post-derate segment begins before the handle has
+    cooled, so _ambient_before finds no stable idle window and the segment
+    loses its rise fit. But the decay itself encodes ambient: idle cooling
+    follows the same first-order lag as the charge ramp, settling at
+    ambient + IDLE_OFFSET_C. With tau known from this install's fitted
+    ramps, the asymptote is a closed-form least squares over a few minutes
+    of tail — no flat stretch needed. (The live forecast bridges the same
+    gap by inferring ambient *from* the fitted rise; that would be circular
+    here, where the rise is the thing being measured.)
+    """
+    rows = db.vitals_range(start_ts - 2400, start_ts - 5, 5000)
+    idle = [
+        row
+        for row in rows
+        if not row.get("contactor_closed")
+        and (row.get("vehicle_current_a") or 0) < 1
+        and row.get("handle_temp_c") is not None
+        and row["handle_temp_c"] < 200
+    ]
+    if not idle:
+        return None
+    # The contiguous idle run ending at the segment start (tolerating normal
+    # polling gaps) — the tail of the previous charge's cool-down.
+    tail = [idle[-1]]
+    for row in reversed(idle[:-1]):
+        if tail[-1]["ts"] - row["ts"] > 120.0:
+            break
+        tail.append(row)
+    tail.reverse()
+    if len(tail) < COOLDOWN_MIN_SAMPLES or tail[-1]["ts"] - tail[0]["ts"] < COOLDOWN_MIN_SPAN_S:
+        return None
+    start_temp = tail[0]["handle_temp_c"]
+    if start_temp - tail[-1]["handle_temp_c"] < COOLDOWN_MIN_DROP_C:
+        return None  # not visibly cooling; nothing to extrapolate
+    tau_s = tau_min * 60.0
+    decays = [math.exp(-(row["ts"] - tail[0]["ts"]) / tau_s) for row in tail]
+    num = den = 0.0
+    for row, decay in zip(tail, decays):
+        num += (1.0 - decay) * (row["handle_temp_c"] - start_temp * decay)
+        den += (1.0 - decay) ** 2
+    if den < 1e-9:
+        return None
+    asymptote = num / den
+    rmse = math.sqrt(
+        sum(
+            (asymptote - (asymptote - start_temp) * decay - row["handle_temp_c"]) ** 2
+            for row, decay in zip(tail, decays)
+        )
+        / len(tail)
+    )
+    if rmse > COOLDOWN_MAX_RMSE_C:
+        return None  # not a clean single-exponential decay at this tau
+    ambient = asymptote - IDLE_OFFSET_C
+    if not (-30.0 <= ambient <= TRIP_HANDLE_C):
+        return None
+    return ambient
+
+
 def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list[dict]:
     """Per-segment fits, oldest first: one dict per charging segment whose
     ramp passed the quality gates. A session that idles for hours and then
     charges (a vehicle top-off, preconditioning, a charging schedule) yields
     its fits from wherever the ramps actually are, not just the plug-in
-    moment. rise_ref_c is None when there was no stable idle before the
-    segment to estimate ambient from (e.g. a resume minutes after a derate)."""
+    moment. Ambient comes from the flat idle stretch before the segment, or
+    — when the segment starts with a still-warm handle (stop/resume,
+    post-derate) — from the previous charge's cool-down tail extrapolated
+    to its asymptote. rise_ref_c is None only when neither read succeeds
+    (each fit carries its ambient_source: "pre_idle" or "cooldown_tail")."""
     sessions = [
         session
         for session in db.sessions_range(now - lookback_days * 86400, now)
@@ -227,6 +299,16 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
                 continue
             i_med = median(sample["vehicle_current_a"] for sample in prefix)
             ambient = _ambient_before(db, seg_start)
+            ambient_source = "pre_idle" if ambient is not None else None
+            if ambient is None:
+                # Hot-handle start (stop/resume, post-derate): read ambient
+                # from the previous charge's cool-down tail instead, using
+                # this install's fitted tau (this segment's own plus any
+                # earlier fits this pass).
+                tau_est = median([tau_s / 60.0] + [fit["tau_min"] for fit in fits])
+                ambient = _ambient_from_cooldown(db, seg_start, tau_est)
+                if ambient is not None:
+                    ambient_source = "cooldown_tail"
             rise = None
             if ambient is not None:
                 rise = (t_inf - ambient) * (REF_CURRENT_A / i_med) ** 2
@@ -240,6 +322,7 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
                     "rise_ref_c": round(rise, 2) if rise is not None else None,
                     "rmse_c": round(rmse, 3),
                     "current_a": round(i_med, 1),
+                    "ambient_source": ambient_source if rise is not None else None,
                 }
             )
     fits.sort(key=lambda fit: fit["start_ts"])
