@@ -1333,8 +1333,98 @@ async function viewAlerts(root, rangeKey = "7d") {
     el("div", { class: "note" },
       "Every recorded state change with its exact local timestamp — use this to reconstruct the operating conditions around an error, " +
       "then open the matching session for the telemetry at that moment."));
-  const evData = await getJSON(`/api/events?from=${from}&to=${now}`);
-  root.append(eventsTable(evData.events));
+
+  // The timeline grows without bound, so it gets its own range, category
+  // filters, and incremental paging — independent of the page-level range
+  // so narrowing the timeline doesn't refetch the alert history above.
+  const EVENT_GROUPS = [
+    { key: "charging", label: "Charging & sessions",
+      kinds: ["session_start", "session_end", "charging_start", "charging_stop"] },
+    { key: "evse", label: "EVSE state",
+      kinds: ["evse_state_change", "evse_not_ready_change"] },
+    { key: "alerts", label: "Alerts & thermal",
+      kinds: ["alert_raised", "alert_cleared", "thermal_drift", "thermal_drift_cleared",
+              "derate_warning", "derate_warning_cleared", "charger_reboot"] },
+    { key: "conn", label: "Connectivity",
+      kinds: ["poll_error", "poll_recovered", "wifi_disconnected", "wifi_reconnected",
+              "internet_lost", "internet_restored"] },
+    { key: "monitor", label: "Monitor",
+      kinds: ["monitor_start", "monitor_stop", "monitor_gap", "firmware_changed"] },
+  ];
+  const TL_PAGE = 100;
+  const tl = { rangeKey, groups: new Set(EVENT_GROUPS.map((group) => group.key)), events: [], shown: TL_PAGE };
+  const tlControls = el("div", {});
+  const tlInfo = el("div", { class: "note" });
+  const tlBody = el("div", {});
+  const tlPager = el("div", { class: "filters" });
+  root.append(tlControls, tlInfo, tlBody, tlPager);
+
+  function tlVisibleEvents() {
+    // With every category on, pass everything through — including any event
+    // kind added later that no group lists yet.
+    if (tl.groups.size === EVENT_GROUPS.length) return tl.events;
+    const kinds = new Set(EVENT_GROUPS.filter((group) => tl.groups.has(group.key))
+      .flatMap((group) => group.kinds));
+    return tl.events.filter((event) => kinds.has(event.kind));
+  }
+
+  function tlRender() {
+    const evs = tlVisibleEvents();
+    const visible = evs.slice(0, tl.shown);
+    tlBody.replaceChildren(eventsTable(visible));
+    const filtered = tl.groups.size < EVENT_GROUPS.length;
+    tlInfo.textContent =
+      `${evs.length}${tl.events.length >= 2000 ? "+" : ""} event${evs.length === 1 ? "" : "s"} in range` +
+      (filtered ? ` (filtered from ${tl.events.length})` : "") +
+      (visible.length < evs.length ? ` — showing the newest ${visible.length}` : "") +
+      (tl.events.length >= 2000 ? " · range capped at the most recent 2000; narrow the range for older events" : "");
+    tlPager.replaceChildren();
+    if (visible.length < evs.length) {
+      tlPager.append(
+        el("button", { class: "chip", onclick: () => { tl.shown += TL_PAGE; tlRender(); } },
+          `Show ${Math.min(TL_PAGE, evs.length - visible.length)} more`),
+        el("button", { class: "chip", onclick: () => { tl.shown = evs.length; tlRender(); } },
+          `Show all ${evs.length}`));
+    }
+  }
+
+  function tlControlsRender() {
+    const rangeRow = presetRow(RANGE_PRESETS, tl.rangeKey, (key) => {
+      tl.rangeKey = key;
+      tl.shown = TL_PAGE;
+      tlFetch();
+    });
+    const filterRow = el("div", { class: "filters" }, el("span", { class: "flabel" }, "Show"));
+    for (const group of EVENT_GROUPS) {
+      filterRow.append(el("button", {
+        class: "chip" + (tl.groups.has(group.key) ? " active" : ""),
+        onclick: () => {
+          if (tl.groups.has(group.key)) tl.groups.delete(group.key);
+          else tl.groups.add(group.key);
+          tl.shown = TL_PAGE;
+          tlControlsRender();
+          tlRender();
+        },
+      }, group.label));
+    }
+    tlControls.replaceChildren(rangeRow, filterRow);
+  }
+
+  async function tlFetch() {
+    tlControlsRender();
+    tlInfo.textContent = "Loading events…";
+    try {
+      const nowTs = Date.now() / 1000;
+      const data = await getJSON(`/api/events?from=${nowTs - rangeSeconds(tl.rangeKey)}&to=${nowTs}`);
+      tl.events = data.events; // newest first from the API
+    } catch {
+      tlInfo.textContent = "Could not load events.";
+      return;
+    }
+    tlRender();
+  }
+
+  await tlFetch();
 }
 
 /* ---------------- router ---------------- */
