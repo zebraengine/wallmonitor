@@ -130,6 +130,13 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
    `POST /api/thermal/baseline-anchor`) excludes all fits recorded before a
    hardware inspection: from then on the comparison means "vs verified
    healthy", not "vs the first charges the monitor happened to see".
+   A **rise-vs-ambient scatter** on the same page separates the remaining
+   confounder the fits can't remove: ambient is subtracted per fit, so a
+   healthy install shows a flat cloud regardless of garage temperature — a
+   cloud still sloping upward with ambient exposes an environment effect
+   the model doesn't carry (multi-day heat soak of cable and structure in
+   an uninsulated garage), while an elevated-but-flat cloud is the genuine
+   added-resistance signature.
 8. **Actionable warnings, local-only** — events a user can actually act on
    are pushed, not just logged: a **predicted derate** while there is still
    time to intercede (with the computed highest charge current that avoids

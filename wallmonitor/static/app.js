@@ -226,6 +226,71 @@ function timeTickFormat(ts, spanS) {
   return spanS <= 900 ? fmtT(ts) : `${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+/* scatterChart(box, {series: [{name, color, points: [[x, y, title?]]}],
+   xLabel, height, digits}) — numeric x axis (not time), one dot per point.
+   Used where the relationship between two measured quantities is the story
+   (e.g. fitted heat rise vs window ambient), not their history. */
+function scatterChart(box, opts) {
+  box.style.minHeight = `${opts.height || 210}px`;
+  box.textContent = "";
+  box.classList.add("chart-box");
+  const series = (opts.series || []).map((dataset) => (
+    { ...dataset, points: dataset.points.filter((point) => point[0] != null && point[1] != null && isFinite(point[0]) && isFinite(point[1])) }
+  ));
+  const height = opts.height || 210;
+  const width = Math.max(320, box.clientWidth || 800);
+  const margin = { left: 48, right: 14, top: 12, bottom: 34 };
+  const pw = width - margin.left - margin.right, ph = height - margin.top - margin.bottom;
+  const allPts = series.flatMap((dataset) => dataset.points);
+  if (allPts.length < 2) {
+    box.append(el("div", { class: "empty" }, "Not enough fits yet — each completed charge adds a point"));
+    return;
+  }
+  const xt = niceTicks(Math.min(...allPts.map((p) => p[0])), Math.max(...allPts.map((p) => p[0])), 6);
+  const yt = niceTicks(Math.min(...allPts.map((p) => p[1])), Math.max(...allPts.map((p) => p[1])), 4);
+  const xOf = (value) => margin.left + ((value - xt.min) / (xt.max - xt.min || 1)) * pw;
+  const yOf = (value) => margin.top + ph - ((value - yt.min) / (yt.max - yt.min || 1)) * ph;
+  const root = svg("svg", { viewBox: `0 0 ${width} ${height}`, width, height });
+  for (const value of yt.ticks) {
+    root.append(svg("line", { x1: margin.left, x2: width - margin.right, y1: yOf(value), y2: yOf(value), stroke: "var(--grid)", "stroke-width": 1 }));
+    const label = svg("text", { x: margin.left - 6, y: yOf(value) + 3.5, "text-anchor": "end", class: "axis-text" });
+    label.textContent = fmtNum(value, 0);
+    root.append(label);
+  }
+  for (const value of xt.ticks) {
+    const label = svg("text", { x: xOf(value), y: height - 18, "text-anchor": "middle", class: "axis-text" });
+    label.textContent = fmtNum(value, 0);
+    root.append(label);
+  }
+  if (opts.xLabel) {
+    const label = svg("text", { x: margin.left + pw / 2, y: height - 4, "text-anchor": "middle", class: "axis-text" });
+    label.textContent = opts.xLabel;
+    root.append(label);
+  }
+  root.append(svg("line", { x1: margin.left, x2: width - margin.right, y1: margin.top + ph, y2: margin.top + ph, stroke: "var(--baseline)", "stroke-width": 1 }));
+  for (const dataset of series) {
+    for (const point of dataset.points) {
+      const dot = svg("circle", { cx: xOf(point[0]).toFixed(1), cy: yOf(point[1]).toFixed(1), r: 4.5, fill: dataset.color, "fill-opacity": 0.85 });
+      if (point[2]) {
+        const title = svg("title", {});
+        title.textContent = point[2];
+        dot.append(title);
+      }
+      root.append(dot);
+    }
+  }
+  box.append(root);
+  if (series.length > 1) {
+    const legend = el("div", { class: "note" });
+    for (const dataset of series) {
+      const swatch = el("span", {}, "● ");
+      swatch.style.color = dataset.color;
+      legend.append(swatch, `${dataset.name} (${dataset.points.length})  `);
+    }
+    box.append(legend);
+  }
+}
+
 /* lineChart(box, {series, height, unit, digits, area, zeroBase, xFrom, xTo}) */
 function lineChart(box, opts) {
   // Reserve the chart's height before clearing so a live re-render never
@@ -1322,6 +1387,36 @@ async function viewAlerts(root, rangeKey = "7d") {
     } }, anchorTs ? "Clear anchor" : "Mark hardware verified — anchor baseline now");
     anchorRow.append(anchorBtn);
     rise.card.append(anchorRow);
+
+    // Rise vs ambient: the confounder detector. Healthy hardware with a
+    // complete thermal model shows a flat cloud — the fitted rise should not
+    // care what the garage temperature was, because ambient is already
+    // subtracted out. A cloud that still slopes upward with ambient means
+    // the model is missing an environment term (heat-soaked cable/structure
+    // in an uninsulated garage, not the weather at fit time); a flat cloud
+    // sitting higher than the old fits at the same ambient is hardware.
+    const scatter = chartCard("Heat rise vs ambient",
+      "Each completed charge adds a point: fitted rise (48 A-normalized) against the ambient measured for " +
+      "that load window. Flat cloud = model complete, ambient truly removed. Upward slope = residual " +
+      "environment effect (e.g. multi-day heat soak) still masquerading as rise. Elevated-but-flat = " +
+      "genuine added resistance. Hover a point for its session.");
+    root.append(scatter.card);
+    const fitPoint = (fit) => {
+      const ambient = fit.ambient_end_c != null ? (fit.ambient_c + fit.ambient_end_c) / 2 : fit.ambient_c;
+      return [ambient, fit.rise_ref_c,
+        `session ${fit.session_id} · ${fmtDT(fit.start_ts)} · ${fmtNum(fit.current_a, 1)} A · ` +
+        `rise ${fmtNum(fit.rise_ref_c, 1)} °C @ ambient ${fmtNum(ambient, 1)} °C`];
+    };
+    scatterChart(scatter.box, {
+      xLabel: "window ambient, °C",
+      series: [
+        { name: "ambient-bracketed", color: colors.s1,
+          points: fits.filter((fit) => fit.ambient_drift_c != null && fit.ambient_c != null).map(fitPoint) },
+        { name: "start-only ambient", color: colors.s3,
+          points: fits.filter((fit) => fit.ambient_drift_c == null && fit.ambient_c != null).map(fitPoint) },
+      ],
+      height: 210,
+    });
   }
 
   root.append(el("h2", {}, "Alert history"));
