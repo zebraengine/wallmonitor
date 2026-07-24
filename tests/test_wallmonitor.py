@@ -333,21 +333,43 @@ def _seed_idle(db, t_from, t_to, ambient_c, dt=10.0):
 
 
 def _seed_thermal_session(db, start_ts, ambient_c, tau_s=720.0, rise_ref_c=36.0,
-                          amps=48.6, charge_s=1500.0, dt=10.0):
-    """Idle lead-in plus a charging ramp that follows the first-order model."""
+                          amps=48.6, charge_s=1500.0, dt=10.0,
+                          ambient_end_c=None, cooldown_s=0.0):
+    """Idle lead-in plus a charging ramp that follows the first-order model.
+
+    With ambient_end_c set, ambient drifts linearly across the charge (the
+    heat-wave / overnight-cooling scenario) and the ramp comes from
+    integrating the lag ODE against the moving ambient. cooldown_s appends
+    post-session idle decay samples — the tail the fitter reads the load
+    window's end ambient from.
+    """
     _seed_idle(db, start_ts - 1800, start_ts, ambient_c, dt)
     sid = db.start_session(start_ts)
     t0_temp = ambient_c + thermal.IDLE_OFFSET_C
-    t_inf = ambient_c + rise_ref_c * (amps / thermal.REF_CURRENT_A) ** 2
+    rise_at = rise_ref_c * (amps / thermal.REF_CURRENT_A) ** 2
+    temp = t0_temp
     ts = start_ts
     while ts <= start_ts + charge_s:
-        temp = t_inf - (t_inf - t0_temp) * math.exp(-(ts - start_ts) / tau_s)
+        if ambient_end_c is None:
+            t_inf = ambient_c + rise_at
+            temp = t_inf - (t_inf - t0_temp) * math.exp(-(ts - start_ts) / tau_s)
         db.insert_vitals(ts, {
             "vehicle_connected": 1, "contactor_closed": 1, "vehicle_current_a": amps,
             "handle_temp_c": round(temp, 3), "pcba_temp_c": 55.0, "mcu_temp_c": 50.0,
         }, sid, amps * 233.0)
+        if ambient_end_c is not None:
+            ambient_now = ambient_c + (ambient_end_c - ambient_c) * (ts - start_ts) / charge_s
+            temp += dt * ((ambient_now + rise_at - temp) / tau_s)
         ts += dt
     db.close_session(sid, start_ts + charge_s, "vehicle_disconnected")
+    ambient_final = ambient_end_c if ambient_end_c is not None else ambient_c
+    while ts <= start_ts + charge_s + cooldown_s:
+        temp += dt * ((ambient_final + thermal.IDLE_OFFSET_C - temp) / tau_s)
+        db.insert_vitals(ts, {
+            "vehicle_connected": 0, "contactor_closed": 0, "vehicle_current_a": 0.0,
+            "handle_temp_c": round(temp, 3), "pcba_temp_c": 45.0, "mcu_temp_c": 48.0,
+        }, None, 0.0)
+        ts += dt
     return sid
 
 
@@ -665,6 +687,63 @@ async def test_thermal_fit_cooldown_tail_ambient(db):
     assert second["ambient_source"] == "cooldown_tail"
     assert second["rise_ref_c"] is not None
     assert abs(second["rise_ref_c"] - rise) < 3.0
+
+
+async def test_thermal_fit_debiases_in_window_ambient_drift(db):
+    # The heat-wave failure mode: the garage warms during the charge, a point
+    # ambient read at the window start goes stale, and the fitted rise
+    # absorbs the weather — indistinguishable from connector resistance.
+    # Bracketing reads the end ambient from the charge's own cool-down tail
+    # and de-trends the fit; both drift directions must recover the true
+    # rise, and the fit must record how much the ambient moved.
+    now = time.time()
+    warming = _seed_thermal_session(db, now - 4 * 7200, ambient_c=30.0, ambient_end_c=33.0,
+                                    charge_s=1800.0, cooldown_s=1500.0)
+    cooling = _seed_thermal_session(db, now - 2 * 7200, ambient_c=28.0, ambient_end_c=26.0,
+                                    charge_s=1800.0, cooldown_s=1500.0)
+    fits = thermal.fit_sessions(db, now)
+    assert [fit["session_id"] for fit in fits] == [warming, cooling]
+    warm_fit, cool_fit = fits
+    assert warm_fit["ambient_drift_c"] is not None and 2.0 < warm_fit["ambient_drift_c"] < 4.0
+    assert cool_fit["ambient_drift_c"] is not None and -3.0 < cool_fit["ambient_drift_c"] < -1.0
+    # Without the bracket the warming fit reads ~+3 °C hot and the cooling
+    # fit ~2 °C cold; de-trended, both land on the seeded 36 °C.
+    assert abs(warm_fit["rise_ref_c"] - 36.0) < 1.5
+    assert abs(cool_fit["rise_ref_c"] - 36.0) < 1.5
+    # And a start-only fit (no cool-down tail recorded) still works the old
+    # way, flagged as such.
+    _seed_thermal_session(db, now - 7200, ambient_c=27.0)
+    fits = thermal.fit_sessions(db, now)
+    assert fits[-1]["ambient_drift_c"] is None
+    assert fits[-1]["ambient_end_c"] is None
+    assert fits[-1]["rise_ref_c"] is not None
+
+
+async def test_thermal_drift_follows_current_change(db):
+    # The user caps the vehicle at a new charge current (e.g. 48 A -> 40 A to
+    # stay under the derate on hot days). The old all-history median kept
+    # "typical" at 48 A forever: every new session was off-current, the drift
+    # verdict froze on stale data, and an active alert could never clear or
+    # re-confirm. Typical must follow the install's recent operating point.
+    now = time.time()
+    for i, rise in enumerate([36.0, 36.5, 35.8, 36.2, 36.1, 36.4]):
+        _seed_thermal_session(db, now - (14 - i) * 7200, ambient_c=25.0, rise_ref_c=rise)
+    for i, rise in enumerate([36.3, 36.0, 36.2]):
+        _seed_thermal_session(db, now - (7 - i) * 7200, ambient_c=25.0, rise_ref_c=rise, amps=40.6)
+    fits = thermal.fit_sessions(db, now)
+    drift = thermal.detect_drift(fits)
+    # Three 40 A fits and no 40 A baseline yet: the honest "can't judge yet"
+    # (which clears a stale alert) rather than a verdict frozen at 48 A.
+    assert drift is None
+    # More 40 A history accumulates — the watch re-arms at the new current
+    # and a genuine same-current increase is still flagged.
+    for i, rise in enumerate([36.1, 42.0, 41.8, 42.3]):
+        _seed_thermal_session(db, now - (4 - i) * 7200, ambient_c=25.0, rise_ref_c=rise, amps=40.6)
+    fits = thermal.fit_sessions(db, now)
+    drift = thermal.detect_drift(fits)
+    assert drift is not None and drift["drifting"] is True
+    assert abs(drift["typical_current_a"] - 40.6) < 0.1
+    assert drift["off_current_n"] == 6  # the old 48 A history sits out
 
 
 async def test_thermal_drift_detection(db):

@@ -1277,6 +1277,19 @@ async function viewAlerts(root, rangeKey = "7d") {
           : `Stable: recent median +${fmtNum(drift.recent_rise_c, 1)} °C vs baseline +${fmtNum(drift.baseline_rise_c, 1)} °C ` +
             `(alert threshold Δ ≥ ${fmtNum(drift.threshold_c, 1)} °C).`));
     }
+    // Ambient bracketing: fits that read ambient at both ends of the load
+    // window are de-trended for weather that moved during the charge — the
+    // difference between "the garage warmed 3 °C" and "the connector is
+    // going bad". Start-only fits carry that ambiguity; say so.
+    const bracketed = fits.filter((fit) => fit.ambient_drift_c != null);
+    if (bracketed.length) {
+      const maxDrift = bracketed.reduce(
+        (acc, fit) => Math.abs(fit.ambient_drift_c) > Math.abs(acc) ? fit.ambient_drift_c : acc, 0);
+      rise.card.append(el("div", { class: "note" },
+        `Ambient bracketing: ${bracketed.length} of ${fits.length} fits read ambient at both ends of ` +
+        `their load window and are corrected for in-window ambient drift ` +
+        `(largest ${maxDrift > 0 ? "+" : ""}${fmtNum(maxDrift, 1)} °C); the rest assume it held still.`));
+    }
   }
 
   root.append(el("h2", {}, "Alert history"));
