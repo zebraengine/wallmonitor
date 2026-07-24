@@ -1,11 +1,34 @@
 # wallmonitor
 
-A **local-only** monitoring, recording, and review UI for a Tesla Wall Connector
-Gen 3, built on the `tesla-wall-connector` library in the parent directory.
+A **local-only** companion for the Tesla Wall Connector Gen 3 that grew well
+beyond reading data off the charger: it records everything the device
+reports, turns that history into a thermal model fitted to *your* install,
+forecasts derates before they happen (with the charge-current cap that
+avoids them), watches for connector degradation with honest statistics, and
+pushes actionable warnings to your browser or phone. Built on the
+`tesla-wall-connector` library in the parent directory.
 
 Everything stays on your machine and your LAN: the only network traffic is
 HTTP GETs to the charger's local API, storage is a local SQLite file, and the
 web UI serves no external assets (no CDNs, fonts, or analytics).
+
+**At a glance:**
+
+- Full-fidelity recording — every response stored with its complete raw JSON
+- Live dashboard (SSE) with rolling charts and an active-alert banner
+- Session review: energy, peak/average power, per-phase telemetry, drillable charts
+- Event timeline with range presets, category filters, and paging
+- Alert decoding and EVSE-state labels, each marked verified vs community-reported
+- Wi-Fi health history and connectivity events
+- **Thermal derate forecast** — a per-install fitted model predicts alert 40
+  live and suggests the highest current that avoids the 50% foldback
+- **Degradation watch** — ambient-corrected heat-rise trend with confidence
+  intervals and a verified-baseline anchor, so "getting worse" is a
+  statistical claim, not a vibe
+- **Actionable notifications, local-only** — browser push and LAN
+  webhook/self-hosted ntfy for phones, with a systemd + Docker deploy recipe
+- Resilience: seamless restarts, downtime recorded as explicit gap events,
+  sensor-glitch quarantine
 
 ## What it does
 
@@ -75,7 +98,19 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
    charge started now would trip. When a derate is coming it also suggests
    the highest vehicle charge-current cap that stays under the limit —
    a steady capped rate charges faster than full rate folding back to 50%.
-   The same per-segment fits feed a **degradation watch**: rising heat at
+   During cool-down — after a current cut or a derate — the forecast reports
+   the true lower equilibrium the handle is settling toward ("recovering",
+   not "tripping"). When a mid-session current change resets the live
+   trajectory window, or sessions run back-to-back with no idle gap to read
+   ambient from, the forecast bridges with ambient inferred from the newest
+   steady run still in the buffer instead of going dark.
+   **Field-validated live:** steering the vehicle's charge
+   current down on the forecast's advice kept a session 0.7 °C under the
+   trip point, and in a deliberate full-rate test the trajectory forecast
+   predicted the actual alert-40 raise to within seconds. `/api/thermal`
+   returns the fitted model, the live forecast, every per-segment fit, and
+   the drift verdict.
+7. **Degradation watch** — the same per-segment fits feed a trend: rising heat at
    unchanged current means added resistance (loose lug, degrading contact),
    so when recent segments' fitted rise climbs past the baseline the poller
    raises a monitor alert and the Alerts page charts the fitted-rise trend.
@@ -95,18 +130,7 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
    `POST /api/thermal/baseline-anchor`) excludes all fits recorded before a
    hardware inspection: from then on the comparison means "vs verified
    healthy", not "vs the first charges the monitor happened to see".
-   During cool-down — after a current cut or a derate — the forecast reports
-   the true lower equilibrium the handle is settling toward ("recovering",
-   not "tripping"). When a mid-session current change resets the live
-   trajectory window, or sessions run back-to-back with no idle gap to read
-   ambient from, the forecast bridges with ambient inferred from the newest
-   steady run still in the buffer instead of going dark. **Field-validated live:** steering the vehicle's charge
-   current down on the forecast's advice kept a session 0.7 °C under the
-   trip point, and in a deliberate full-rate test the trajectory forecast
-   predicted the actual alert-40 raise to within seconds. `/api/thermal`
-   returns the fitted model, the live forecast, every per-segment fit, and
-   the drift verdict.
-7. **Actionable warnings, local-only** — events a user can actually act on
+8. **Actionable warnings, local-only** — events a user can actually act on
    are pushed, not just logged: a **predicted derate** while there is still
    time to intercede (with the computed highest charge current that avoids
    the trip — capping the vehicle beats the charger's blunt 50% foldback),
@@ -121,7 +145,7 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
    **LAN webhook** (`--notify-url` / `WM_NOTIFY_URL`) that POSTs each
    warning as JSON to an endpoint on your own network — Home Assistant, a
    self-hosted ntfy, Node-RED — for warnings while no dashboard is open.
-8. **One synchronized clock** — every sample, session boundary, alert, and
+9. **One synchronized clock** — every sample, session boundary, alert, and
    event is stamped with the host's UTC time the moment it was observed, and
    rendered in your local timezone by one shared formatter, so you can line up
    any error with the exact operating conditions around it. The charger's own
