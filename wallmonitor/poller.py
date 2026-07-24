@@ -376,7 +376,8 @@ class Poller:
         try:
             fits = await asyncio.to_thread(thermal.fit_sessions, self.db, ts)
             self._params = await asyncio.to_thread(thermal.fit_history, self.db, ts, fits=fits)
-            drift = thermal.detect_drift(fits)
+            anchor = await asyncio.to_thread(thermal.baseline_anchor, self.db)
+            drift = thermal.detect_drift(fits, anchor_ts=anchor)
         except Exception:
             log.exception("thermal drift check failed")
             return
@@ -392,12 +393,18 @@ class Poller:
             _, newly = await asyncio.to_thread(self.db.raise_alert, ts, thermal.DRIFT_ALERT, "monitor")
             if newly:
                 await self._event(ts, "thermal_drift", drift)
+                ci_lo, ci_hi = drift["delta_ci95_c"]
+                sureness = (
+                    "statistically confirmed"
+                    if drift["confident"]
+                    else f"not yet confirmed at n={drift['baseline_n']}+{drift['recent_n']} — treat as a lead"
+                )
                 await self._notify(
                     "thermal_drift",
                     "Heat rise climbing vs baseline",
                     f"Recent sessions run +{drift['recent_rise_c']:.1f} °C vs a +{drift['baseline_rise_c']:.1f} °C "
-                    "baseline at the same current — inspect the handle and charge-port pins, and have the "
-                    "terminal torque checked.",
+                    f"baseline at the same current (Δ {drift['delta_c']:.1f} °C, 95% CI {ci_lo:.1f}..{ci_hi:.1f}, "
+                    f"{sureness}) — inspect the handle and charge-port pins, and have the terminal torque checked.",
                     drift,
                 )
         else:

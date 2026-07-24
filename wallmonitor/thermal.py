@@ -448,6 +448,33 @@ DRIFT_MIN_BASELINE_N = 3
 DRIFT_WARN_C = 2.5
 DRIFT_ALERT = "Handle heat rise increasing (check connector/wiring)"
 
+# Cross-current pooling: fits whose ambient was bracketed at both ends are
+# trustworthy enough under the I^2 normalization to join the comparison from
+# a wider current band; start-only fits must still match the typical current.
+DRIFT_POOL_BAND_FRAC = 0.25
+
+# The settings key holding the baseline anchor: a timestamp before which
+# fits are excluded from the drift comparison. Set it when the hardware has
+# been inspected and verified (or fixed) — from then on "baseline" means
+# "verified healthy", not "the first charges the monitor happened to see".
+BASELINE_ANCHOR_KEY = "thermal_baseline_anchor_ts"
+
+# Two-sided 95% Student-t multipliers by degrees of freedom, for the delta's
+# confidence interval. Small-sample medians are noisy; a plain 1.96 would
+# overstate the confidence exactly when the history is thinnest.
+_T95 = {1: 12.71, 2: 4.30, 3: 3.18, 4: 2.78, 5: 2.57, 6: 2.45, 7: 2.36, 8: 2.31, 9: 2.26, 10: 2.23}
+
+
+def _median_stats(values: list[float]) -> tuple[float, float, float]:
+    """(median, MAD, standard error of the median).
+
+    Spread comes from the median absolute deviation — robust to the odd wild
+    fit — scaled to a normal-equivalent sigma (1.4826) and to the median's
+    sampling efficiency (1.2533 / sqrt(n))."""
+    med = median(values)
+    mad = median(abs(value - med) for value in values)
+    return med, mad, 1.2533 * (1.4826 * mad) / math.sqrt(len(values))
+
 # Actionable warning: the live forecast puts the 65 C trip inside this
 # horizon, so the user still has time to lower the vehicle's charge current
 # and keep a sustained rate instead of eating the 50% foldback.
@@ -455,7 +482,7 @@ DERATE_WARN_MIN = 15.0
 DERATE_ALERT = "Derate predicted (lower vehicle charge current to avoid it)"
 
 
-def detect_drift(fits: list[dict]) -> dict | None:
+def detect_drift(fits: list[dict], anchor_ts: float | None = None) -> dict | None:
     """Compare the last few sessions' fitted rise against the baseline.
 
     Returns None while there is too little history to judge; otherwise a
@@ -468,42 +495,82 @@ def detect_drift(fits: list[dict]) -> dict | None:
     that normalization amplifies ordinary fit error — a session at 40 A with
     an unremarkable raw rise extrapolates to an alarming number at 48 A, and
     with only DRIFT_RECENT_N recent sessions a single such point can swing
-    the median past the threshold and manufacture a drift verdict.
+    the median past the threshold and manufacture a drift verdict. Fits with
+    bracketed ambient are cleaner, so they join from a wider current band —
+    that is what lets a baseline recorded at 48 A keep judging charges after
+    the vehicle is capped to 40 A, instead of the verdict going dark.
 
     "Typical" is the median current of the newest fits, not of all history:
     when the user caps the vehicle at a new current, the watch follows the
-    new operating point. Until enough same-current history accumulates on
-    both sides of the comparison it returns None — the honest "can't judge
-    yet" that clears a stale alert — rather than judging new charges against
-    a frozen verdict from a current the install no longer uses.
+    new operating point.
+
+    anchor_ts, when set, excludes fits from before it: the user has had the
+    hardware inspected and verified, so "baseline" means "verified healthy"
+    from that moment, not "the first charges the monitor happened to see".
+
+    The verdict carries its own uncertainty: MAD spread per side and a
+    Student-t ~95% confidence interval on the delta. "drifting" stays a
+    plain threshold tripwire; "confident" says whether the interval clears
+    zero — a Δ from a four-fit baseline is a lead, not a conviction, and the
+    UI should show the difference.
     """
     usable = [fit for fit in fits if fit["rise_ref_c"] is not None]
+    if anchor_ts is not None:
+        usable = [fit for fit in usable if fit["start_ts"] >= anchor_ts]
     if len(usable) < DRIFT_RECENT_N + DRIFT_MIN_BASELINE_N:
         return None
     usable.sort(key=lambda fit: fit["start_ts"])
     typical_a = median(fit["current_a"] for fit in usable[-DRIFT_RECENT_N:])
     band = max(2.0, 0.1 * typical_a)
-    comparable = [fit for fit in usable if abs(fit["current_a"] - typical_a) <= band]
+    pool_band = DRIFT_POOL_BAND_FRAC * typical_a
+    comparable = [
+        fit
+        for fit in usable
+        if abs(fit["current_a"] - typical_a) <= band
+        or (
+            fit.get("ambient_drift_c") is not None
+            and abs(fit["current_a"] - typical_a) <= pool_band
+        )
+    ]
     rises = [(fit["start_ts"], fit["rise_ref_c"]) for fit in comparable]
     rises.sort(key=lambda entry: entry[0])
     if len(rises) < DRIFT_RECENT_N + DRIFT_MIN_BASELINE_N:
         return None
     recent = [rise for _, rise in rises[-DRIFT_RECENT_N:]]
     baseline = [rise for _, rise in rises[:-DRIFT_RECENT_N]]
-    recent_med = median(recent)
-    baseline_med = median(baseline)
+    recent_med, recent_mad, recent_se = _median_stats(recent)
+    baseline_med, baseline_mad, baseline_se = _median_stats(baseline)
     delta = recent_med - baseline_med
+    delta_se = math.sqrt(recent_se**2 + baseline_se**2)
+    t_mult = _T95.get(len(recent) + len(baseline) - 2, 2.0)
+    ci_lo, ci_hi = delta - t_mult * delta_se, delta + t_mult * delta_se
+    cross_current = sum(1 for fit in comparable if abs(fit["current_a"] - typical_a) > band)
     return {
         "drifting": delta >= DRIFT_WARN_C,
+        "confident": ci_lo > 0.0,
         "recent_rise_c": round(recent_med, 2),
         "baseline_rise_c": round(baseline_med, 2),
         "delta_c": round(delta, 2),
+        "delta_ci95_c": [round(ci_lo, 2), round(ci_hi, 2)],
+        "recent_mad_c": round(recent_mad, 2),
+        "baseline_mad_c": round(baseline_mad, 2),
         "recent_n": len(recent),
         "baseline_n": len(baseline),
         "typical_current_a": round(typical_a, 1),
         "off_current_n": len(usable) - len(comparable),
+        "cross_current_n": cross_current,
+        "anchor_ts": anchor_ts,
         "threshold_c": DRIFT_WARN_C,
     }
+
+
+def baseline_anchor(db: Database) -> float | None:
+    """The verified-baseline anchor timestamp, or None when unset."""
+    raw = db.get_setting(BASELINE_ANCHOR_KEY)
+    try:
+        return float(raw) if raw is not None else None
+    except ValueError:
+        return None
 
 
 def _minutes_to_trip(t_now: float, t_inf: float, tau_min: float) -> float | None:

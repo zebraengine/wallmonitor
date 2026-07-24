@@ -1270,12 +1270,21 @@ async function viewAlerts(root, rangeKey = "7d") {
       unit: "°C", digits: 1, height: 180,
     });
     if (drift) {
+      // The verdict carries its own uncertainty — a delta from a handful of
+      // fits is a lead, not a conviction, and the note must show which.
+      const [ciLo, ciHi] = drift.delta_ci95_c || [null, null];
+      const sureness = ciLo == null ? "" :
+        ` · 95% CI ${fmtNum(ciLo, 1)}..${fmtNum(ciHi, 1)} °C from n=${drift.baseline_n}+${drift.recent_n}` +
+        (drift.confident ? "" : " — not yet statistically confirmed; more sessions will tighten this");
+      const pooled = drift.cross_current_n
+        ? ` (${drift.cross_current_n} ambient-bracketed fit${drift.cross_current_n > 1 ? "s" : ""} pooled from other charge currents)`
+        : "";
       rise.card.append(el("div", { class: "note" },
-        drift.drifting
+        (drift.drifting
           ? `Recent median +${fmtNum(drift.recent_rise_c, 1)} °C vs baseline +${fmtNum(drift.baseline_rise_c, 1)} °C ` +
-            `(Δ ${fmtNum(drift.delta_c, 1)} °C ≥ ${fmtNum(drift.threshold_c, 1)} °C threshold) — a monitor alert is active.`
+            `(Δ ${fmtNum(drift.delta_c, 1)} °C ≥ ${fmtNum(drift.threshold_c, 1)} °C threshold) — a monitor alert is active`
           : `Stable: recent median +${fmtNum(drift.recent_rise_c, 1)} °C vs baseline +${fmtNum(drift.baseline_rise_c, 1)} °C ` +
-            `(alert threshold Δ ≥ ${fmtNum(drift.threshold_c, 1)} °C).`));
+            `(alert threshold Δ ≥ ${fmtNum(drift.threshold_c, 1)} °C)`) + sureness + pooled + "."));
     }
     // Ambient bracketing: fits that read ambient at both ends of the load
     // window are de-trended for weather that moved during the charge — the
@@ -1290,6 +1299,29 @@ async function viewAlerts(root, rangeKey = "7d") {
         `their load window and are corrected for in-window ambient drift ` +
         `(largest ${maxDrift > 0 ? "+" : ""}${fmtNum(maxDrift, 1)} °C); the rest assume it held still.`));
     }
+    // Verified-baseline anchor: without one, "baseline" only means "the
+    // first charges the monitor happened to see". After a hardware
+    // inspection, anchoring here makes the comparison mean "vs verified
+    // healthy" — the claim the alert text is actually making.
+    const anchorTs = thermalData.baseline_anchor_ts;
+    const anchorRow = el("div", { class: "filters" },
+      el("span", { class: "flabel" }, "Baseline"),
+      el("span", { class: "note" }, anchorTs
+        ? `anchored at ${fmtDT(anchorTs)} — fits before it sit out the drift comparison. `
+        : "all recorded fits (hardware never verified). After an inspection, anchor here so the " +
+          "baseline means “verified healthy”. "));
+    const anchorBtn = el("button", { class: "chip", onclick: async () => {
+      const verb = anchorTs ? "Clear the verified-baseline anchor?" :
+        "Anchor the baseline now? Only fits recorded from this moment on will form the drift baseline. " +
+        "Do this right after the hardware has been inspected and verified (or fixed).";
+      if (!window.confirm(verb)) return;
+      await fetch("/api/thermal/baseline-anchor", { method: anchorTs ? "DELETE" : "POST",
+        headers: { "Content-Type": "application/json" },
+        body: anchorTs ? undefined : JSON.stringify({}) });
+      render("alerts", rangeKey);
+    } }, anchorTs ? "Clear anchor" : "Mark hardware verified — anchor baseline now");
+    anchorRow.append(anchorBtn);
+    rise.card.append(anchorRow);
   }
 
   root.append(el("h2", {}, "Alert history"));

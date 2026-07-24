@@ -160,14 +160,36 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
             thermal_fit["params"] = thermal.fit_history(db, now, fits=fits)
             thermal_fit["ts"] = now
         result = await asyncio.to_thread(thermal.predict, db, now, thermal_fit["params"])
+        anchor = await asyncio.to_thread(thermal.baseline_anchor, db)
         return web.json_response(
             {
                 "server_ts": now,
                 **result,
-                "drift": thermal.detect_drift(thermal_fit["fits"]),
+                "drift": thermal.detect_drift(thermal_fit["fits"], anchor_ts=anchor),
                 "session_fits": thermal_fit["fits"],
+                "baseline_anchor_ts": anchor,
             }
         )
+
+    async def api_baseline_anchor(request: web.Request) -> web.Response:
+        """Set (POST {"ts": ...}, default now) or clear (DELETE) the
+        verified-baseline anchor. Fits before the anchor stay on the chart
+        but leave the drift comparison: set it after the hardware has been
+        inspected and verified so the baseline means "verified healthy"."""
+        if request.method == "DELETE":
+            await asyncio.to_thread(db.delete_setting, thermal.BASELINE_ANCHOR_KEY)
+            await asyncio.to_thread(db.add_event, time.time(), "baseline_anchor_cleared", None)
+            return web.json_response({"baseline_anchor_ts": None})
+        try:
+            body = await request.json() if request.can_read_body else {}
+        except json.JSONDecodeError:
+            return web.json_response({"error": "invalid JSON"}, status=400)
+        ts = body.get("ts", time.time())
+        if not isinstance(ts, (int, float)):
+            return web.json_response({"error": "ts must be a number"}, status=400)
+        await asyncio.to_thread(db.set_setting, thermal.BASELINE_ANCHOR_KEY, repr(float(ts)))
+        await asyncio.to_thread(db.add_event, time.time(), "baseline_anchor_set", {"ts": float(ts)})
+        return web.json_response({"baseline_anchor_ts": float(ts)})
 
     async def api_stream(request: web.Request) -> web.StreamResponse:
         response = web.StreamResponse(
@@ -206,6 +228,8 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
     app.router.add_get("/api/sessions/{id}", api_session_detail)
     app.router.add_get("/api/alerts", api_alerts)
     app.router.add_get("/api/thermal", api_thermal)
+    app.router.add_post("/api/thermal/baseline-anchor", api_baseline_anchor)
+    app.router.add_delete("/api/thermal/baseline-anchor", api_baseline_anchor)
     app.router.add_get("/api/events", api_events)
     app.router.add_get("/api/stream", api_stream)
     return app
