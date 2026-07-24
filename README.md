@@ -81,9 +81,20 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
    raises a monitor alert and the Alerts page charts the fitted-rise trend.
    The watch compares only sessions near the install's *recent* operating
    current: cap the vehicle at a new amperage and the watch follows,
-   withdrawing its verdict (and clearing any active alert) until enough
-   same-current history accumulates, rather than judging forever against a
-   current the install no longer uses.
+   rather than judging forever against a current the install no longer
+   uses; ambient-bracketed fits are clean enough under the I² normalization
+   to pool in from a wider current band, so a baseline recorded at 48 A
+   keeps judging charges after a cap to 40 A instead of the verdict going
+   dark. The verdict also **carries its own uncertainty**: per-side spread
+   (MAD) and a small-sample Student-t ~95% confidence interval on the
+   delta, with a separate `confident` flag — the alert threshold is a
+   tripwire, and the UI and notifications distinguish "statistically
+   confirmed" from "a lead from a four-fit baseline". And because a
+   baseline is only as meaningful as the hardware behind it, a
+   **verified-baseline anchor** (button on the Alerts page, or
+   `POST /api/thermal/baseline-anchor`) excludes all fits recorded before a
+   hardware inspection: from then on the comparison means "vs verified
+   healthy", not "vs the first charges the monitor happened to see".
    During cool-down — after a current cut or a derate — the forecast reports
    the true lower equilibrium the handle is settling toward ("recovering",
    not "tripping"). When a mid-session current change resets the live

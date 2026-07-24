@@ -793,6 +793,89 @@ async def test_thermal_drift_ignores_off_current_sessions(db):
     assert drift["off_current_n"] == 1
 
 
+async def test_thermal_drift_confidence_interval(db):
+    # The verdict must carry its own uncertainty. A tight cluster on both
+    # sides of a big delta is a confirmed finding; the same delta built on a
+    # scattered baseline is a lead — drifting (tripwire) but not confident.
+    now = time.time()
+    for i, rise in enumerate([36.0, 36.5, 35.8, 36.2, 42.0, 41.5, 42.3]):
+        _seed_thermal_session(db, now - (7 - i) * 7200, ambient_c=25.0, rise_ref_c=rise)
+    drift = thermal.detect_drift(thermal.fit_sessions(db, now))
+    assert drift["drifting"] is True and drift["confident"] is True
+    ci_lo, ci_hi = drift["delta_ci95_c"]
+    assert ci_lo < drift["delta_c"] < ci_hi and ci_lo > 0
+    assert drift["baseline_mad_c"] < 1.0 and drift["recent_mad_c"] < 1.0
+
+
+async def test_thermal_drift_wide_scatter_is_not_confident(db):
+    now = time.time()
+    # Baseline scattered over 6 °C: the recent increase clears the tripwire
+    # but the interval straddles zero — the UI and notification must say
+    # "lead, not conviction" instead of presenting the delta as exact.
+    for i, rise in enumerate([30.0, 36.0, 31.0, 35.8, 36.2, 42.0, 36.6]):
+        _seed_thermal_session(db, now - (7 - i) * 7200, ambient_c=25.0, rise_ref_c=rise)
+    drift = thermal.detect_drift(thermal.fit_sessions(db, now))
+    assert drift is not None and drift["drifting"] is True
+    assert drift["confident"] is False
+    assert drift["delta_ci95_c"][0] < 0
+
+
+async def test_thermal_drift_pools_bracketed_cross_current_fits(db):
+    # The vehicle gets capped 48.6 -> 40.6 A. Same-current-only comparison
+    # would go dark (no 40 A baseline); ambient-bracketed fits are clean
+    # enough under the I^2 normalization to keep the 48 A baseline judging
+    # the new 40 A charges from the wider pooling band.
+    now = time.time()
+    for i, rise in enumerate([36.0, 36.5, 35.8, 36.2, 36.1, 36.4]):
+        _seed_thermal_session(db, now - (12 - i) * 7200, ambient_c=25.0, rise_ref_c=rise,
+                              cooldown_s=900.0, ambient_end_c=25.0)
+    for i, rise in enumerate([36.3, 36.0, 36.2]):
+        _seed_thermal_session(db, now - (3 - i) * 7200, ambient_c=25.0, rise_ref_c=rise,
+                              amps=40.6, cooldown_s=900.0, ambient_end_c=25.0)
+    fits = thermal.fit_sessions(db, now)
+    assert all(fit["ambient_drift_c"] is not None for fit in fits)
+    drift = thermal.detect_drift(fits)
+    assert drift is not None, "bracketed 48 A baseline must keep judging 40 A charges"
+    assert drift["drifting"] is False
+    assert abs(drift["typical_current_a"] - 40.6) < 0.1
+    assert drift["cross_current_n"] == 6  # the 48 A baseline, pooled in
+    # Un-bracketed off-current fits must still be excluded (the old rule).
+    # (Seeded clear of session 9's cool-down tail so neither ambient read is
+    # contaminated by interleaved samples.)
+    _seed_thermal_session(db, now - 1800, ambient_c=25.0, rise_ref_c=42.5, amps=32.0)
+    drift = thermal.detect_drift(thermal.fit_sessions(db, now))
+    assert drift is not None and drift["off_current_n"] >= 1
+
+
+async def test_thermal_baseline_anchor(db):
+    now = time.time()
+    rises = [36.0, 36.5, 35.8, 36.2, 42.0, 41.5, 42.3]
+    for i, rise in enumerate(rises):
+        _seed_thermal_session(db, now - (len(rises) - i) * 7200, ambient_c=25.0, rise_ref_c=rise)
+    fits = thermal.fit_sessions(db, now)
+    assert thermal.detect_drift(fits)["drifting"] is True
+    # Anchoring after the old baseline (hardware inspected, verified) leaves
+    # only the three newest fits: too thin to judge, verdict honestly None.
+    anchor = now - 4 * 7200
+    assert thermal.detect_drift(fits, anchor_ts=anchor) is None
+    # The API round-trip: set, read back through /api/thermal, clear.
+    app = make_app(db, EventBus(), None)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/api/thermal/baseline-anchor", json={"ts": anchor})
+        assert resp.status == 200 and (await resp.json())["baseline_anchor_ts"] == anchor
+        data = await (await client.get("/api/thermal?refit=1")).json()
+        assert data["baseline_anchor_ts"] == anchor
+        assert data["drift"] is None
+        resp = await client.delete("/api/thermal/baseline-anchor")
+        assert resp.status == 200 and (await resp.json())["baseline_anchor_ts"] is None
+        data = await (await client.get("/api/thermal?refit=1")).json()
+        assert data["baseline_anchor_ts"] is None
+        assert data["drift"]["drifting"] is True
+    events = db.events_range(now - 10, time.time() + 10)
+    kinds = [event["kind"] for event in events]
+    assert "baseline_anchor_set" in kinds and "baseline_anchor_cleared" in kinds
+
+
 async def test_thermal_drift_poller_alert(db):
     now = time.time()
     rises = [36.0, 36.5, 35.8, 36.2, 42.0, 41.5, 42.3]

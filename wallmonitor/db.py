@@ -121,6 +121,11 @@ CREATE TABLE IF NOT EXISTS events (
     detail TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 VITALS_COLUMNS = {
@@ -321,6 +326,22 @@ class Database:
                 (ts, ts, alert, source),
             )
             return cur.rowcount > 0
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self._lock:
+            self._execute(
+                "INSERT INTO settings(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+
+    def get_setting(self, key: str) -> str | None:
+        rows = self._rows("SELECT value FROM settings WHERE key = ?", (key,))
+        return rows[0]["value"] if rows else None
+
+    def delete_setting(self, key: str) -> None:
+        with self._lock:
+            self._execute("DELETE FROM settings WHERE key = ?", (key,))
 
     def active_alerts(self) -> list[dict]:
         with self._lock:
