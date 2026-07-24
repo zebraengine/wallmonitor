@@ -54,12 +54,22 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
    it idles in ordinary connected states until the car draws), so the fitter
    finds each segment's opening ramp wherever it occurs in the session and
    lets the quality gates decide what teaches the model — no configuration or
-   "monitoring mode" needed. Each fit reads ambient from the flat idle
-   stretch before its segment, or — when a segment starts on a still-warm
-   handle (stop/resume, a post-derate resume) — from the previous charge's
+   "monitoring mode" needed. The unit of thermal analysis is the **load
+   window** — the stretch where current actually flows — and ambient is a
+   **bracket, not a point**: read at the window's start from the flat idle
+   stretch before it (or, when a segment starts on a still-warm handle —
+   stop/resume, a post-derate resume — from the previous charge's
    **cool-down tail** extrapolated to its asymptote at the install's fitted
    τ, so exactly the hardest-working segments aren't the ones excluded from
-   degradation tracking. The Live page forecasts: during charging, whether
+   degradation tracking), and read again at the window's end from the
+   charge's own cool-down tail. When both ends read, the fit is de-trended
+   against the ambient ramp between them: a garage that warms 3 °C during an
+   afternoon charge (or cools overnight) is measured and removed instead of
+   masquerading as connector resistance — a single start-of-window ambient
+   silently assumes the weather held still for the whole charge, and a
+   baseline recorded in one season would otherwise bias every comparison
+   that follows. Fits that could only read one end fall back to the point
+   ambient and say so. The Live page forecasts: during charging, whether
    and when the current session will derate (from the handle's live
    trajectory); when idle, the estimated ambient and whether a full-rate
    charge started now would trip. When a derate is coming it also suggests
@@ -69,6 +79,11 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
    unchanged current means added resistance (loose lug, degrading contact),
    so when recent segments' fitted rise climbs past the baseline the poller
    raises a monitor alert and the Alerts page charts the fitted-rise trend.
+   The watch compares only sessions near the install's *recent* operating
+   current: cap the vehicle at a new amperage and the watch follows,
+   withdrawing its verdict (and clearing any active alert) until enough
+   same-current history accumulates, rather than judging forever against a
+   current the install no longer uses.
    During cool-down — after a current cut or a derate — the forecast reports
    the true lower equilibrium the handle is settling toward ("recovering",
    not "tripping"). When a mid-session current change resets the live
