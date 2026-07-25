@@ -296,6 +296,34 @@ Android needs no upstream at all. Off the home network, a VPN into your
 LAN (e.g. WireGuard on the router) keeps everything reachable without
 exposing anything.
 
+## Optional: garage ambient sensor
+
+The thermal model normally uses the charger as its own thermometer (idle
+handle ≈ ambient + 2 °C) — workable, but it rests on that offset assumption,
+goes blind while the handle is warm, and can't separate multi-day heat soak
+from real ambient. A cheap Wi-Fi sensor in the garage removes all three
+limits: wallmonitor accepts readings at **`POST /api/ambient`** and, whenever
+samples cover a window, prefers measured air temperature over every
+handle-derived estimate — in per-segment fits (`ambient_source: "measured"`),
+the live forecast, and the idle ambient tile. No configuration: the sensor
+can appear, disappear, or never exist, and every path falls back to the
+handle proxy.
+
+Two dialects are accepted:
+
+- **Ecowitt gateway (GW1100/GW1200)** — in the gateway's local web UI, set
+  *Customized Upload* to protocol "Ecowitt", server = the wallmonitor host,
+  port `8480`, path `/api/ambient`, interval 60 s. The gateway then POSTs
+  its readings (°F/inHg, converted on ingest; its `PASSKEY` is dropped, not
+  stored) over the LAN. Never configure the ecowitt.net upload and nothing
+  leaves your network.
+- **Plain JSON** — anything that can hit a URL:
+  `curl -X POST http://<host>:8480/api/ambient -H 'Content-Type: application/json' -d '{"temp_c": 31.1, "humidity_pct": 55}'`
+  (Shelly "Actions", Home Assistant automations, a cron job).
+
+`GET /api/ambient` returns recent samples and the latest reading. Humidity
+and barometric pressure are stored when provided.
+
 ## Tests
 
 ```bash

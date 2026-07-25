@@ -183,6 +183,28 @@ def _segments(rows: list[dict]) -> list[tuple[float, float]]:
     return segments
 
 
+# Measured ambient (an optional LAN sensor POSTing to /api/ambient) beats
+# every handle-derived estimate: the handle proxy carries the idle-offset
+# assumption and goes blind when the handle is warm, while a sensor reads
+# the garage air directly at any moment. All reads fall back to the proxy
+# when no samples cover the window, so the sensor can appear, disappear, or
+# never exist without configuration.
+MEASURED_AMBIENT_WINDOW_S = 900.0
+MEASURED_AMBIENT_FRESH_S = 600.0
+
+
+def _measured_ambient(db: Database, t_from: float, t_to: float) -> float | None:
+    temps = [row["temp_c"] for row in db.ambient_range(t_from, t_to, 500)]
+    return median(temps) if temps else None
+
+
+def _latest_measured_ambient(db: Database, now: float) -> float | None:
+    row = db.latest_ambient()
+    if row is None or now - row["ts"] > MEASURED_AMBIENT_FRESH_S:
+        return None
+    return row["temp_c"]
+
+
 def _ambient_before(db: Database, start_ts: float) -> float | None:
     """Ambient estimate from the idle handle temperature before a session."""
     rows = db.vitals_range(start_ts - 2400, start_ts - 30, 5000)
@@ -357,8 +379,11 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
                 continue
             i_med = median(sample["vehicle_current_a"] for sample in prefix)
             tau_est = median([tau_s / 60.0] + [fit["tau_min"] for fit in fits])
-            ambient = _ambient_before(db, seg_start)
-            ambient_source = "pre_idle" if ambient is not None else None
+            ambient = _measured_ambient(db, seg_start - MEASURED_AMBIENT_WINDOW_S, seg_start + 60)
+            ambient_source = "measured" if ambient is not None else None
+            if ambient is None:
+                ambient = _ambient_before(db, seg_start)
+                ambient_source = "pre_idle" if ambient is not None else None
             if ambient is None:
                 # Hot-handle start (stop/resume, post-derate): read ambient
                 # from the previous charge's cool-down tail instead, using
@@ -369,7 +394,9 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
                     ambient_source = "cooldown_tail"
             ambient_end = None
             if ambient is not None and seg_end - seg_start > 0:
-                ambient_end = _ambient_after(db, seg_end, tau_est)
+                ambient_end = _measured_ambient(db, seg_end - 60, seg_end + MEASURED_AMBIENT_WINDOW_S)
+                if ambient_end is None:
+                    ambient_end = _ambient_after(db, seg_end, tau_est)
             if ambient_end is not None:
                 # Bracketed: de-trend the samples against the linear ambient
                 # ramp across the load window and refit. With ambient
@@ -709,13 +736,17 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
             forecast["basis"] = "trajectory"
         else:
             # Too early at this current for a slope: model from ambient and
-            # the present current scaled by I^2. Ambient comes from the idle
-            # stretch before the session, or — when sessions run back-to-back
-            # and there was none — from the newest steady run in the buffer.
-            sid = last.get("session_id")
-            sess = db.session(int(sid)) if sid else None
-            ambient = _ambient_before(db, sess["start_ts"]) if sess else None
-            source = "pre_session"
+            # the present current scaled by I^2. Ambient comes from the LAN
+            # sensor when one is reporting, else the idle stretch before the
+            # session, or — when sessions run back-to-back and there was
+            # none — from the newest steady run in the buffer.
+            ambient = _latest_measured_ambient(db, now)
+            source = "measured"
+            if ambient is None:
+                sid = last.get("session_id")
+                sess = db.session(int(sid)) if sid else None
+                ambient = _ambient_before(db, sess["start_ts"]) if sess else None
+                source = "pre_session"
             if ambient is None:
                 ambient = _recent_steady_ambient(recent, params)
                 source = "recent_trajectory"
@@ -753,8 +784,17 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
         out["state"] = "idle"
         temps = [row["handle_temp_c"] for row in recent if last["ts"] - row["ts"] <= 900]
         stable = len(temps) >= 3 and max(temps) - min(temps) <= 1.5
-        ambient = last["handle_temp_c"] - IDLE_OFFSET_C
+        measured = _latest_measured_ambient(db, now)
+        if measured is not None:
+            # A reporting LAN sensor reads the garage air directly — no idle
+            # offset assumption, and valid even while the handle is still
+            # cooling from a recent charge (when the proxy reads high).
+            ambient = measured
+            stable = True
+        else:
+            ambient = last["handle_temp_c"] - IDLE_OFFSET_C
         out["ambient_c"] = round(ambient, 1)
+        out["ambient_source"] = "measured" if measured is not None else "idle_handle"
         out["ambient_stable"] = stable
         # Hypothetical: a full-rate session started right now.
         t_inf = ambient + params.rise_ref_c

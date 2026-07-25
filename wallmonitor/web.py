@@ -171,6 +171,58 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
             }
         )
 
+    def _num(fields: dict, *keys: str) -> float | None:
+        for key in keys:
+            value = fields.get(key)
+            if value is None or value == "":
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    async def api_ambient_ingest(request: web.Request) -> web.Response:
+        """Receive a garage ambient reading from a LAN sensor.
+
+        Speaks two dialects: the Ecowitt gateway "customized upload"
+        (form-encoded, Fahrenheit/inHg fields — point the gateway's custom
+        server at this path) and plain JSON ({"temp_c": ..} with optional
+        humidity_pct/pressure_hpa) for anything else on the network (Shelly
+        action URLs, a curl in a cron job). Metric wins when both appear."""
+        if request.content_type == "application/json":
+            try:
+                fields = dict(await request.json())
+            except json.JSONDecodeError:
+                return web.json_response({"error": "invalid JSON"}, status=400)
+        else:
+            fields = dict(await request.post())
+        fields.pop("PASSKEY", None)  # gateway auth token; not ours to keep
+        temp_c = _num(fields, "temp_c")
+        if temp_c is None:
+            # Ecowitt: tempinf is the gateway's own (indoor) sensor — the one
+            # in the garage; tempf/temp1f are add-on RF channels.
+            temp_f = _num(fields, "tempinf", "tempf", "temp1f")
+            temp_c = (temp_f - 32.0) * 5.0 / 9.0 if temp_f is not None else None
+        if temp_c is None or not (-40.0 <= temp_c <= 85.0):
+            return web.json_response({"error": "no usable temperature"}, status=400)
+        humidity = _num(fields, "humidity_pct", "humidityin", "humidity", "humidity1")
+        pressure = _num(fields, "pressure_hpa")
+        if pressure is None:
+            inhg = _num(fields, "baromrelin", "baromabsin")
+            pressure = inhg * 33.8639 if inhg is not None else None
+        now = time.time()
+        await asyncio.to_thread(db.insert_ambient, now, temp_c, humidity, pressure, fields)
+        return web.json_response({"ok": True, "ts": now, "temp_c": round(temp_c, 2)})
+
+    async def api_ambient_history(request: web.Request) -> web.Response:
+        now = time.time()
+        t_from = _float_q(request, "from", now - 24 * 3600)
+        t_to = _float_q(request, "to", now)
+        rows = await asyncio.to_thread(db.ambient_range, t_from, t_to)
+        latest = await asyncio.to_thread(db.latest_ambient)
+        return web.json_response({"samples": rows, "latest": latest})
+
     async def api_baseline_anchor(request: web.Request) -> web.Response:
         """Set (POST {"ts": ...}, default now) or clear (DELETE) the
         verified-baseline anchor. Fits before the anchor stay on the chart
@@ -230,6 +282,8 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
     app.router.add_get("/api/thermal", api_thermal)
     app.router.add_post("/api/thermal/baseline-anchor", api_baseline_anchor)
     app.router.add_delete("/api/thermal/baseline-anchor", api_baseline_anchor)
+    app.router.add_post("/api/ambient", api_ambient_ingest)
+    app.router.add_get("/api/ambient", api_ambient_history)
     app.router.add_get("/api/events", api_events)
     app.router.add_get("/api/stream", api_stream)
     return app

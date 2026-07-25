@@ -793,6 +793,78 @@ async def test_thermal_drift_ignores_off_current_sessions(db):
     assert drift["off_current_n"] == 1
 
 
+async def test_ambient_ingest_ecowitt_and_json(db):
+    app = make_app(db, EventBus(), None)
+    async with TestClient(TestServer(app)) as client:
+        # Ecowitt "customized upload": form-encoded, Fahrenheit / inHg.
+        resp = await client.post("/api/ambient", data={
+            "PASSKEY": "SECRET", "stationtype": "GW1200B_V1.0.0",
+            "tempinf": "77.9", "humidityin": "27", "baromrelin": "29.86",
+        })
+        assert resp.status == 200
+        body = await resp.json()
+        assert abs(body["temp_c"] - 25.5) < 0.1
+        latest = db.latest_ambient()
+        assert abs(latest["temp_c"] - 25.5) < 0.1
+        assert abs(latest["humidity_pct"] - 27.0) < 0.1
+        assert abs(latest["pressure_hpa"] - 1011.2) < 1.0
+        # The gateway's auth token must not be persisted.
+        raw = db._rows("SELECT raw FROM ambient_samples ORDER BY id DESC LIMIT 1")[0]["raw"]
+        assert "SECRET" not in raw
+        # Generic JSON (Shelly action, curl, anything on the LAN).
+        resp = await client.post("/api/ambient", json={"temp_c": 31.1, "humidity_pct": 55})
+        assert resp.status == 200
+        assert abs(db.latest_ambient()["temp_c"] - 31.1) < 0.01
+        # No usable temperature -> rejected, nothing stored.
+        resp = await client.post("/api/ambient", data={"humidityin": "40"})
+        assert resp.status == 400
+        # History endpoint returns both samples.
+        data = await (await client.get("/api/ambient")).json()
+        assert len(data["samples"]) == 2 and data["latest"]["temp_c"] == 31.1
+
+
+def _seed_ambient(db, t_from, t_to, temp_of, dt=60.0):
+    ts = t_from
+    while ts <= t_to:
+        db.insert_ambient(ts, round(temp_of(ts), 2))
+        ts += dt
+
+
+async def test_thermal_fit_prefers_measured_ambient(db):
+    # A LAN sensor reporting the garage air beats every handle-derived
+    # estimate: the fit brackets from measured samples (source "measured")
+    # and recovers the true rise even with ambient drifting mid-charge.
+    now = time.time()
+    start, charge_s = now - 2 * 7200, 1800.0
+    _seed_thermal_session(db, start, ambient_c=30.0, ambient_end_c=33.0, charge_s=charge_s)
+    ramp = lambda ts: 30.0 + 3.0 * min(1.0, max(0.0, (ts - start) / charge_s))
+    _seed_ambient(db, start - 1200, start + charge_s + 600, ramp)
+    fits = thermal.fit_sessions(db, now)
+    assert len(fits) == 1
+    fit = fits[0]
+    assert fit["ambient_source"] == "measured"
+    assert fit["ambient_drift_c"] is not None and 2.0 < fit["ambient_drift_c"] < 4.0
+    assert abs(fit["rise_ref_c"] - 36.0) < 1.5
+
+
+async def test_thermal_predict_idle_prefers_measured_ambient(db):
+    now = time.time()
+    # Handle still warm from a recent charge (proxy would read 35 C); the
+    # sensor says the garage is actually 30 C.
+    _seed_idle(db, now - 600, now, 35.0)
+    db.insert_ambient(now - 60, 30.0)
+    out = thermal.predict(db, now, thermal.ThermalParams())
+    assert out["state"] == "idle"
+    assert out["ambient_source"] == "measured"
+    assert abs(out["ambient_c"] - 30.0) < 0.01
+    # A stale sensor (silent > freshness window) falls back to the proxy.
+    db2_ambient_ts = now - 3600
+    db._execute("UPDATE ambient_samples SET ts = ?", (db2_ambient_ts,))
+    out = thermal.predict(db, now, thermal.ThermalParams())
+    assert out["ambient_source"] == "idle_handle"
+    assert abs(out["ambient_c"] - 35.0) < 0.1
+
+
 async def test_thermal_drift_confidence_interval(db):
     # The verdict must carry its own uncertainty. A tight cluster on both
     # sides of a big delta is a confirmed finding; the same delta built on a
