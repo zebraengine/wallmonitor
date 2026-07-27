@@ -165,6 +165,7 @@ tr.clickable:hover td { background: color-mix(in srgb, var(--text-primary) 4%, t
 .tooltip .tt-row .swatch { width: 12px; height: 2px; border-radius: 1px; flex: none; }
 .tooltip .tt-row .tt-val { font-weight: 650; font-variant-numeric: tabular-nums; margin-left: auto; }
 .tooltip .tt-row .tt-name { color: var(--text-secondary); }
+.tooltip .tt-note { margin-top: 5px; color: var(--text-secondary); max-width: 220px; line-height: 1.35; font-size: 12px; }
 
 .grid-2 { display: grid; gap: 14px; grid-template-columns: 1fr 1fr; }
 .grid-3 { display: grid; gap: 14px; grid-template-columns: 1fr 1fr 1fr; }
