@@ -337,6 +337,34 @@ automatically, and the car demotes to backup with no reconfiguration.
 `GET /api/ambient` returns recent samples and the latest reading. Humidity
 and barometric pressure are stored when provided.
 
+### Bridging a TeslaMate vehicle
+
+If [TeslaMate](https://github.com/teslamate-org/teslamate) runs on the same
+host, the vehicle parked in your garage is already a logged thermometer:
+TeslaMate records the car's outside-temperature sensor every few minutes
+while it is awake. `contrib/teslamate_ambient_bridge.py` (stdlib-only)
+reads the newest value straight from TeslaMate's Postgres via `docker
+exec` — nothing about the TeslaMate stack changes — and POSTs it to
+`/api/ambient` as `source: "car"`.
+
+```bash
+sudo ./deploy/install-teslamate-bridge.sh --car-id 1 --geofence Home
+# or, with no TeslaMate geofence configured (coordinates stay in the local
+# systemd unit — never commit them):
+sudo ./deploy/install-teslamate-bridge.sh --car-id 1 --home-lat 39.2 --home-lon -77.3
+# or zero-config: only posts while a vehicle is plugged into the charger
+sudo ./deploy/install-teslamate-bridge.sh --car-id 1
+```
+
+The bridge's job is mostly to stay silent. It posts nothing while the car
+is away from home, asleep (readings go stale), driving, or within 45
+minutes of a drive ending (the sensor housing heat-soaks on the road and
+reads high for a while). Silence is safe by design: wallmonitor's
+freshness window expires and every consumer falls back to the handle
+proxy — and once a stationary sensor reports, its samples outrank the
+car's anyway. `journalctl -u teslamate-ambient-bridge` shows each run's
+decision and reason.
+
 ## Tests
 
 ```bash
