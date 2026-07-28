@@ -808,6 +808,7 @@ async def test_ambient_ingest_ecowitt_and_json(db):
         assert abs(latest["temp_c"] - 25.5) < 0.1
         assert abs(latest["humidity_pct"] - 27.0) < 0.1
         assert abs(latest["pressure_hpa"] - 1011.2) < 1.0
+        assert latest["source"] == "ecowitt"
         # The gateway's auth token must not be persisted.
         raw = db._rows("SELECT raw FROM ambient_samples ORDER BY id DESC LIMIT 1")[0]["raw"]
         assert "SECRET" not in raw
@@ -815,18 +816,24 @@ async def test_ambient_ingest_ecowitt_and_json(db):
         resp = await client.post("/api/ambient", json={"temp_c": 31.1, "humidity_pct": 55})
         assert resp.status == 200
         assert abs(db.latest_ambient()["temp_c"] - 31.1) < 0.01
+        assert db.latest_ambient()["source"] == "json"
         # No usable temperature -> rejected, nothing stored.
         resp = await client.post("/api/ambient", data={"humidityin": "40"})
         assert resp.status == 400
         # History endpoint returns both samples.
         data = await (await client.get("/api/ambient")).json()
         assert len(data["samples"]) == 2 and data["latest"]["temp_c"] == 31.1
+        # A JSON caller may name its source; "car" (normalized) marks a
+        # mobile sensor the thermal model treats as second-tier.
+        resp = await client.post("/api/ambient", json={"temp_c": 29.4, "source": "Car"})
+        assert resp.status == 200 and (await resp.json())["source"] == "car"
+        assert db.latest_ambient()["source"] == "car"
 
 
-def _seed_ambient(db, t_from, t_to, temp_of, dt=60.0):
+def _seed_ambient(db, t_from, t_to, temp_of, dt=60.0, source=None):
     ts = t_from
     while ts <= t_to:
-        db.insert_ambient(ts, round(temp_of(ts), 2))
+        db.insert_ambient(ts, round(temp_of(ts), 2), source=source)
         ts += dt
 
 
@@ -863,6 +870,44 @@ async def test_thermal_predict_idle_prefers_measured_ambient(db):
     out = thermal.predict(db, now, thermal.ThermalParams())
     assert out["ambient_source"] == "idle_handle"
     assert abs(out["ambient_c"] - 35.0) < 0.1
+
+
+async def test_thermal_car_ambient_yields_to_stationary_sensor(db):
+    # A parked vehicle's sensor is a real garage thermometer, but it drives
+    # away and reads high after drives — so it fills in only when nothing
+    # stationary reports, and a stationary sample wins even when the car's
+    # is newer.
+    now = time.time()
+    _seed_idle(db, now - 600, now, 35.0)  # proxy alone would say 35 C
+    db.insert_ambient(now - 90, 30.0, source="car")
+    out = thermal.predict(db, now, thermal.ThermalParams())
+    assert out["ambient_source"] == "measured_car"
+    assert abs(out["ambient_c"] - 30.0) < 0.01
+    db.insert_ambient(now - 300, 28.0, source="ecowitt")
+    out = thermal.predict(db, now, thermal.ThermalParams())
+    assert out["ambient_source"] == "measured"
+    assert abs(out["ambient_c"] - 28.0) < 0.01
+    # The window-median reader applies the same precedence: interleaved car
+    # samples don't pollute a stationary sensor's median.
+    base = now - 7200
+    for i in range(5):
+        db.insert_ambient(base + i * 60, 31.0 + i * 0.1, source="car")
+        db.insert_ambient(base + i * 60 + 30, 26.0, source="ecowitt")
+    val, tag = thermal._measured_ambient(db, base - 60, base + 400)
+    assert tag == "measured" and abs(val - 26.0) < 0.01
+
+
+async def test_thermal_fit_car_ambient_tagged(db):
+    # With only the car reporting, its samples still beat the handle proxy
+    # for the fit bracket — and the fit says the read came from the car.
+    now = time.time()
+    start, charge_s = now - 2 * 7200, 1800.0
+    _seed_thermal_session(db, start, ambient_c=30.0, charge_s=charge_s)
+    _seed_ambient(db, start - 1200, start + charge_s + 600, lambda _ts: 30.0, source="car")
+    fits = thermal.fit_sessions(db, now)
+    assert len(fits) == 1
+    assert fits[0]["ambient_source"] == "measured_car"
+    assert abs(fits[0]["rise_ref_c"] - 36.0) < 1.5
 
 
 async def test_thermal_drift_confidence_interval(db):

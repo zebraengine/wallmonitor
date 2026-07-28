@@ -321,6 +321,19 @@ Two dialects are accepted:
   `curl -X POST http://<host>:8480/api/ambient -H 'Content-Type: application/json' -d '{"temp_c": 31.1, "humidity_pct": 55}'`
   (Shelly "Actions", Home Assistant automations, a cron job).
 
+Every sample is tagged with its origin (`ecowitt` for the gateway dialect;
+JSON callers may pass `"source": "..."`, default `json`). One tag changes
+behavior: **`"car"`** marks a mobile sensor — an EV parked in the garage
+reporting its own ambient reading (e.g. bridged from TeslaMate). A car is a
+real garage thermometer most of the night, but it drives away and its sensor
+reads high for a while after a drive, so car samples rank between the
+stationary sensor and the handle proxy: they are used only when no
+stationary sample covers the window, and the UI labels them distinctly
+(`ambient_source: "measured_car"`, "car sensor"). A stationary sample wins
+even when a car sample is newer. This means you can feed a vehicle bridge
+today and add a dedicated sensor later — the sensor takes precedence
+automatically, and the car demotes to backup with no reconfiguration.
+
 `GET /api/ambient` returns recent samples and the latest reading. Humidity
 and barometric pressure are stored when provided.
 

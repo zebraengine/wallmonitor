@@ -189,14 +189,20 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
         (form-encoded, Fahrenheit/inHg fields — point the gateway's custom
         server at this path) and plain JSON ({"temp_c": ..} with optional
         humidity_pct/pressure_hpa) for anything else on the network (Shelly
-        action URLs, a curl in a cron job). Metric wins when both appear."""
+        action URLs, a curl in a cron job). Metric wins when both appear.
+
+        JSON may also carry "source" naming the reporter. "car" is special:
+        it marks a mobile sensor (a vehicle parked in the garage), which the
+        thermal model uses only when no stationary sensor is reporting."""
         if request.content_type == "application/json":
             try:
                 fields = dict(await request.json())
             except json.JSONDecodeError:
                 return web.json_response({"error": "invalid JSON"}, status=400)
+            source = str(fields.pop("source", "") or "").strip().lower()[:32] or "json"
         else:
             fields = dict(await request.post())
+            source = "ecowitt"
         fields.pop("PASSKEY", None)  # gateway auth token; not ours to keep
         temp_c = _num(fields, "temp_c")
         if temp_c is None:
@@ -212,8 +218,10 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
             inhg = _num(fields, "baromrelin", "baromabsin")
             pressure = inhg * 33.8639 if inhg is not None else None
         now = time.time()
-        await asyncio.to_thread(db.insert_ambient, now, temp_c, humidity, pressure, fields)
-        return web.json_response({"ok": True, "ts": now, "temp_c": round(temp_c, 2)})
+        await asyncio.to_thread(db.insert_ambient, now, temp_c, humidity, pressure, fields, source)
+        return web.json_response(
+            {"ok": True, "ts": now, "temp_c": round(temp_c, 2), "source": source}
+        )
 
     async def api_ambient_history(request: web.Request) -> web.Response:
         now = time.time()

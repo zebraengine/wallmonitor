@@ -883,7 +883,9 @@ async function viewLive(root) {
     } else if (data.state === "idle" && forecast) {
       const amb = `${fmtNum(data.ambient_c, 1)} °C (${fmtNum(cToF(data.ambient_c), 0)} °F)`;
       const ambLabel = data.ambient_source === "measured"
-        ? "Garage ambient (sensor)" : "Ambient at the charger ≈";
+        ? "Garage ambient (sensor)"
+        : data.ambient_source === "measured_car"
+          ? "Garage ambient (car sensor)" : "Ambient at the charger ≈";
       if (forecast.will_trip) {
         chip = chipFor("warning", "hot enough to derate");
         lines.push(`${ambLabel} ${amb}. A full-rate (${fmtNum(model.ref_current_a, 0)} A) charge started now ` +
@@ -1466,9 +1468,11 @@ async function viewAlerts(root, rangeKey = "7d") {
         nodes.push(ttRow("heat rise", `+${fmtNum(fit.rise_ref_c, 1)} °C @ 48 A`));
         nodes.push(ttRow("window ambient", `${fmtNum(fit.window_ambient, 1)} °C (${fmtNum(cToF(fit.window_ambient), 0)} °F)`));
         nodes.push(ttRow("charge current", `${fmtNum(fit.current_a, 1)} A`));
+        const srcNames = { measured: "garage sensor", measured_car: "car sensor",
+          cooldown_tail: "cool-down tail", pre_idle: "pre-charge idle" };
         nodes.push(ttRow("ambient read", fit.ambient_drift_c != null
           ? `both ends (drifted ${fit.ambient_drift_c > 0 ? "+" : ""}${fmtNum(fit.ambient_drift_c, 1)} °C, corrected)`
-          : `${fit.ambient_source === "cooldown_tail" ? "cool-down tail" : "pre-charge idle"} only`));
+          : `${srcNames[fit.ambient_source] || "pre-charge idle"} only`));
         // What the number means: this charge made the handle settle this far
         // above the garage air (scaled to 48 A) — compared against what this
         // install typically does. Position on the x-axis is context, not
