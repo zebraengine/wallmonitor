@@ -126,6 +126,17 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS ambient_samples (
+    id INTEGER PRIMARY KEY,
+    ts REAL NOT NULL,
+    temp_c REAL NOT NULL,
+    humidity_pct REAL,
+    pressure_hpa REAL,
+    source TEXT,
+    raw TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ambient_ts ON ambient_samples(ts);
 """
 
 VITALS_COLUMNS = {
@@ -326,6 +337,31 @@ class Database:
                 (ts, ts, alert, source),
             )
             return cur.rowcount > 0
+
+    def insert_ambient(self, ts: float, temp_c: float, humidity_pct: float | None = None,
+                       pressure_hpa: float | None = None, raw: dict | None = None,
+                       source: str | None = None) -> int:
+        with self._lock:
+            cur = self._execute(
+                "INSERT INTO ambient_samples (ts, temp_c, humidity_pct, pressure_hpa, raw, source) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (ts, temp_c, humidity_pct, pressure_hpa, json.dumps(raw) if raw else None, source),
+            )
+            return cur.lastrowid
+
+    def ambient_range(self, t_from: float, t_to: float, limit: int = 5000) -> list[dict]:
+        return self._rows(
+            "SELECT ts, temp_c, humidity_pct, pressure_hpa, source FROM ambient_samples "
+            "WHERE ts >= ? AND ts <= ? ORDER BY ts LIMIT ?",
+            (t_from, t_to, limit),
+        )
+
+    def latest_ambient(self) -> dict | None:
+        rows = self._rows(
+            "SELECT ts, temp_c, humidity_pct, pressure_hpa, source FROM ambient_samples "
+            "ORDER BY ts DESC LIMIT 1"
+        )
+        return rows[0] if rows else None
 
     def set_setting(self, key: str, value: str) -> None:
         with self._lock:
