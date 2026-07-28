@@ -268,18 +268,57 @@ function scatterChart(box, opts) {
     root.append(label);
   }
   root.append(svg("line", { x1: margin.left, x2: width - margin.right, y1: margin.top + ph, y2: margin.top + ph, stroke: "var(--baseline)", "stroke-width": 1 }));
+  const dotInfo = [];
   for (const dataset of series) {
     for (const point of dataset.points) {
-      const dot = svg("circle", { cx: xOf(point[0]).toFixed(1), cy: yOf(point[1]).toFixed(1), r: 4.5, fill: dataset.color, "fill-opacity": 0.85 });
-      if (point[2]) {
-        const title = svg("title", {});
-        title.textContent = point[2];
-        dot.append(title);
-      }
+      const cx = xOf(point[0]), cy = yOf(point[1]);
+      const dot = svg("circle", { cx: cx.toFixed(1), cy: cy.toFixed(1), r: 4.5, fill: dataset.color, "fill-opacity": 0.85 });
       root.append(dot);
+      dotInfo.push({ cx, cy, dot, dataset, point });
     }
   }
   box.append(root);
+
+  // Instant styled tooltip on the nearest dot (the SVG-native <title> is
+  // slow to appear and can't explain what a reading means). opts.tip(meta,
+  // dataset) supplies the content nodes; without it, x/y values are shown.
+  const tip = el("div", { class: "tooltip" });
+  box.append(tip);
+  const hit = svg("rect", { x: 0, y: 0, width, height, fill: "transparent" });
+  root.append(hit);
+  const resetDots = () => dotInfo.forEach((info) => { info.dot.setAttribute("r", 4.5); info.dot.setAttribute("fill-opacity", 0.85); });
+  function onMove(ev) {
+    const rect = root.getBoundingClientRect();
+    const px = ((ev.clientX - rect.left) / rect.width) * width;
+    const py = ((ev.clientY - rect.top) / rect.height) * height;
+    let best = null, bestDist = Infinity;
+    for (const info of dotInfo) {
+      const dist = Math.hypot(info.cx - px, info.cy - py);
+      if (dist < bestDist) { bestDist = dist; best = info; }
+    }
+    if (!best || bestDist > 28) {
+      tip.style.display = "none";
+      resetDots();
+      return;
+    }
+    resetDots();
+    best.dot.setAttribute("r", 6.5);
+    best.dot.setAttribute("fill-opacity", 1);
+    tip.textContent = "";
+    const nodes = opts.tip
+      ? opts.tip(best.point[2], best.dataset)
+      : [el("div", { class: "tt-row" }, el("span", { class: "tt-val" }, `${fmtNum(best.point[0], 1)}, ${fmtNum(best.point[1], 1)}`))];
+    for (const node of nodes) tip.append(node);
+    tip.style.display = "block";
+    const boxWidth = box.clientWidth, boxHeight = box.clientHeight;
+    const leftPx = (best.cx / width) * boxWidth;
+    const topPx = (best.cy / height) * boxHeight;
+    tip.style.left = `${Math.min(boxWidth - 240, Math.max(0, leftPx + 14))}px`;
+    tip.style.top = `${Math.max(4, Math.min(boxHeight - 120, topPx - 30))}px`;
+  }
+  hit.addEventListener("pointermove", onMove);
+  hit.addEventListener("pointerleave", () => { tip.style.display = "none"; resetDots(); });
+
   if (series.length > 1) {
     const legend = el("div", { class: "note" });
     for (const dataset of series) {
@@ -1405,9 +1444,13 @@ async function viewAlerts(root, rangeKey = "7d") {
     root.append(scatter.card);
     const fitPoint = (fit) => {
       const ambient = fit.ambient_end_c != null ? (fit.ambient_c + fit.ambient_end_c) / 2 : fit.ambient_c;
-      return [ambient, fit.rise_ref_c,
-        `session ${fit.session_id} · ${fmtDT(fit.start_ts)} · ${fmtNum(fit.current_a, 1)} A · ` +
-        `rise ${fmtNum(fit.rise_ref_c, 1)} °C @ ambient ${fmtNum(ambient, 1)} °C`];
+      return [ambient, fit.rise_ref_c, { ...fit, window_ambient: ambient }];
+    };
+    const typicalRise = thermalData.model.rise_ref_c;
+    const ttRow = (name, value) => {
+      const row = el("div", { class: "tt-row" });
+      row.append(el("span", { class: "tt-name" }, name), el("span", { class: "tt-val" }, value));
+      return row;
     };
     scatterChart(scatter.box, {
       xLabel: "window ambient, °C",
@@ -1418,6 +1461,28 @@ async function viewAlerts(root, rangeKey = "7d") {
           points: fits.filter((fit) => fit.ambient_drift_c == null && fit.ambient_c != null).map(fitPoint) },
       ],
       height: 210,
+      tip: (fit) => {
+        const nodes = [el("div", { class: "tt-time" }, `Session ${fit.session_id} · ${fmtDT(fit.start_ts)}`)];
+        nodes.push(ttRow("heat rise", `+${fmtNum(fit.rise_ref_c, 1)} °C @ 48 A`));
+        nodes.push(ttRow("window ambient", `${fmtNum(fit.window_ambient, 1)} °C (${fmtNum(cToF(fit.window_ambient), 0)} °F)`));
+        nodes.push(ttRow("charge current", `${fmtNum(fit.current_a, 1)} A`));
+        nodes.push(ttRow("ambient read", fit.ambient_drift_c != null
+          ? `both ends (drifted ${fit.ambient_drift_c > 0 ? "+" : ""}${fmtNum(fit.ambient_drift_c, 1)} °C, corrected)`
+          : `${fit.ambient_source === "cooldown_tail" ? "cool-down tail" : "pre-charge idle"} only`));
+        // What the number means: this charge made the handle settle this far
+        // above the garage air (scaled to 48 A) — compared against what this
+        // install typically does. Position on the x-axis is context, not
+        // cause: ambient is already subtracted, so a healthy install reads
+        // about the same rise at any garage temperature.
+        const delta = fit.rise_ref_c - typicalRise;
+        nodes.push(el("div", { class: "tt-note" },
+          Math.abs(delta) < 1.5
+            ? `In line with this install's typical +${fmtNum(typicalRise, 0)} °C rise — the connector made a normal amount of heat for this current.`
+            : delta > 0
+              ? `Ran ${fmtNum(delta, 1)} °C hotter than this install's typical +${fmtNum(typicalRise, 0)} °C — extra heat at the connector beyond what garage temperature explains.`
+              : `Ran ${fmtNum(-delta, 1)} °C cooler than this install's typical +${fmtNum(typicalRise, 0)} °C rise.`));
+        return nodes;
+      },
     });
   }
 
