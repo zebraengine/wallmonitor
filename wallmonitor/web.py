@@ -235,10 +235,17 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
         """Set (POST {"ts": ...}, default now) or clear (DELETE) the
         verified-baseline anchor. Fits before the anchor stay on the chart
         but leave the drift comparison: set it after the hardware has been
-        inspected and verified so the baseline means "verified healthy"."""
+        inspected and verified so the baseline means "verified healthy".
+
+        Either change re-evaluates the drift verdict right away — the alert
+        otherwise only updates when a session ends, which can latch a
+        no-longer-justified alert for as long as the vehicle stays plugged
+        in (or hide a re-justified one after the anchor is cleared)."""
         if request.method == "DELETE":
             await asyncio.to_thread(db.delete_setting, thermal.BASELINE_ANCHOR_KEY)
             await asyncio.to_thread(db.add_event, time.time(), "baseline_anchor_cleared", None)
+            if poller is not None:
+                await poller.recheck_thermal_drift(time.time())
             return web.json_response({"baseline_anchor_ts": None})
         try:
             body = await request.json() if request.can_read_body else {}
@@ -249,6 +256,8 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
             return web.json_response({"error": "ts must be a number"}, status=400)
         await asyncio.to_thread(db.set_setting, thermal.BASELINE_ANCHOR_KEY, repr(float(ts)))
         await asyncio.to_thread(db.add_event, time.time(), "baseline_anchor_set", {"ts": float(ts)})
+        if poller is not None:
+            await poller.recheck_thermal_drift(time.time())
         return web.json_response({"baseline_anchor_ts": float(ts)})
 
     async def api_stream(request: web.Request) -> web.StreamResponse:
