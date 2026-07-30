@@ -1002,11 +1002,41 @@ async def test_thermal_drift_poller_alert(db):
     bus = EventBus()
     async with aiohttp.ClientSession() as client:
         poller = Poller(cfg, db, bus, client)
-        await poller._check_thermal_drift(now)
+        await poller.recheck_thermal_drift(now)
     alerts = db.active_alerts()
     assert any(alert["alert"] == thermal.DRIFT_ALERT and alert["source"] == "monitor" for alert in alerts)
     events = db.events_range(now - 1, now + 1)
     assert any(event["kind"] == "thermal_drift" for event in events)
+
+
+async def test_baseline_anchor_reevaluates_drift_alert(db):
+    # Moving the anchor must re-judge the active alert immediately — not at
+    # the next session end, which can be a full plugged-in day away. Setting
+    # it right after an inspection clears the now-unjustified alert; clearing
+    # it restores the old baseline and the verdict (and alert) that come
+    # with it.
+    now = time.time()
+    rises = [36.0, 36.5, 35.8, 36.2, 42.0, 41.5, 42.3]
+    for i, rise in enumerate(rises):
+        _seed_thermal_session(db, now - (len(rises) - i) * 7200, ambient_c=25.0, rise_ref_c=rise)
+    bus = EventBus()
+    async with aiohttp.ClientSession() as session:
+        poller = Poller(Config(host="127.0.0.1:1"), db, bus, session)
+        await poller.recheck_thermal_drift(now)  # what a session close does
+        drift_active = lambda: any(
+            a["alert"] == thermal.DRIFT_ALERT for a in db.active_alerts())
+        assert drift_active()
+        app = make_app(db, bus, poller)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/thermal/baseline-anchor",
+                                     json={"ts": now - 4 * 7200})
+            assert resp.status == 200
+            assert not drift_active(), "anchor set must clear the stale alert at once"
+            resp = await client.delete("/api/thermal/baseline-anchor")
+            assert resp.status == 200
+            assert drift_active(), "anchor cleared must restore the old verdict at once"
+    kinds = [e["kind"] for e in db.events_range(now - 10, time.time() + 10)]
+    assert kinds.count("thermal_drift") == 2 and "thermal_drift_cleared" in kinds
 
 
 async def test_derate_forecast_warns_then_clears(db):
@@ -1134,7 +1164,7 @@ async def test_thermal_drift_alert_clears_when_history_too_thin(db):
     bus = EventBus()
     async with aiohttp.ClientSession() as client:
         poller = Poller(cfg, db, bus, client)
-        await poller._check_thermal_drift(now)
+        await poller.recheck_thermal_drift(now)
     assert not any(a["alert"] == thermal.DRIFT_ALERT for a in db.active_alerts())
     events = db.events_range(now - 1, now + 1)
     assert any(e["kind"] == "thermal_drift_cleared" for e in events)

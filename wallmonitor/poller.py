@@ -282,7 +282,7 @@ class Poller:
             reason = "vehicle_disconnected" if was_connected else "not_connected_on_startup"
             await asyncio.to_thread(self.db.close_session, sid, ts, reason)
             await self._event(ts, "session_end", {"session_id": sid, "reason": reason})
-            await self._check_thermal_drift(ts)
+            await self.recheck_thermal_drift(ts)
 
         # Contactor transitions (actual charging on/off)
         if prev is not None and bool(raw.get("contactor_closed")) != bool(prev.get("contactor_closed")):
@@ -368,11 +368,14 @@ class Poller:
         if latest is None or json.loads(latest["raw"]) != raw:
             await asyncio.to_thread(self.db.insert_version, ts, raw)
 
-    async def _check_thermal_drift(self, ts: float) -> None:
-        """After a session closes: refit history and raise/clear the
-        degradation alert. Drift only changes when a session completes, so
-        this is the one place it needs evaluating (and the one place the
-        cached forecast params need refreshing)."""
+    async def recheck_thermal_drift(self, ts: float) -> None:
+        """Refit history and raise/clear the degradation alert.
+
+        Drift changes in exactly two situations, and both call here: a
+        session completes (new fit lands), or the verified-baseline anchor
+        moves (the web handler re-evaluates immediately so a no-longer-
+        justified alert doesn't stay latched until the next unplug). Also
+        the one place the cached forecast params need refreshing."""
         try:
             fits = await asyncio.to_thread(thermal.fit_sessions, self.db, ts)
             self._params = await asyncio.to_thread(thermal.fit_history, self.db, ts, fits=fits)
