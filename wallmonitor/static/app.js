@@ -46,6 +46,9 @@ function fmtNum(value, digits = 1) {
   if (value == null || Number.isNaN(value)) return "—";
   return Number(value).toLocaleString(undefined, { maximumFractionDigits: digits, minimumFractionDigits: 0 });
 }
+function cToF(celsius) {
+  return (celsius * 9) / 5 + 32;
+}
 
 async function getJSON(url) {
   const res = await fetch(url);
@@ -847,8 +850,6 @@ async function viewLive(root) {
       unit: "A", digits: 1, zeroBase: true, xFrom, xTo, height: 200,
     });
   }
-
-  const cToF = (celsius) => (celsius * 9) / 5 + 32;
 
   function renderThermal(data) {
     thermalCard.textContent = "";
