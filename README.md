@@ -404,6 +404,20 @@ else, so a stale cap can never silently persist into a session that never
 earned it. `journalctl -u derate-amp-control` shows each run's decision and
 reason.
 
+**Checking whether it would actually help, before or after deploying it:**
+`contrib/backtest_derate_amp_control.py` replays `decide()` against real
+historical sessions read straight from `wallmonitor.db` (point it at a copy,
+not the live file). `thermal.predict()` and the model-fitting functions are
+all parameterized by an explicit `now` and never look past it, so the
+script can reconstruct exactly what `/api/thermal` would have reported at
+any past instant — including during a real alert 40, not just a
+hypothetical one — and check whether the daemon's gating would have caught
+it with enough lead time to matter.
+
+```bash
+uv run python contrib/backtest_derate_amp_control.py --db /path/to/a/copy/of/wallmonitor.db
+```
+
 ## Tests
 
 ```bash
