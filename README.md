@@ -22,6 +22,9 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
 - Wi-Fi health history and connectivity events
 - **Thermal derate forecast** — a per-install fitted model predicts alert 40
   live and suggests the highest current that avoids the 50% foldback
+- **Automatic derate prevention** — an optional daemon caps the vehicle's
+  charge current through a least-privilege BLE pairing when the forecast
+  firms up, and restores it once the risk clears
 - **Degradation watch** — ambient-corrected heat-rise trend with confidence
   intervals and a verified-baseline anchor, so "getting worse" is a
   statistical claim, not a vibe
@@ -364,6 +367,42 @@ freshness window expires and every consumer falls back to the handle
 proxy — and once a stationary sensor reports, its samples outrank the
 car's anyway. `journalctl -u teslamate-ambient-bridge` shows each run's
 decision and reason.
+
+## Optional: automatic derate prevention (BLE amp control)
+
+The thermal forecast can suggest a lower charge current, but doing anything
+about it needs a way to talk to the vehicle. `contrib/derate_amp_control.py`
+(stdlib-only) polls `/api/thermal` and, when the forecast firms up, caps the
+charge current through an ESP32 running
+[esphome-tesla-ble](https://github.com/yoziru/esphome-tesla-ble) — paired
+with the **least-privilege `CHARGING_MANAGER` role**, so the key can adjust
+charge current and nothing else. No cloud API, no Fleet API, nothing leaves
+the LAN.
+
+```bash
+sudo ./deploy/install-derate-amp-control.sh --tesla-ble http://<esp32-host>
+# dry-run first: prints every decision without touching the charger
+sudo ./deploy/install-derate-amp-control.sh --tesla-ble http://<esp32-host> --dry-run
+```
+
+`/api/thermal`'s forecast gets more precise as a session runs: `hypothetical`
+(pre-session, pure extrapolation from historical fits), `model` (a little
+live data blended with that prior), then `trajectory` (an exponential curve
+fit to this session's own readings). Live testing found the historical prior
+runs hot relative to reality — `hypothetical`/`model` basis predicted a trip
+that the session's own `trajectory` fit, once it had enough points, correctly
+ruled out. So the daemon **only ever acts on `trajectory`-basis forecasts**,
+and only once a signal has held for `--confirm-ticks` consecutive polls (default
+3) — a single noisy fit can't flip a real amp change on the charger.
+
+A cap lifts three ways: the trajectory forecast itself reports the risk has
+passed (held for `--confirm-ticks` polls), the charging session ends, or — a
+safety net — a new session starts while the daemon's on-disk state still
+says "capped" from a run that never saw its session close out (crash,
+restart, etc.). That last case always restores before evaluating anything
+else, so a stale cap can never silently persist into a session that never
+earned it. `journalctl -u derate-amp-control` shows each run's decision and
+reason.
 
 ## Tests
 
