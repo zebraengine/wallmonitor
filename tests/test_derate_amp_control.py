@@ -1,13 +1,16 @@
 """decide() is pure, so the whole cap/restore decision table tests without
 a wallmonitor server, an ESP32, or a vehicle. The behaviors under test
-reflect two real incidents: (2026-08-01) trust only `trajectory`/`model`
-bases, never `hypothetical`, and debounce over several confirming polls;
-(2026-08-03) capping and restoring are NOT symmetric — capping trusts
+reflect three real incidents, all 2026-08-01 through 2026-08-03: trust only
+`trajectory`/`model` bases, never `hypothetical`, and debounce over several
+confirming polls; capping and restoring are NOT symmetric — capping trusts
 `model` basis too (the safe direction, and `trajectory` alone left a
 multi-minute blind spot after every amp change), while restoring stays
 narrow: `trajectory` only, one step at a time, and gated on real thermal
-margin, because snapping straight back to full current converted a caught
-derate into repeated near-misses before one wasn't caught in time."""
+margin; and a step-up undone by another cap soon after backs off
+exponentially before the next attempt, giving up entirely after repeated
+quick reversals in the same session — the *speed* of one swing wasn't the
+only problem, the *frequency* of retrying when conditions genuinely hadn't
+recovered was its own."""
 
 import importlib.util
 import pathlib
@@ -29,6 +32,9 @@ def _cfg(**kw):
     kw.setdefault("min_cap_delta_a", 1.0)
     kw.setdefault("restore_step_a", 2.0)
     kw.setdefault("restore_margin_c", 3.0)
+    kw.setdefault("restore_backoff_base", 2.0)
+    kw.setdefault("max_restore_attempts", 3)
+    kw.setdefault("reattempt_window_min", 15.0)
     return dac.Config(**kw)
 
 
@@ -39,10 +45,12 @@ def _thermal(
     mtt: float | None = 10.0,
     suggested: float | None = 44.0,
     handle_c: float | None = 50.0,  # well under trip - margin unless a test says otherwise
+    ts: float | None = 1_000_000.0,
 ):
     return {
         "state": state,
         "handle_c": handle_c,
+        "ts": ts,
         "forecast": {
             "basis": basis,
             "will_trip": will_trip,
@@ -187,6 +195,86 @@ def test_restore_holds_with_no_handle_reading():
     action, state, reason = dac.decide(no_handle, state, cfg)
     assert action.kind == "none" and state.capped
     assert "no handle reading" in reason
+
+
+def test_quick_reversal_backs_off_the_next_attempt():
+    # 2026-08-03: stepping straight back up on every confirmed-clear read,
+    # with no memory of how well the LAST step-up held, meant the daemon
+    # kept retrying at the same pace even though conditions clearly hadn't
+    # recovered — a real derate happened on the third retry. A step-up
+    # reversed by another cap soon after should make the next attempt wait
+    # longer, not retry at the same cadence.
+    cfg = _cfg(confirm_ticks=2, restore_backoff_base=2.0, reattempt_window_min=15.0)
+    state = dac.State(capped=True, cap_value=40.0, last_session_state="charging", trip_streak=0)
+
+    clear_t0 = _thermal(will_trip=False, mtt=None, suggested=None, handle_c=50.0, ts=1000.0)
+    action, state, _ = dac.decide(clear_t0, state, cfg)
+    action, state, reason = dac.decide(clear_t0, state, cfg)
+    assert action.kind == "cap" and action.value == 42.0  # stepped up
+    assert state.last_step_up_ts == 1000.0 and state.restore_attempts == 0
+
+    # Reversed by a cap just 5 minutes later — well inside the 15min window.
+    soon_hot = _thermal(will_trip=True, mtt=5.0, suggested=40.0, ts=1300.0)
+    action, state, reason = dac.decide(soon_hot, state, cfg)
+    action, state, reason = dac.decide(soon_hot, state, cfg)
+    assert action.kind == "cap" and action.value == 40.0
+    assert state.restore_attempts == 1
+    assert "quick reversal" in reason
+
+    # The next step-up attempt now needs confirm_ticks * backoff_base = 4
+    # confirming polls, not 2.
+    clear_t1 = _thermal(will_trip=False, mtt=None, suggested=None, handle_c=50.0, ts=1400.0)
+    for _ in range(3):
+        action, state, _ = dac.decide(clear_t1, state, cfg)
+        assert action.kind == "none"
+    action, state, _ = dac.decide(clear_t1, state, cfg)
+    assert action.kind == "cap" and action.value == 42.0  # the 4th confirming poll
+
+
+def test_slow_reversal_resets_backoff():
+    # A step-up that holds LONGER than the reattempt window before needing
+    # another cap is real recovery, not a fluke — it should get a clean
+    # slate, not carry forward a growing penalty from an unrelated episode.
+    cfg = _cfg(confirm_ticks=2, restore_backoff_base=2.0, reattempt_window_min=15.0)
+    state = dac.State(
+        capped=True, cap_value=40.0, last_session_state="charging", restore_attempts=2, last_step_up_ts=1000.0
+    )
+    # A cap fires 20 minutes (1200s) after the last step-up — outside the
+    # window. suggested=35.0 (well under cap_value - min_cap_delta_a) so
+    # this actually tightens rather than being a no-op "already capped".
+    long_after = _thermal(will_trip=True, mtt=5.0, suggested=35.0, ts=1000.0 + 1200.0)
+    action, state, _ = dac.decide(long_after, state, cfg)
+    action, state, reason = dac.decide(long_after, state, cfg)
+    assert action.kind == "cap" and action.value == 35.0
+    assert state.restore_attempts == 0
+    assert "quick reversal" not in reason
+
+
+def test_gives_up_after_max_restore_attempts():
+    cfg = _cfg(confirm_ticks=1, max_restore_attempts=2)
+    state = dac.State(
+        capped=True, cap_value=40.0, last_session_state="charging", restore_attempts=2, last_step_up_ts=None
+    )
+    clear = _thermal(will_trip=False, mtt=None, suggested=None, handle_c=50.0, ts=5000.0)
+    action, state, reason = dac.decide(clear, state, cfg)
+    assert action.kind == "none"
+    assert state.capped and state.cap_value == 40.0  # never even attempts the step
+    assert "giving up" in reason
+
+    # Stays given up across further ticks too, not just once.
+    action, state, reason = dac.decide(clear, state, cfg)
+    assert action.kind == "none" and state.cap_value == 40.0 and "giving up" in reason
+
+
+def test_restore_attempts_reset_on_new_session():
+    cfg = _cfg(confirm_ticks=1)
+    exhausted = dac.State(
+        capped=True, cap_value=40.0, last_session_state="idle", restore_attempts=3, last_step_up_ts=2000.0
+    )
+    thermal = _thermal(will_trip=True, mtt=5.0, suggested=40.0, ts=9000.0)
+    action, state, _ = dac.decide(thermal, exhausted, cfg)
+    assert action.kind == "restore"  # stale-cap safety net fires first
+    assert state.restore_attempts == 0 and state.last_step_up_ts is None
 
 
 def test_trajectory_clear_with_nothing_capped_is_a_noop():
