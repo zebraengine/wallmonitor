@@ -53,6 +53,19 @@ A cap fully lifts three ways, in order of how eagerly they should fire:
    safety net so a stale cap can never silently persist into a session that
    never earned it.
 
+Stepping up isn't unconditionally retried, either. If a step-up (partial or
+full) gets reversed by another cap within ``--reattempt-window-min``, that's
+treated as evidence the thermal budget genuinely hasn't recovered yet, not
+noise — the *speed* of one swing isn't the only problem repeated attempts
+cause; the *frequency* of retrying is its own signal. Each such quick
+reversal multiplies the confirm-ticks required before the *next* attempt by
+``--restore-backoff-base`` (default 2x, so 3 -> 6 -> 12 ticks...), and after
+``--max-restore-attempts`` quick reversals in the same session, the daemon
+stops trying to climb back up at all and just holds the last cap for the
+rest of that session. A step-up that holds *longer* than the reattempt
+window before needing to cap again resets the backoff — real recovery still
+gets a clean slate.
+
 Stdlib only. Run it from cron or a systemd timer (see
 deploy/install-derate-amp-control.sh); one invocation reads, decides,
 optionally acts, and exits — debounce state lives in --state-file between
@@ -83,6 +96,9 @@ class Config:
     min_cap_delta_a: float = 1.0
     restore_step_a: float = 2.0
     restore_margin_c: float = 3.0
+    restore_backoff_base: float = 2.0
+    max_restore_attempts: int = 3
+    reattempt_window_min: float = 15.0
 
 
 @dataclass
@@ -92,6 +108,8 @@ class State:
     trip_streak: int = 0
     clear_streak: int = 0
     last_session_state: str | None = None
+    restore_attempts: int = 0
+    last_step_up_ts: float | None = None
 
 
 @dataclass
@@ -109,12 +127,13 @@ def decide(thermal: dict, state: State, cfg: Config) -> tuple[Action, State, str
     mtt = forecast.get("minutes_to_trip")
     suggested = forecast.get("suggested_max_a")
     handle_c = thermal.get("handle_c")
+    now_ts = thermal.get("ts")
 
     session_started = session_state == "charging" and state.last_session_state != "charging"
     new_state = replace(state, last_session_state=session_state)
 
     if session_state != "charging":
-        new_state = replace(new_state, trip_streak=0, clear_streak=0)
+        new_state = replace(new_state, trip_streak=0, clear_streak=0, restore_attempts=0, last_step_up_ts=None)
         if state.capped:
             new_state = replace(new_state, capped=False, cap_value=None)
             return Action("restore", cfg.normal_amps), new_state, "session ended: restoring normal rate"
@@ -124,12 +143,31 @@ def decide(thermal: dict, state: State, cfg: Config) -> tuple[Action, State, str
         # A previous run set "capped" but never saw this session close out
         # (crash, daemon restart, ...). Never let that carry into a new
         # session on trust alone.
-        new_state = replace(new_state, capped=False, cap_value=None, trip_streak=0, clear_streak=0)
+        new_state = replace(
+            new_state,
+            capped=False,
+            cap_value=None,
+            trip_streak=0,
+            clear_streak=0,
+            restore_attempts=0,
+            last_step_up_ts=None,
+        )
         return (
             Action("restore", cfg.normal_amps),
             new_state,
             ("new session started with a stale cap from a previous run: restoring first"),
         )
+
+    # A step-up (partial or full) undone by another cap soon after isn't
+    # noise — it's evidence the thermal budget genuinely hasn't recovered,
+    # so retrying immediately would just repeat the same failed attempt at
+    # higher frequency. Holding this long since the last step-up is treated
+    # as a real recovery and forgives past failures.
+    quick_reversal = (
+        state.last_step_up_ts is not None
+        and isinstance(now_ts, (int, float))
+        and (now_ts - state.last_step_up_ts) <= cfg.reattempt_window_min * 60.0
+    )
 
     # Capping down is the safe direction, so both `trajectory` and `model`
     # basis are trusted — see the module docstring for why: `trajectory`
@@ -159,22 +197,39 @@ def decide(thermal: dict, state: State, cfg: Config) -> tuple[Action, State, str
             state.capped and state.cap_value is not None and suggested_a <= state.cap_value - cfg.min_cap_delta_a
         )
         if not state.capped or tightening:
-            final_state = replace(next_state, capped=True, cap_value=suggested_a, trip_streak=0)
+            attempts = state.restore_attempts + 1 if quick_reversal else 0
+            final_state = replace(
+                next_state, capped=True, cap_value=suggested_a, trip_streak=0, restore_attempts=attempts
+            )
+            note = f", quick reversal (restore_attempts={attempts})" if quick_reversal else ""
             return (
                 Action("cap", suggested_a),
                 final_state,
-                (f"basis={basis} predicts a trip in {mtt:.1f}min: capping to {suggested_a:g}A"),
+                (f"basis={basis} predicts a trip in {mtt:.1f}min: capping to {suggested_a:g}A{note}"),
             )
         return Action("none"), replace(next_state, trip_streak=0), "already capped near the suggested value"
 
     # Restore path: deliberately narrower than the cap path. Only
-    # `trajectory` basis (never `model`), only a step at a time, and only
-    # with real thermal margin — see the module docstring for the incident
-    # that justifies every one of these guards.
+    # `trajectory` basis (never `model`), only a step at a time, gated on
+    # real thermal margin, and backed off exponentially after repeated
+    # quick reversals — see the module docstring for the incidents that
+    # justify every one of these guards.
     if basis == "trajectory" and will_trip is False:
         streak = state.clear_streak + 1
         next_state = replace(new_state, clear_streak=streak, trip_streak=0)
-        if streak >= cfg.confirm_ticks and state.capped and state.cap_value is not None:
+
+        if state.capped and state.cap_value is not None and state.restore_attempts >= cfg.max_restore_attempts:
+            return (
+                Action("none"),
+                next_state,
+                (
+                    f"giving up on returning to full rate this session after "
+                    f"{state.restore_attempts} quick reversals: holding {state.cap_value:g}A"
+                ),
+            )
+
+        required = cfg.confirm_ticks * (cfg.restore_backoff_base**state.restore_attempts)
+        if streak >= required and state.capped and state.cap_value is not None:
             if not isinstance(handle_c, (int, float)):
                 return (
                     Action("none"),
@@ -192,14 +247,15 @@ def decide(thermal: dict, state: State, cfg: Config) -> tuple[Action, State, str
                     ),
                 )
             next_value = min(cfg.normal_amps, state.cap_value + cfg.restore_step_a)
+            step_state = replace(next_state, clear_streak=0, last_step_up_ts=now_ts)
             if next_value >= cfg.normal_amps:
-                final_state = replace(next_state, capped=False, cap_value=None, clear_streak=0)
+                final_state = replace(step_state, capped=False, cap_value=None)
                 return (
                     Action("restore", cfg.normal_amps),
                     final_state,
                     (f"trajectory clear, {margin_c:.1f}C of margin: fully restoring to {cfg.normal_amps:g}A"),
                 )
-            final_state = replace(next_state, capped=True, cap_value=next_value, clear_streak=0)
+            final_state = replace(step_state, capped=True, cap_value=next_value)
             return (
                 Action("cap", next_value),
                 final_state,
@@ -211,7 +267,10 @@ def decide(thermal: dict, state: State, cfg: Config) -> tuple[Action, State, str
         return (
             Action("none"),
             next_state,
-            (f"trajectory clear ({streak}/{cfg.confirm_ticks} confirming polls, capped={state.capped})"),
+            (
+                f"trajectory clear ({streak}/{required:g} confirming polls, capped={state.capped}, "
+                f"restore_attempts={state.restore_attempts})"
+            ),
         )
 
     # Neither path qualifies: `model` basis reporting clear (not trusted for
@@ -318,6 +377,27 @@ def main(argv: list[str] | None = None) -> int:
         "of the trip point, even if the trajectory reads clear (default %(default)s)",
     )
     parser.add_argument(
+        "--restore-backoff-base",
+        type=float,
+        default=2.0,
+        help="each step-up reversed by another cap within --reattempt-window-min "
+        "multiplies the confirm-ticks required for the next attempt by this (default %(default)s)",
+    )
+    parser.add_argument(
+        "--max-restore-attempts",
+        type=int,
+        default=3,
+        help="after this many quick reversals in one session, stop trying to climb "
+        "back up at all and hold the last cap for the rest of it (default %(default)s)",
+    )
+    parser.add_argument(
+        "--reattempt-window-min",
+        type=float,
+        default=15.0,
+        help="a step-up undone by another cap sooner than this counts as a quick "
+        "reversal; longer than this counts as a real recovery (default %(default)s)",
+    )
+    parser.add_argument(
         "--state-file",
         default="/tmp/derate_amp_control.state.json",
         help="remembers cap state and debounce streaks between runs",
@@ -332,6 +412,9 @@ def main(argv: list[str] | None = None) -> int:
         min_cap_delta_a=args.min_cap_delta_a,
         restore_step_a=args.restore_step_a,
         restore_margin_c=args.restore_margin_c,
+        restore_backoff_base=args.restore_backoff_base,
+        max_restore_attempts=args.max_restore_attempts,
+        reattempt_window_min=args.reattempt_window_min,
     )
     state = load_state(args.state_file)
 

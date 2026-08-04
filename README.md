@@ -410,6 +410,19 @@ reality. `model` and `trajectory` are trusted, but **not symmetrically**:
 Either direction needs a signal held for `--confirm-ticks` consecutive polls
 (default 3) before acting — a single noisy fit can't flip a real amp change.
 
+Stepping up isn't unconditionally retried, either. The *speed* of one swing
+wasn't the only problem live testing exposed — the *frequency* of retrying
+when the thermal budget genuinely hadn't recovered was its own. If a step-up
+(partial or full) gets reversed by another cap within `--reattempt-window-min`
+(default 15min), each such quick reversal multiplies the confirm-ticks
+required before the *next* attempt by `--restore-backoff-base` (default 2x —
+3 polls, then 6, then 12...), and after `--max-restore-attempts` quick
+reversals in the same session (default 3), the daemon stops trying to climb
+back up at all and just holds the last cap for the rest of that session. A
+step-up that holds *longer* than the reattempt window before needing another
+cap resets the backoff — real recovery still gets a clean slate, and a new
+session always starts fresh.
+
 A cap fully lifts three ways: the trajectory forecast reports the risk has
 passed *and* the handle has real thermal margin (stepped up gradually, see
 above), the charging session ends (restored immediately — no more climb to
