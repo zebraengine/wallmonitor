@@ -1,9 +1,13 @@
 """decide() is pure, so the whole cap/restore decision table tests without
-a wallmonitor server, an ESP32, or a vehicle. The behaviors under test are
-the ones tonight's live 48A session actually taught: trust trajectory-basis
-forecasts only, require several consecutive confirming polls before acting,
-and never let a cap survive past the session (or a crashed run) that set
-it."""
+a wallmonitor server, an ESP32, or a vehicle. The behaviors under test
+reflect two real incidents: (2026-08-01) trust only `trajectory`/`model`
+bases, never `hypothetical`, and debounce over several confirming polls;
+(2026-08-03) capping and restoring are NOT symmetric — capping trusts
+`model` basis too (the safe direction, and `trajectory` alone left a
+multi-minute blind spot after every amp change), while restoring stays
+narrow: `trajectory` only, one step at a time, and gated on real thermal
+margin, because snapping straight back to full current converted a caught
+derate into repeated near-misses before one wasn't caught in time."""
 
 import importlib.util
 import pathlib
@@ -23,14 +27,22 @@ def _cfg(**kw):
     kw.setdefault("lead_time_min", 20.0)
     kw.setdefault("confirm_ticks", 3)
     kw.setdefault("min_cap_delta_a", 1.0)
+    kw.setdefault("restore_step_a", 2.0)
+    kw.setdefault("restore_margin_c", 3.0)
     return dac.Config(**kw)
 
 
 def _thermal(
-    state="charging", basis="trajectory", will_trip=True, mtt: float | None = 10.0, suggested: float | None = 44.0
+    state="charging",
+    basis="trajectory",
+    will_trip=True,
+    mtt: float | None = 10.0,
+    suggested: float | None = 44.0,
+    handle_c: float | None = 50.0,  # well under trip - margin unless a test says otherwise
 ):
     return {
         "state": state,
+        "handle_c": handle_c,
         "forecast": {
             "basis": basis,
             "will_trip": will_trip,
@@ -53,22 +65,45 @@ def test_idle_with_no_cap_is_a_noop():
     assert not state.capped
 
 
-def test_idle_after_a_cap_restores():
+def test_idle_after_a_cap_restores_immediately():
+    # Session-end restore skips the step-up/margin gating entirely — there's
+    # no more climb to protect against once charging has actually stopped.
     capped = dac.State(capped=True, cap_value=44.0, last_session_state="charging")
     action, state, _ = dac.decide(_thermal(state="idle"), capped, _cfg())
     assert action.kind == "restore" and action.value == 48.0
     assert not state.capped and state.cap_value is None
 
 
-def test_hypothetical_and_model_basis_never_act():
+def test_hypothetical_and_insufficient_basis_never_act():
     cfg = _cfg(confirm_ticks=2)
     state = dac.State(last_session_state="charging")
-    for basis in ("hypothetical", "model"):
+    for basis in ("hypothetical", "insufficient"):
         thermal = _thermal(basis=basis, will_trip=True, mtt=5.0, suggested=40.0)
         action, state, reason = _run(thermal, state, cfg, times=5)
         assert action.kind == "none"
         assert state.trip_streak == 0 and state.clear_streak == 0
-        assert "not a trajectory fit" in reason
+        assert f"basis={basis}" in reason
+
+
+def test_model_basis_triggers_a_cap():
+    # The safe direction: model basis is trusted for capping, unlike restoring.
+    cfg = _cfg(confirm_ticks=2)
+    state = dac.State(last_session_state="charging")
+    thermal = _thermal(basis="model", will_trip=True, mtt=6.0, suggested=42.0)
+    action, state, _ = _run(thermal, state, cfg, times=2)
+    assert action.kind == "cap" and action.value == 42.0
+    assert state.capped and state.cap_value == 42.0
+
+
+def test_model_basis_clear_does_not_restore():
+    # The risky direction stays narrow: model-basis "clear" never counts.
+    cfg = _cfg(confirm_ticks=2)
+    state = dac.State(capped=True, cap_value=44.0, last_session_state="charging")
+    thermal = _thermal(basis="model", will_trip=False, mtt=None, suggested=None)
+    action, state, reason = _run(thermal, state, cfg, times=5)
+    assert action.kind == "none"
+    assert state.capped and state.cap_value == 44.0 and state.clear_streak == 0
+    assert "basis=model" in reason
 
 
 def test_trajectory_cap_requires_confirm_ticks_then_fires():
@@ -97,18 +132,61 @@ def test_will_trip_beyond_lead_time_is_neutral_not_reset():
     assert state.trip_streak == 2 and state.clear_streak == 1
 
 
-def test_trajectory_clear_restores_after_confirm_ticks():
-    cfg = _cfg(confirm_ticks=2)
-    state = dac.State(capped=True, cap_value=44.0, last_session_state="charging")
-    clear = _thermal(will_trip=False, mtt=None, suggested=None)
+def test_restore_steps_up_gradually_instead_of_snapping_to_full():
+    cfg = _cfg(confirm_ticks=2, restore_step_a=2.0, restore_margin_c=3.0)
+    state = dac.State(capped=True, cap_value=40.0, last_session_state="charging")
+    clear = _thermal(will_trip=False, mtt=None, suggested=None, handle_c=50.0)  # 15C of margin
 
     action, state, _ = dac.decide(clear, state, cfg)
-    assert action.kind == "none" and state.clear_streak == 1 and state.capped
+    assert action.kind == "none" and state.clear_streak == 1 and state.cap_value == 40.0
 
+    # 2nd confirming tick: steps up by restore_step_a, does NOT jump to 48.
+    action, state, reason = dac.decide(clear, state, cfg)
+    assert action.kind == "cap" and action.value == 42.0
+    assert state.capped and state.cap_value == 42.0 and state.clear_streak == 0
+    assert "stepping up" in reason
+
+    # Each further step needs its OWN confirm cycle, not a free ride.
+    action, state, _ = dac.decide(clear, state, cfg)
+    assert action.kind == "none" and state.clear_streak == 1 and state.cap_value == 42.0
+
+
+def test_restore_fully_lifts_once_the_step_reaches_normal_amps():
+    cfg = _cfg(confirm_ticks=1, restore_step_a=2.0, restore_margin_c=3.0)
+    state = dac.State(capped=True, cap_value=47.0, last_session_state="charging")
+    clear = _thermal(will_trip=False, mtt=None, suggested=None, handle_c=50.0)
     action, state, reason = dac.decide(clear, state, cfg)
     assert action.kind == "restore" and action.value == 48.0
-    assert not state.capped and state.cap_value is None and state.clear_streak == 0
-    assert "clear" in reason
+    assert not state.capped and state.cap_value is None
+    assert "fully restoring" in reason
+
+
+def test_restore_holds_when_handle_still_close_to_trip():
+    # 2026-08-03: restoring while the handle was still ~0.6-1C under the
+    # trip point immediately restarted the climb, twice, before a real
+    # alert 40 fired. The margin gate exists specifically to prevent this.
+    cfg = _cfg(confirm_ticks=1, restore_margin_c=3.0)
+    state = dac.State(capped=True, cap_value=42.0, last_session_state="charging")
+    still_hot = _thermal(will_trip=False, mtt=None, suggested=None, handle_c=64.4)  # 0.6C of margin
+    action, state, reason = dac.decide(still_hot, state, cfg)
+    assert action.kind == "none"
+    assert state.capped and state.cap_value == 42.0  # held, not stepped
+    assert "holding" in reason and "0.6" in reason
+
+    # Confirmation streak still counts while held — once margin clears, it
+    # doesn't need to re-earn confirm_ticks from scratch.
+    cooled = _thermal(will_trip=False, mtt=None, suggested=None, handle_c=61.0)  # 4C of margin
+    action, state, reason = dac.decide(cooled, state, cfg)
+    assert action.kind == "cap" and action.value == 44.0
+
+
+def test_restore_holds_with_no_handle_reading():
+    cfg = _cfg(confirm_ticks=1)
+    state = dac.State(capped=True, cap_value=42.0, last_session_state="charging")
+    no_handle = _thermal(will_trip=False, mtt=None, suggested=None, handle_c=None)
+    action, state, reason = dac.decide(no_handle, state, cfg)
+    assert action.kind == "none" and state.capped
+    assert "no handle reading" in reason
 
 
 def test_trajectory_clear_with_nothing_capped_is_a_noop():

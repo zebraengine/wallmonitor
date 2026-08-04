@@ -388,21 +388,37 @@ sudo ./deploy/install-derate-amp-control.sh --tesla-ble http://<esp32-host> --dr
 `/api/thermal`'s forecast gets more precise as a session runs: `hypothetical`
 (pre-session, pure extrapolation from historical fits), `model` (a little
 live data blended with that prior), then `trajectory` (an exponential curve
-fit to this session's own readings). Live testing found the historical prior
-runs hot relative to reality — `hypothetical`/`model` basis predicted a trip
-that the session's own `trajectory` fit, once it had enough points, correctly
-ruled out. So the daemon **only ever acts on `trajectory`-basis forecasts**,
-and only once a signal has held for `--confirm-ticks` consecutive polls (default
-3) — a single noisy fit can't flip a real amp change on the charger.
+fit to this session's own readings). `hypothetical` is never trusted at all —
+live testing found the historical prior it leans on runs hot relative to
+reality. `model` and `trajectory` are trusted, but **not symmetrically**:
 
-A cap lifts three ways: the trajectory forecast itself reports the risk has
-passed (held for `--confirm-ticks` polls), the charging session ends, or — a
-safety net — a new session starts while the daemon's on-disk state still
-says "capped" from a run that never saw its session close out (crash,
-restart, etc.). That last case always restores before evaluating anything
-else, so a stale cap can never silently persist into a session that never
-earned it. `journalctl -u derate-amp-control` shows each run's decision and
-reason.
+- **Capping down is the safe direction** (a false-positive cap only costs a
+  little charging speed), so it acts on `model` basis too, not just
+  `trajectory` — every amp change resets the trajectory window, so trusting
+  only `trajectory` leaves a multi-minute blind spot after every cap or
+  restore, right when the situation is most likely to be changing. A real
+  alert 40 fired inside exactly that gap during live testing.
+- **Restoring up is the risky direction** (it's what pushes the equilibrium
+  back toward the trip point), so it stays conservative on every axis: only
+  `trajectory` basis, one `--restore-step-a` at a time rather than snapping
+  straight back to `--normal-amps`, and never while the handle is within
+  `--restore-margin-c` of the trip point even if the trajectory reads clear.
+  Snapping straight back to full current, twice, immediately restarted the
+  climb both times during live testing — turning a caught derate into
+  repeated near-misses before a third one wasn't caught in time.
+
+Either direction needs a signal held for `--confirm-ticks` consecutive polls
+(default 3) before acting — a single noisy fit can't flip a real amp change.
+
+A cap fully lifts three ways: the trajectory forecast reports the risk has
+passed *and* the handle has real thermal margin (stepped up gradually, see
+above), the charging session ends (restored immediately — no more climb to
+protect against), or — a safety net — a new session starts while the
+daemon's on-disk state still says "capped" from a run that never saw its
+session close out (crash, restart, etc.). That last case always restores
+before evaluating anything else, so a stale cap can never silently persist
+into a session that never earned it. `journalctl -u derate-amp-control`
+shows each run's decision and reason.
 
 **Checking whether it would actually help, before or after deploying it:**
 `contrib/backtest_derate_amp_control.py` replays `decide()` against real
