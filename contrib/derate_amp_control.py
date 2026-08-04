@@ -66,6 +66,20 @@ rest of that session. A step-up that holds *longer* than the reattempt
 window before needing to cap again resets the backoff — real recovery still
 gets a clean slate.
 
+Finally, ``will_trip: false`` is a point estimate, not a certainty — it means
+the *projected* plateau landed under the trip point, and that projection
+carries the model's own fit error. When the two are within
+``--forecast-confidence-k`` times ``fit_rmse_c`` of each other, that verdict
+is a coin flip dressed up as a decision, so the daemon steps down instead of
+trusting it. Observed live 2026-08-04: a projected 64.6 C plateau against a
+65.0 C trip with ~0.31 C fit RMSE — a 1.3-sigma call that nothing in the
+logic had authority to act on, since only ``will_trip: true`` could trigger a
+cap. It held that time, but by luck rather than by design. Note this is
+deliberately *not* a raw "handle is within X degrees of the trip" rule: the
+same session settled into a genuinely stable 63.8 C plateau at 45A that such
+a rule would have banned outright. Proximity to the trip is not the danger;
+proximity plus an untrustworthy forecast is.
+
 Stdlib only. Run it from cron or a systemd timer (see
 deploy/install-derate-amp-control.sh); one invocation reads, decides,
 optionally acts, and exits — debounce state lives in --state-file between
@@ -99,6 +113,8 @@ class Config:
     restore_backoff_base: float = 2.0
     max_restore_attempts: int = 3
     reattempt_window_min: float = 15.0
+    forecast_confidence_k: float = 2.0
+    min_amps: float = 6.0
 
 
 @dataclass
@@ -128,6 +144,11 @@ def decide(thermal: dict, state: State, cfg: Config) -> tuple[Action, State, str
     suggested = forecast.get("suggested_max_a")
     handle_c = thermal.get("handle_c")
     now_ts = thermal.get("ts")
+    current_a = thermal.get("current_a")
+    steady_state_c = forecast.get("steady_state_c")
+    model = thermal.get("model") or {}
+    fit_rmse_c = model.get("fit_rmse_c")
+    trip_c = model.get("trip_c", TRIP_HANDLE_C)
 
     session_started = session_state == "charging" and state.last_session_state != "charging"
     new_state = replace(state, last_session_state=session_state)
@@ -208,6 +229,73 @@ def decide(thermal: dict, state: State, cfg: Config) -> tuple[Action, State, str
                 (f"basis={basis} predicts a trip in {mtt:.1f}min: capping to {suggested_a:g}A{note}"),
             )
         return Action("none"), replace(next_state, trip_streak=0), "already capped near the suggested value"
+
+    # Confidence guard. `will_trip: false` is a point estimate, not a
+    # certainty: it means the *projected* plateau landed under the trip
+    # point, and that projection carries the model's own fit error. When
+    # the two are within `k * fit_rmse_c` of each other the "no trip"
+    # verdict is a coin flip dressed up as a decision, so treat it as a
+    # trip signal and step down instead of trusting it.
+    #
+    # 2026-08-04: observed live at 45A with a projected plateau of 64.6 C
+    # against a 65.0 C trip and a fit RMSE of ~0.31 C — a 1.3-sigma call
+    # the daemon had no authority to act on, since only `will_trip: true`
+    # could trigger a cap. It happened to hold, but nothing in the logic
+    # made that a decision rather than luck.
+    #
+    # Deliberately NOT a raw "handle is within X degrees of the trip" rule:
+    # that same session settled into a genuinely stable 63.8 C plateau at
+    # 45A, which a proximity rule would have banned outright. Proximity to
+    # the trip is not the danger; proximity plus an untrustworthy forecast
+    # is. As fits improve and fit_rmse_c shrinks, this guard narrows on its
+    # own and permits more aggressive operation.
+    plateau_c = gap_c = sigma = None
+    if (
+        basis == "trajectory"
+        and will_trip is False
+        and isinstance(steady_state_c, (int, float))
+        and isinstance(fit_rmse_c, (int, float))
+        and isinstance(trip_c, (int, float))
+        and fit_rmse_c > 0
+    ):
+        plateau_c = float(steady_state_c)
+        gap_c = float(trip_c) - plateau_c
+        sigma = gap_c / float(fit_rmse_c)
+
+    if sigma is not None and gap_c is not None and plateau_c is not None and sigma < cfg.forecast_confidence_k:
+        streak = state.trip_streak + 1
+        next_state = replace(new_state, trip_streak=streak, clear_streak=0)
+        if streak < cfg.confirm_ticks:
+            return (
+                Action("none"),
+                next_state,
+                (
+                    f"plateau {plateau_c:.1f}C is only {gap_c:.1f}C under trip "
+                    f"({sigma:.1f} sigma, need {cfg.forecast_confidence_k:g}): "
+                    f"{streak}/{cfg.confirm_ticks} confirming polls"
+                ),
+            )
+        # Step down from wherever we are now. Unlike the main cap path there
+        # is no suggested_max_a to aim at — the forecast believes no cap is
+        # needed at all — so back off one step and re-measure. Lower current
+        # lowers the projected plateau, so this converges rather than
+        # ratcheting.
+        basis_a = state.cap_value if state.capped and state.cap_value is not None else current_a
+        if not isinstance(basis_a, (int, float)):
+            basis_a = cfg.normal_amps
+        target = max(cfg.min_amps, float(basis_a) - cfg.restore_step_a)
+        if state.capped and state.cap_value is not None and target >= state.cap_value:
+            return Action("none"), replace(next_state, trip_streak=0), "already at the confidence-guard floor"
+        attempts = state.restore_attempts + 1 if quick_reversal else state.restore_attempts
+        final_state = replace(next_state, capped=True, cap_value=target, trip_streak=0, restore_attempts=attempts)
+        return (
+            Action("cap", target),
+            final_state,
+            (
+                f"plateau {plateau_c:.1f}C only {gap_c:.1f}C under trip ({sigma:.1f} sigma): "
+                f"forecast too uncertain to trust, stepping down to {target:g}A"
+            ),
+        )
 
     # Restore path: deliberately narrower than the cap path. Only
     # `trajectory` basis (never `model`), only a step at a time, gated on
@@ -398,6 +486,20 @@ def main(argv: list[str] | None = None) -> int:
         "reversal; longer than this counts as a real recovery (default %(default)s)",
     )
     parser.add_argument(
+        "--forecast-confidence-k",
+        type=float,
+        default=2.0,
+        help="treat a 'no trip' forecast as untrustworthy (and cap anyway) when the "
+        "projected plateau is within this many fit-RMSE of the trip point; 0 disables "
+        "the guard (default %(default)s)",
+    )
+    parser.add_argument(
+        "--min-amps",
+        type=float,
+        default=6.0,
+        help="never step below this (J1772 floor — the vehicle won't charge under it) (default %(default)s)",
+    )
+    parser.add_argument(
         "--state-file",
         default="/tmp/derate_amp_control.state.json",
         help="remembers cap state and debounce streaks between runs",
@@ -415,6 +517,8 @@ def main(argv: list[str] | None = None) -> int:
         restore_backoff_base=args.restore_backoff_base,
         max_restore_attempts=args.max_restore_attempts,
         reattempt_window_min=args.reattempt_window_min,
+        forecast_confidence_k=args.forecast_confidence_k,
+        min_amps=args.min_amps,
     )
     state = load_state(args.state_file)
 

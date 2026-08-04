@@ -423,6 +423,21 @@ step-up that holds *longer* than the reattempt window before needing another
 cap resets the backoff — real recovery still gets a clean slate, and a new
 session always starts fresh.
 
+One more guard covers a subtler failure: **`will_trip: false` is a point
+estimate, not a certainty.** It means the *projected* plateau landed under
+the trip point, and that projection carries the model's own fit error. When
+the two are within `--forecast-confidence-k` times `fit_rmse_c` of each
+other (default 2), that verdict is a coin flip dressed up as a decision, so
+the daemon steps down instead of trusting it. Live testing produced exactly
+this: a projected 64.6 °C plateau against a 65.0 °C trip with ~0.31 °C fit
+RMSE — a 1.3-sigma call that nothing in the logic had authority to act on,
+since only `will_trip: true` could trigger a cap. Note this is deliberately
+*not* a "handle is within X degrees of the trip" rule: the same session
+settled into a genuinely stable 63.8 °C plateau that such a rule would have
+banned outright. Proximity to the trip is not the danger; proximity plus an
+untrustworthy forecast is. As fits improve and `fit_rmse_c` shrinks, the
+guard narrows on its own and permits more aggressive operation.
+
 A cap fully lifts three ways: the trajectory forecast reports the risk has
 passed *and* the handle has real thermal margin (stepped up gradually, see
 above), the charging session ends (restored immediately — no more climb to

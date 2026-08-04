@@ -10,7 +10,10 @@ margin; and a step-up undone by another cap soon after backs off
 exponentially before the next attempt, giving up entirely after repeated
 quick reversals in the same session — the *speed* of one swing wasn't the
 only problem, the *frequency* of retrying when conditions genuinely hadn't
-recovered was its own."""
+recovered was its own; and finally (2026-08-04) a `will_trip: false` verdict
+whose projected plateau sits within the model's own fit error is a coin flip
+rather than an answer, so it is treated as a trip signal instead of being
+trusted."""
 
 import importlib.util
 import pathlib
@@ -35,6 +38,8 @@ def _cfg(**kw):
     kw.setdefault("restore_backoff_base", 2.0)
     kw.setdefault("max_restore_attempts", 3)
     kw.setdefault("reattempt_window_min", 15.0)
+    kw.setdefault("forecast_confidence_k", 2.0)
+    kw.setdefault("min_amps", 6.0)
     return dac.Config(**kw)
 
 
@@ -46,16 +51,25 @@ def _thermal(
     suggested: float | None = 44.0,
     handle_c: float | None = 50.0,  # well under trip - margin unless a test says otherwise
     ts: float | None = 1_000_000.0,
+    current_a: float | None = 48.0,
+    # Default plateau sits far below the trip so the confidence guard stays
+    # dormant unless a test deliberately puts it in play.
+    steady_state_c: float | None = 55.0,
+    fit_rmse_c: float | None = 0.3,
+    trip_c: float = 65.0,
 ):
     return {
         "state": state,
         "handle_c": handle_c,
         "ts": ts,
+        "current_a": current_a,
+        "model": {"fit_rmse_c": fit_rmse_c, "trip_c": trip_c},
         "forecast": {
             "basis": basis,
             "will_trip": will_trip,
             "minutes_to_trip": mtt,
             "suggested_max_a": suggested,
+            "steady_state_c": steady_state_c,
         },
     }
 
@@ -321,3 +335,77 @@ def test_session_start_with_no_stale_cap_evaluates_normally():
     action, state, _ = dac.decide(thermal, fresh, cfg)
     assert action.kind == "cap" and action.value == 40.0
     assert state.capped and state.cap_value == 40.0
+
+
+def test_confidence_guard_caps_when_plateau_is_within_model_error():
+    # 2026-08-04, observed live: a projected 64.6C plateau against a 65.0C
+    # trip with ~0.31C fit RMSE — the forecast said "no trip", but at 1.3
+    # sigma that is a coin flip, and nothing in the logic could act on it.
+    cfg = _cfg(confirm_ticks=2, forecast_confidence_k=2.0, restore_step_a=2.0)
+    state = dac.State(last_session_state="charging")
+    marginal = _thermal(will_trip=False, mtt=None, suggested=None, steady_state_c=64.6, fit_rmse_c=0.31, current_a=45.0)
+
+    action, state, reason = dac.decide(marginal, state, cfg)
+    assert action.kind == "none" and state.trip_streak == 1
+    assert "sigma" in reason and "confirming polls" in reason
+
+    action, state, reason = dac.decide(marginal, state, cfg)
+    assert action.kind == "cap" and action.value == 43.0  # 45 - restore_step_a
+    assert state.capped and state.cap_value == 43.0
+    assert "too uncertain to trust" in reason
+
+
+def test_confidence_guard_dormant_when_plateau_is_comfortably_clear():
+    # The same session settled at a genuinely stable 63.8C plateau at 45A.
+    # A raw "handle within X degrees of trip" rule would have banned that;
+    # this guard must not, because the *forecast* is confident there.
+    cfg = _cfg(confirm_ticks=1, forecast_confidence_k=2.0)
+    state = dac.State(capped=True, cap_value=45.0, last_session_state="charging")
+    confident = _thermal(will_trip=False, mtt=None, suggested=None, steady_state_c=63.8, fit_rmse_c=0.31, handle_c=50.0)
+    action, state, reason = dac.decide(confident, state, cfg)
+    # 65.0 - 63.8 = 1.2C = 3.9 sigma: comfortably clear, so the normal
+    # restore path runs instead of the guard.
+    assert action.kind == "cap" and action.value == 47.0  # stepping UP, not down
+    assert "stepping up" in reason
+
+
+def test_confidence_guard_disabled_by_zero_k():
+    cfg = _cfg(confirm_ticks=1, forecast_confidence_k=0.0)
+    state = dac.State(last_session_state="charging")
+    marginal = _thermal(will_trip=False, mtt=None, suggested=None, steady_state_c=64.9, fit_rmse_c=0.31)
+    action, state, _ = dac.decide(marginal, state, cfg)
+    assert action.kind == "none" and not state.capped
+
+
+def test_confidence_guard_skipped_without_model_error():
+    # An unfitted model publishes no RMSE; with no uncertainty estimate
+    # there is nothing to reason about, so the guard must stay out of the way.
+    cfg = _cfg(confirm_ticks=1)
+    state = dac.State(last_session_state="charging")
+    no_rmse = _thermal(will_trip=False, mtt=None, suggested=None, steady_state_c=64.9, fit_rmse_c=None)
+    action, state, _ = dac.decide(no_rmse, state, cfg)
+    assert action.kind == "none" and not state.capped
+
+
+def test_confidence_guard_respects_min_amps_floor():
+    cfg = _cfg(confirm_ticks=1, min_amps=6.0, restore_step_a=2.0)
+    state = dac.State(capped=True, cap_value=7.0, last_session_state="charging")
+    marginal = _thermal(will_trip=False, mtt=None, suggested=None, steady_state_c=64.8, fit_rmse_c=0.31)
+    action, state, _ = dac.decide(marginal, state, cfg)
+    assert action.kind == "cap" and action.value == 6.0
+
+    # Already at the floor: no further stepping, and no churn of POSTs.
+    at_floor = dac.State(capped=True, cap_value=6.0, last_session_state="charging")
+    action, _, reason = dac.decide(marginal, at_floor, cfg)
+    assert action.kind == "none" and "floor" in reason
+
+
+def test_confidence_guard_only_trusts_trajectory_basis():
+    # model basis has no session-specific plateau worth second-guessing.
+    cfg = _cfg(confirm_ticks=1)
+    state = dac.State(last_session_state="charging")
+    marginal_model = _thermal(
+        basis="model", will_trip=False, mtt=None, suggested=None, steady_state_c=64.9, fit_rmse_c=0.31
+    )
+    action, state, _ = dac.decide(marginal_model, state, cfg)
+    assert action.kind == "none" and not state.capped
