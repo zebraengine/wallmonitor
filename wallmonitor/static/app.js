@@ -117,6 +117,9 @@ const EVENT_META = {
   thermal_drift_cleared: ["Handle heat rise back to baseline", "good"],
   derate_warning: ["Derate predicted — lower charge current", "serious"],
   derate_warning_cleared: ["Derate no longer predicted", "good"],
+  amp_capped: ["Charge current capped (auto)", "warning"],
+  amp_restored: ["Charge current stepped up (auto)", "good"],
+  amp_adjust_failed: ["Charge-current change failed", "serious"],
 };
 const eventLabel = (kind) => (EVENT_META[kind] || [kind, "muted"])[0];
 const eventSeverity = (kind) => (EVENT_META[kind] || [kind, "muted"])[1];
@@ -1344,6 +1347,12 @@ function eventsTable(events) {
         else if (ev.kind === "derate_warning")
           detail = `~${fmtNum(detailObj.minutes_to_trip, 0)} min to 65 °C at ${fmtNum(detailObj.current_a, 0)} A` +
             (detailObj.suggested_max_a ? ` — cap vehicle charge current at ${fmtNum(detailObj.suggested_max_a, 0)} A to keep charging` : "");
+        else if (ev.kind === "amp_capped" || ev.kind === "amp_restored")
+          detail = `${detailObj.from_a != null ? fmtNum(detailObj.from_a, 0) : "?"} → ${fmtNum(detailObj.to_a, 0)} A` +
+            (detailObj.minutes_to_trip != null ? ` — forecast had ~${fmtNum(detailObj.minutes_to_trip, 0)} min to 65 °C` :
+              detailObj.steady_state_c != null ? ` — plateau read ~${fmtNum(detailObj.steady_state_c, 1)} °C` : "");
+        else if (ev.kind === "amp_adjust_failed")
+          detail = `could not ${detailObj.attempted} to ${fmtNum(detailObj.to_a, 0)} A — ${detailObj.error || "BLE bridge unreachable"}`;
         else if (ev.kind === "monitor_gap") detail = `no data since ${fmtDT(detailObj.offline_since)} (${fmtDur(detailObj.gap_s)})`;
         else if (ev.kind === "evse_not_ready_change")
           detail = `codes [${(detailObj.from || []).join(", ")}] → [${(detailObj.to || []).join(", ")}] (undocumented)`;
@@ -1641,7 +1650,8 @@ async function viewAlerts(root, rangeKey = "7d") {
       kinds: ["evse_state_change", "evse_not_ready_change"] },
     { key: "alerts", label: "Alerts & thermal",
       kinds: ["alert_raised", "alert_cleared", "thermal_drift", "thermal_drift_cleared",
-              "derate_warning", "derate_warning_cleared", "charger_reboot"] },
+              "derate_warning", "derate_warning_cleared", "charger_reboot",
+              "amp_capped", "amp_restored", "amp_adjust_failed"] },
     { key: "conn", label: "Connectivity",
       kinds: ["poll_error", "poll_recovered", "wifi_disconnected", "wifi_reconnected",
               "internet_lost", "internet_restored"] },

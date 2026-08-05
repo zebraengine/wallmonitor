@@ -395,6 +395,37 @@ def set_charging_amps(tesla_ble_url: str, amps: float) -> None:
         resp.read()
 
 
+def event_for(action: Action, reason: str, thermal: dict, prev: State) -> tuple[str, dict]:
+    """The event-log record for an applied action: what changed, from where,
+    and the forecast numbers that justified it."""
+    forecast = thermal.get("forecast") or {}
+    detail = {
+        "from_a": prev.cap_value if prev.capped else thermal.get("current_a"),
+        "to_a": action.value,
+        "reason": reason,
+        "basis": forecast.get("basis"),
+        "minutes_to_trip": forecast.get("minutes_to_trip"),
+        "steady_state_c": forecast.get("steady_state_c"),
+        "handle_c": thermal.get("handle_c"),
+    }
+    return ("amp_capped" if action.kind == "cap" else "amp_restored", detail)
+
+
+def post_event(base_url: str, kind: str, detail: dict) -> None:
+    """Best-effort: the event log is observability, never control flow."""
+    req = urllib.request.Request(
+        f"{base_url}/api/events",
+        data=json.dumps({"kind": kind, "detail": detail}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except (urllib.error.URLError, TimeoutError) as exc:
+        print(f"warn: could not record {kind} in the event log ({exc})", file=sys.stderr)
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -541,14 +572,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"would {verb} to {action.value:g}A: {reason}")
         return 0
 
+    # Built from the pre-apply state so from_a reflects where we stepped from.
+    kind, detail = event_for(action, reason, thermal, state)
+
     try:
         set_charging_amps(args.tesla_ble, action.value)
     except (urllib.error.URLError, TimeoutError) as exc:
         print(f"error: failed to {verb} charging_amps to {action.value:g}A ({exc})", file=sys.stderr)
+        post_event(args.wallmonitor, "amp_adjust_failed", {"attempted": verb, "to_a": action.value, "error": str(exc)})
         return 1
 
     save_state(args.state_file, new_state)
     print(f"{verb} applied: {action.value:g}A ({reason})")
+    post_event(args.wallmonitor, kind, detail)
     return 0
 
 

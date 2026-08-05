@@ -1088,6 +1088,35 @@ async def test_derate_forecast_warns_then_clears(db):
             assert queue.get_nowait()["type"] != "thermal"
 
 
+async def test_event_ingest_records_amp_controller_actions(db):
+    # The BLE amp controller runs out-of-process; POST /api/events is how its
+    # cap/restore actions become first-class timeline events. Kinds are
+    # allowlisted so the log stays curated, and the timestamp is server-side.
+    import json as _json
+
+    bus = EventBus()
+    queue = bus.subscribe()
+    app = make_app(db, bus, None)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/api/events",
+            json={"kind": "amp_capped", "detail": {"from_a": 48.0, "to_a": 32.0, "basis": "trajectory"}},
+        )
+        assert resp.status == 200
+        for bad in (
+            {"kind": "session_start"},  # real kind, but not the controller's to write
+            {"kind": "amp_capped", "detail": "not-an-object"},
+            {"kind": "amp_capped", "detail": {"reason": "x" * 3000}},
+        ):
+            resp = await client.post("/api/events", json=bad)
+            assert resp.status == 400
+    events = db.events_range(0, time.time() + 1, kinds=["amp_capped"])
+    assert len(events) == 1
+    assert _json.loads(events[0]["detail"])["to_a"] == 32.0
+    frame = queue.get_nowait()
+    assert frame["type"] == "event" and frame["kind"] == "amp_capped"
+
+
 async def test_notify_webhook_posts_actionable_warning(db):
     from aiohttp import web as aioweb
 

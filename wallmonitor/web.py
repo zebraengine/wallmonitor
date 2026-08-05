@@ -144,6 +144,32 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
         rows = await asyncio.to_thread(db.events_range, t_from, t_to, kind_list)
         return web.json_response({"events": rows})
 
+    # The BLE amp controller acts on this monitor's forecasts but runs as a
+    # separate process; these are the only kinds it may write, so the timeline
+    # stays curated rather than becoming a generic log sink.
+    AMP_EVENT_KINDS = ("amp_capped", "amp_restored", "amp_adjust_failed")
+
+    async def api_event_ingest(request: web.Request) -> web.Response:
+        """Record an amp-controller action as a first-class event.
+
+        Timestamp is server-side on receipt, like every other ingest path."""
+        try:
+            body = await request.json()
+        except ValueError:
+            return web.json_response({"error": "invalid json"}, status=400)
+        kind = body.get("kind")
+        if kind not in AMP_EVENT_KINDS:
+            return web.json_response({"error": "unknown kind"}, status=400)
+        detail = body.get("detail")
+        if detail is not None and not isinstance(detail, dict):
+            return web.json_response({"error": "detail must be an object"}, status=400)
+        if detail is not None and len(json.dumps(detail)) > 2048:
+            return web.json_response({"error": "detail too large"}, status=400)
+        ts = time.time()
+        await asyncio.to_thread(db.add_event, ts, kind, detail)
+        bus.publish({"type": "event", "ts": ts, "kind": kind, "detail": detail})
+        return web.json_response({"ok": True, "ts": ts, "kind": kind})
+
     # Model parameters change only as new sessions land, so the (SQLite-heavy)
     # history fit is cached; the live prediction is computed on every call.
     thermal_fit: dict = {"params": None, "fits": [], "ts": 0.0}
@@ -302,5 +328,6 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
     app.router.add_post("/api/ambient", api_ambient_ingest)
     app.router.add_get("/api/ambient", api_ambient_history)
     app.router.add_get("/api/events", api_events)
+    app.router.add_post("/api/events", api_event_ingest)
     app.router.add_get("/api/stream", api_stream)
     return app
