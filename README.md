@@ -369,6 +369,15 @@ compares the ambient slope during the charge against the slope just after it
 stops — a contaminated sensor cools when the heat source goes away, while a
 diurnal trend does not reverse on cue.
 
+When the sensor also reports humidity, a third check separates charger heat
+from arrived air: the charger warms air without adding water vapor, so a
+coupled bump lifts temperature while the dew point holds flat (relative
+humidity falls to compensate), whereas a bump of new air — an opened garage
+door, a weather front — carries its dew point with it. Constant humidity
+makes the dew point inherit nearly every temperature move, so sensor noise
+degrades this check toward "arrived air", never toward a false accusation
+of coupling.
+
 ### Bridging a TeslaMate vehicle
 
 If [TeslaMate](https://github.com/teslamate-org/teslamate) runs on the same
