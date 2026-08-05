@@ -1059,9 +1059,16 @@ async def test_derate_forecast_warns_then_clears(db):
 
     cfg = Config(host="127.0.0.1:1")
     bus = EventBus()
+    queue = bus.subscribe()
     async with aiohttp.ClientSession() as client:
         poller = Poller(cfg, db, bus, client)
         await poller._check_derate_forecast(now, {"contactor_closed": 1, "vehicle_current_a": amps})
+        # Every computed forecast is streamed for the live chart, ahead of the
+        # edge-triggered alert frames.
+        frame = queue.get_nowait()
+        assert frame["type"] == "thermal" and frame["state"] == "charging"
+        assert frame["forecast"]["will_trip"] is True
+        assert frame["model"]["trip_c"] == thermal.TRIP_HANDLE_C
         alerts = db.active_alerts()
         assert any(a["alert"] == thermal.DERATE_ALERT and a["source"] == "monitor" for a in alerts)
         events = db.events_range(now - 1, now + 1, kinds=["derate_warning"])
@@ -1071,10 +1078,14 @@ async def test_derate_forecast_warns_then_clears(db):
         assert 0 < detail["minutes_to_trip"] <= thermal.DERATE_WARN_MIN
         assert detail["suggested_max_a"] == 43.0
 
-        # Charging stops -> warning clears.
+        # Charging stops -> warning clears, and no thermal frame is streamed.
+        while not queue.empty():
+            queue.get_nowait()
         await poller._check_derate_forecast(now + 1, {"contactor_closed": 0, "vehicle_current_a": 0.0})
         assert not any(a["alert"] == thermal.DERATE_ALERT for a in db.active_alerts())
         assert db.events_range(now - 1, now + 2, kinds=["derate_warning_cleared"])
+        while not queue.empty():
+            assert queue.get_nowait()["type"] != "thermal"
 
 
 async def test_notify_webhook_posts_actionable_warning(db):
