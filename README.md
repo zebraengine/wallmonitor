@@ -340,6 +340,44 @@ automatically, and the car demotes to backup with no reconfiguration.
 `GET /api/ambient` returns recent samples and the latest reading. Humidity
 and barometric pressure are stored when provided.
 
+**Where you put the sensor is a correctness concern, not just an
+installation detail.** Once it reports, its readings outrank everything else
+and the model trusts them completely — and the model's premise is
+`handle_temp = ambient + rise`. A sensor close enough to the connector to be
+warmed by it reports an ambient that climbs during a charge, cancelling part
+of the very rise the model exists to measure. That under-predicts derates
+*and* makes a degrading install look healthy, so the failure hides a problem
+rather than inventing one. Site it beside or below the cable run rather than
+above it (a hot handle's convective plume rises), a few feet of horizontal
+offset, close enough to share the connector's air but not to be heated by
+it, and mounted with an air gap on a low-mass surface rather than pressed
+against thermal mass.
+
+`contrib/check_ambient_contamination.py` verifies this from recorded data:
+
+```bash
+uv run python contrib/check_ambient_contamination.py --db /path/to/a/copy/of/wallmonitor.db
+```
+
+A positive ambient drift during a charge is *not* on its own evidence of
+coupling — an uninsulated garage genuinely warms over an afternoon charge,
+and a naive correlation gives a false positive because ambient and handle
+both rise together on a hot day. The script instead detrends ambient across
+each segment and correlates the *residual* against handle temperature
+(removing slow weather trends while preserving minute-scale tracking), and
+compares the ambient slope during the charge against the slope just after it
+stops — a contaminated sensor cools when the heat source goes away, while a
+diurnal trend does not reverse on cue.
+
+When the sensor also reports humidity, a third check separates charger heat
+from arrived air: the charger warms air without adding water vapor, so a
+coupled bump lifts temperature while the dew point holds flat (relative
+humidity falls to compensate), whereas a bump of new air — an opened garage
+door, a weather front — carries its dew point with it. Constant humidity
+makes the dew point inherit nearly every temperature move, so sensor noise
+degrades this check toward "arrived air", never toward a false accusation
+of coupling.
+
 ### Bridging a TeslaMate vehicle
 
 If [TeslaMate](https://github.com/teslamate-org/teslamate) runs on the same
