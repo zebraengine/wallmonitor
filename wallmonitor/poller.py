@@ -435,6 +435,10 @@ class Poller:
             return
         if out.get("state") != "charging":
             return
+        # Every computed forecast goes to the live stream, not just alert
+        # edges — the dashboard charts the same values the amp controller
+        # acts on, at the cadence it sees them.
+        self.bus.publish({"type": "thermal", **out})
         forecast = out.get("forecast") or {}
         will_trip = forecast.get("will_trip")
         minutes = forecast.get("minutes_to_trip")

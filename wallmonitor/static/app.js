@@ -164,6 +164,8 @@ const PCBA_THROTTLE_C = 95;
 // Handle temperature that raises alert 40 and halves charge current
 // (observed on firmware 26.18.0 — see alert_codes.json).
 const HANDLE_TRIP_C = 65;
+// Handle temperature below which an active alert 40 clears.
+const HANDLE_CLEAR_C = 60;
 
 function fromDbRow(row) {
   return {
@@ -402,7 +404,9 @@ function lineChart(box, opts) {
         `L${xOf(dataset.points[0][0]).toFixed(1)},${yOf(yt.min).toFixed(1)}Z`;
       root.append(svg("path", { d: areaPath, fill: dataset.color, "fill-opacity": 0.1, stroke: "none" }));
     }
-    root.append(svg("path", { d: pathData, fill: "none", stroke: dataset.color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+    const stroke = { d: pathData, fill: "none", stroke: dataset.color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" };
+    if (dataset.dash) stroke["stroke-dasharray"] = dataset.dash;
+    root.append(svg("path", stroke));
   }
 
   // Reference/threshold lines sit above the data, below the crosshair: a thin
@@ -414,7 +418,7 @@ function lineChart(box, opts) {
       x1: margin.left, x2: width - margin.right, y1: y, y2: y,
       stroke: "var(--status-warning)", "stroke-width": 1, "stroke-opacity": 0.7,
     }));
-    const refLabel = svg("text", { x: width - margin.right, y: y - 4, "text-anchor": "end", class: "axis-text" });
+    const refLabel = svg("text", { x: width - margin.right, y: refLine.below ? y + 12 : y - 4, "text-anchor": "end", class: "axis-text" });
     refLabel.textContent = refLine.label;
     refLabel.setAttribute("fill", "var(--status-warning)");
     root.append(refLabel);
@@ -766,9 +770,10 @@ async function viewLive(root) {
   const tiles = el("div", { class: "cards" });
   const sessionCard = el("div", {});
   const thermalCard = el("div", {});
+  const fcast = chartCard("Derate forecast — live", "Waiting for data…");
   const power = chartCard("Power", "Total power drawn by the vehicle — live");
   const currents = chartCard("Phase currents", "Per-phase current at the charger — live");
-  root.append(tiles, sessionCard, thermalCard, power.card, currents.card);
+  root.append(tiles, sessionCard, thermalCard, fcast.card, power.card, currents.card);
 
   // Seed the rolling buffer with the last 15 minutes from the DB.
   const now = Date.now() / 1000;
@@ -777,6 +782,22 @@ async function viewLive(root) {
     const hist = await getJSON(`/api/vitals?from=${now - 900}&to=${now}&points=900`);
     buf = hist.samples.map(fromDbRow);
   } catch { /* fresh DB */ }
+
+  // Measured ambient for the same window. The stationary sensor outranks the
+  // car bridge here for the same reason it does in the thermal model.
+  const ambientRows = (rows) => {
+    const fixed = rows.filter((sample) => sample.source !== "car");
+    return (fixed.length ? fixed : rows).map((sample) => [sample.ts, sample.temp_c]);
+  };
+  let abuf = [];
+  try {
+    const amb = await getJSON(`/api/ambient?from=${now - 900}&to=${now}`);
+    abuf = ambientRows(amb.samples || []);
+  } catch { /* no ambient feed yet */ }
+  // Forecast snapshots: one point per 30 s poller tick (SSE), with the 60 s
+  // /api/thermal poll as fallback. Nothing server-side stores these, so the
+  // series builds from view-mount onward.
+  let tbuf = [];
 
   function renderTiles(sample) {
     tiles.textContent = "";
@@ -932,17 +953,80 @@ async function viewLive(root) {
       el("div", { class: "chart-sub" }, modelNote)));
   }
 
+  function pushThermal(data) {
+    // One point per forecast tick, whether it arrived by stream or by poll.
+    if (data.state !== "charging" || !data.forecast || data.forecast.steady_state_c == null) return;
+    const ts = data.ts || data.server_ts;
+    if (tbuf.length && ts - tbuf[tbuf.length - 1].ts < 1) return;
+    const forecast = data.forecast, model = data.model || {};
+    tbuf.push({
+      ts, steady: forecast.steady_state_c, willTrip: forecast.will_trip,
+      mtt: forecast.minutes_to_trip, basis: forecast.basis, suggested: forecast.suggested_max_a,
+      rmse: model.fit_rmse_c, trip: model.trip_c,
+    });
+    const cutoff = Date.now() / 1000 - 960;
+    while (tbuf.length && tbuf[0].ts < cutoff) tbuf.shift();
+  }
+
+  function renderForecast() {
+    const xTo = Date.now() / 1000;
+    const xFrom = xTo - 900;
+    lineChart(fcast.box, {
+      series: [
+        { name: "Plug handle", color: colors.s2, points: buf.filter((sample) => sample.ts >= xFrom).map((sample) => [sample.ts, sample.tHandle]) },
+        { name: "Projected plateau", color: colors.s5, dash: "6 4", points: tbuf.map((point) => [point.ts, point.steady]) },
+        { name: "Garage ambient", color: colors.s3, points: abuf.filter((point) => point[0] >= xFrom) },
+      ],
+      unit: "°C", digits: 1, xFrom, xTo, height: 210,
+      refLines: [
+        { value: HANDLE_TRIP_C, label: `${HANDLE_TRIP_C}°C handle → alert 40 derate` },
+        { value: HANDLE_CLEAR_C, label: `${HANDLE_CLEAR_C}°C → clears`, below: true },
+      ],
+    });
+    // The sub line spells out the same arithmetic the amp controller's
+    // confidence guard runs: margin to trip, measured in fit-noise units.
+    const sub = fcast.card.querySelector(".chart-sub");
+    const latest = tbuf[tbuf.length - 1];
+    if (!latest || xTo - latest.ts > 180) {
+      sub.textContent = "The dashed plateau appears while charging — recomputed every 30 s from the handle's live trajectory. Solid lines are measured.";
+    } else if (latest.willTrip) {
+      sub.textContent = `Projected to reach ${fmtNum(latest.trip ?? HANDLE_TRIP_C, 0)} °C in ~${fmtNum(latest.mtt, 0)} min` +
+        (latest.suggested ? ` — capping at ≤ ${fmtNum(latest.suggested, 0)} A avoids the derate.` : ".");
+    } else {
+      const trip = latest.trip ?? HANDLE_TRIP_C;
+      const margin = trip - latest.steady;
+      const sigma = latest.rmse > 0 ? margin / latest.rmse : null;
+      sub.textContent = `${latest.basis} basis · plateau ~${fmtNum(latest.steady, 1)} °C · margin to trip ${fmtNum(margin, 1)} °C` +
+        (sigma != null ? ` = ${fmtNum(sigma, 0)}× the model's fit noise` +
+          (sigma < 2 ? " — inside the controller's 2× guard band, treated as trip risk" : "") : "") + ".";
+    }
+  }
+
   async function loadThermal() {
-    try { renderThermal(await getJSON("/api/thermal")); } catch { /* keep last card */ }
+    try {
+      const data = await getJSON("/api/thermal");
+      renderThermal(data);
+      pushThermal(data);
+    } catch { /* keep last card */ }
+    try {
+      const from = abuf.length ? abuf[abuf.length - 1][0] + 0.001 : Date.now() / 1000 - 900;
+      const amb = await getJSON(`/api/ambient?from=${from}`);
+      abuf.push(...ambientRows(amb.samples || []).filter((point) => !abuf.length || point[0] > abuf[abuf.length - 1][0]));
+      const cutoff = Date.now() / 1000 - 960;
+      while (abuf.length && abuf[0][0] < cutoff) abuf.shift();
+    } catch { /* no ambient feed yet */ }
+    renderForecast();
   }
   loadThermal();
   const thermalTimer = setInterval(loadThermal, 60000);
 
   if (buf.length) { renderTiles(buf[buf.length - 1]); renderSessionCard(buf[buf.length - 1]); }
   renderCharts();
+  renderForecast();
 
   let lastCharging = null;
   const onMsg = (msg) => {
+    if (msg.type === "thermal") { pushThermal(msg); renderForecast(); return; }
     if (msg.type !== "vitals") return;
     const sample = fromSse(msg);
     buf.push(sample);
@@ -951,6 +1035,7 @@ async function viewLive(root) {
     renderTiles(sample);
     renderSessionCard(sample);
     renderCharts();
+    renderForecast();
     // Refresh the forecast immediately when charging starts or stops rather
     // than waiting out the poll interval.
     if (lastCharging !== null && sample.charging !== lastCharging) loadThermal();

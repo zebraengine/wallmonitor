@@ -15,7 +15,10 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
 **At a glance:**
 
 - Full-fidelity recording — every response stored with its complete raw JSON
-- Live dashboard (SSE) with rolling charts and an active-alert banner
+- Live dashboard (SSE) with rolling charts and an active-alert banner,
+  including a live derate-forecast chart: the measured handle temperature
+  against the model's projected plateau and the trip threshold, updated with
+  every 30 s forecast tick — the same values the amp controller acts on
 - Session review: energy, peak/average power, per-phase telemetry, drillable charts
 - Event timeline with range presets, category filters, and paging
 - Alert decoding and EVSE-state labels, each marked verified vs community-reported
