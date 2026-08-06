@@ -17,6 +17,12 @@ from dataclasses import dataclass
 
 @dataclass
 class Config:
+    """Everything the app runs with, resolved once by parse_args.
+
+    Fields without CLI flags (request_timeout, the backoff pair,
+    min_interval) are deliberately not user-tunable: they are the
+    guardrails protecting the charger's small embedded web server."""
+
     host: str
     port: int = 8480
     bind: str = "127.0.0.1"
@@ -45,6 +51,7 @@ class Config:
     min_interval: float = 1.0
 
     def clamp(self) -> "Config":
+        """Enforce the polling floor whatever the flags said; returns self."""
         self.vitals_interval_active = max(self.min_interval, self.vitals_interval_active)
         self.vitals_interval_idle = max(self.min_interval, self.vitals_interval_idle)
         self.wifi_interval = max(self.min_interval, self.wifi_interval)
@@ -53,6 +60,12 @@ class Config:
 
 
 def _env(name: str, default):
+    """Environment fallback for a CLI default, coerced to the default's type.
+
+    The bool check must stay ahead of int: bool is an int subclass, so the
+    int branch would otherwise catch bool defaults and int("true") would
+    crash at import. Returning a real bool also keeps store_true flags
+    honest — WM_DEMO=false must not become a truthy default."""
     val = os.getenv(name)
     if val is None:
         return default
@@ -66,6 +79,12 @@ def _env(name: str, default):
 
 
 def parse_args(argv: list[str] | None = None) -> Config:
+    """Build the Config: CLI flag beats WM_* env var beats hardcoded default.
+
+    One validation rule: --host is required unless --demo runs the built-in
+    simulator instead of real hardware. Note the boolean flags can only
+    assert True — an env-var-enabled --demo/--split-phase has no --no-*
+    override; unset the variable instead."""
     parser = argparse.ArgumentParser(
         prog="wallmonitor",
         description="Local-only monitoring UI for a Tesla Wall Connector Gen 3",

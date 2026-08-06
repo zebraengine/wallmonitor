@@ -24,6 +24,8 @@ STATIC_PKG = "wallmonitor.static"
 
 
 def _float_q(request: web.Request, name: str, default: float) -> float:
+    """Float query parameter, silently falling back on absent/garbage input
+    — range endpoints prefer a default window over a 400."""
     try:
         return float(request.query[name])
     except (KeyError, ValueError):
@@ -31,6 +33,15 @@ def _float_q(request: web.Request, name: str, default: float) -> float:
 
 
 def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Application:
+    """Assemble the HTTP app: static UI, JSON API, SSE stream, two ingests.
+
+    Conventions shared by every handler: range endpoints take from/to/... as
+    UTC epoch seconds with sensible default windows; all SQLite work hops to
+    a thread (the handlers themselves never block the loop); responses are
+    plain JSON dicts ready for app.js. Nothing here talks to the charger —
+    reads come from the DB, live data from the poller's EventBus. poller is
+    None only in tests that exercise the API without a device.
+    """
     app = web.Application()
 
     # Without cache headers browsers cache heuristically, so after an update
@@ -43,6 +54,9 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
         return web.Response(text=html, content_type="text/html", headers=no_cache)
 
     async def static_file(request: web.Request) -> web.Response:
+        """Serve app.js/style.css from the package, allowlisted by name —
+        read per-request from disk, so frontend-only changes deploy with a
+        git pull and a browser refresh, no service restart."""
         name = request.match_info["name"]
         if name not in ("app.js", "style.css"):
             raise web.HTTPNotFound()
@@ -55,6 +69,8 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
         return web.Response(text=data, content_type="application/json", headers=no_cache)
 
     async def api_status(_request: web.Request) -> web.Response:
+        """One-call snapshot for the header/tiles: newest sample from every
+        table, poller health, active alerts, the open session, row counts."""
         now = time.time()
         latest = await asyncio.to_thread(db.latest_vitals)
         wifi = await asyncio.to_thread(db.latest_wifi)
@@ -110,6 +126,9 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
         return web.json_response({"sessions": rows})
 
     async def api_session_detail(request: web.Request) -> web.Response:
+        """One session with its samples and events. The 1 s pad around the
+        window catches boundary samples; the filter then drops any padded-in
+        rows that belong to a *different* session (back-to-back plug-ins)."""
         try:
             sid = int(request.match_info["id"])
         except ValueError:
@@ -136,6 +155,8 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
         return web.json_response({"active": active, "history": history})
 
     async def api_events(request: web.Request) -> web.Response:
+        """Event log, newest first; ?kinds=a,b,c filters server-side so the
+        timeline's category chips don't pull thousands of unwanted rows."""
         now = time.time()
         t_from = _float_q(request, "from", now - 7 * 24 * 3600)
         t_to = _float_q(request, "to", now)
@@ -175,6 +196,9 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
     thermal_fit: dict = {"params": None, "fits": [], "ts": 0.0}
 
     async def api_thermal(request: web.Request) -> web.Response:
+        """The full thermal picture: fitted model, live forecast, per-segment
+        fits, drift verdict, baseline anchor. Also what the BLE amp
+        controller polls every 30 s. ?refit busts the 6 h fit cache."""
         now = time.time()
         if (
             thermal_fit["params"] is None
@@ -198,6 +222,8 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
         )
 
     def _num(fields: dict, *keys: str) -> float | None:
+        """First key that parses as a float, in priority order — how the
+        ambient ingest prefers metric fields over the Ecowitt imperial ones."""
         for key in keys:
             value = fields.get(key)
             if value is None or value == "":
@@ -287,6 +313,14 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
         return web.json_response({"baseline_anchor_ts": float(ts)})
 
     async def api_stream(request: web.Request) -> web.StreamResponse:
+        """Server-Sent Events: one EventBus subscription per connection.
+
+        Protocol: every message is an unnamed `data: <json>` frame whose
+        `type` field discriminates (vitals | wifi | lifetime | event |
+        thermal); `: connected` / `: keepalive` comment frames keep proxies
+        and EventSource happy. No event ids, so reconnects start fresh —
+        clients re-seed history over the JSON API, which app.js does on
+        view mount anyway."""
         response = web.StreamResponse(
             headers={
                 "Content-Type": "text/event-stream",

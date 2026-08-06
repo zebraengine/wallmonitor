@@ -168,6 +168,14 @@ class Database:
     """Thread-safe wrapper around a single SQLite connection."""
 
     def __init__(self, path: str):
+        """Open (creating if needed) the database and apply the schema.
+
+        WAL journaling lets the web layer read while the poller writes
+        without either blocking; synchronous=NORMAL is durable against an
+        app crash (not an OS/power loss mid-checkpoint — acceptable for
+        telemetry). The schema is pure CREATE IF NOT EXISTS, re-run on
+        every startup: "migrations" are additive statements appended here.
+        """
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
@@ -179,10 +187,18 @@ class Database:
             self._conn.commit()
 
     def close(self) -> None:
+        """Close the shared connection. Owner-only: called once at process
+        shutdown (__main__, after every writer has stopped) and by test
+        fixtures — nothing else should ever call it."""
         with self._lock:
             self._conn.close()
 
     def _execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
+        """Execute one write statement and commit immediately.
+
+        The caller must already hold self._lock. Committing per statement
+        means every insert is durable before its method returns — there is
+        no batching layer to lose samples in."""
         cur = self._conn.execute(sql, params)
         self._conn.commit()
         return cur
@@ -190,6 +206,9 @@ class Database:
     # ---------- writes ----------
 
     def insert_vitals(self, ts: float, raw: dict, session_id: int | None, total_power_w: float | None) -> int:
+        """Store one vitals poll: extracted columns (via VITALS_COLUMNS) plus
+        the complete raw JSON. Returns the new row id (the SSE frame carries
+        it so clients can de-duplicate)."""
         cols = {col: raw.get(json_key) for col, json_key in VITALS_COLUMNS.items()}
         with self._lock:
             cur = self._execute(
@@ -201,6 +220,9 @@ class Database:
             return cur.lastrowid or 0
 
     def insert_wifi(self, ts: float, raw: dict, ssid: str | None = None) -> int:
+        """Store a Wi-Fi status sample. Pass ssid to override the column with
+        a decoded value (firmware reports it base64-encoded); the raw JSON
+        keeps the original either way."""
         with self._lock:
             cur = self._execute(
                 """INSERT INTO wifi_samples
@@ -265,6 +287,9 @@ class Database:
             return cur.lastrowid or 0
 
     def add_event(self, ts: float, kind: str, detail: dict | None = None) -> int:
+        """Append to the event log. detail is stored as JSON text; an empty
+        dict stores NULL. Writers: the poller (via _event), the web layer's
+        amp-controller ingest, and startup/shutdown bookkeeping."""
         with self._lock:
             cur = self._execute(
                 "INSERT INTO events (ts, kind, detail) VALUES (?, ?, ?)",
@@ -273,6 +298,10 @@ class Database:
             return cur.lastrowid or 0
 
     def start_session(self, start_ts: float) -> int:
+        """Open a charging session (plug-in detected). start_ts may predate
+        'now': the poller backdates it from the charger's own session timer
+        when monitoring begins mid-session. Aggregates stay NULL until
+        close_session computes them."""
         with self._lock:
             cur = self._execute("INSERT INTO sessions (start_ts) VALUES (?)", (start_ts,))
             return cur.lastrowid or 0
@@ -311,6 +340,8 @@ class Database:
             )
 
     def open_session_id(self) -> int | None:
+        """Newest session with no end_ts, if any — how a restart discovers a
+        session the previous run left open."""
         with self._lock:
             row = self._conn.execute("SELECT id FROM sessions WHERE end_ts IS NULL ORDER BY id DESC LIMIT 1").fetchone()
             return row["id"] if row else None
@@ -331,6 +362,9 @@ class Database:
             return cur.lastrowid or 0, True
 
     def clear_alert(self, ts: float, alert: str, source: str) -> bool:
+        """Deactivate an alert. Returns True only if an active row was
+        actually cleared — callers use that edge to fire *_cleared events
+        exactly once instead of on every poll."""
         with self._lock:
             cur = self._execute(
                 "UPDATE alerts SET active = 0, cleared_ts = ?, last_ts = ? WHERE alert = ? AND source = ? AND active = 1",
@@ -350,6 +384,11 @@ class Database:
             return cur.lastrowid
 
     def ambient_range(self, t_from: float, t_to: float, limit: int = 5000) -> list[dict]:
+        """Ambient samples in a window, oldest first. Caveat: a window with
+        more rows than limit keeps the *oldest* rows and silently drops the
+        newest (ORDER BY ts + LIMIT) — harmless at the 1/min sensor cadence
+        (5000 ≈ 3.5 days) but wrong for a naive "latest" query; use
+        latest_ambient for that."""
         return self._rows(
             "SELECT ts, temp_c, humidity_pct, pressure_hpa, source FROM ambient_samples "
             "WHERE ts >= ? AND ts <= ? ORDER BY ts LIMIT ?",
@@ -357,6 +396,8 @@ class Database:
         )
 
     def latest_ambient(self) -> dict | None:
+        """Newest ambient row regardless of source — no stationary-beats-car
+        tiering here; callers that need the tier use thermal's readers."""
         rows = self._rows(
             "SELECT ts, temp_c, humidity_pct, pressure_hpa, source FROM ambient_samples "
             "ORDER BY ts DESC LIMIT 1"
@@ -364,6 +405,8 @@ class Database:
         return rows[0] if rows else None
 
     def set_setting(self, key: str, value: str) -> None:
+        """Upsert into the string key/value settings table (currently only
+        the thermal baseline anchor lives here)."""
         with self._lock:
             self._execute(
                 "INSERT INTO settings(key, value) VALUES (?, ?) "
@@ -389,6 +432,8 @@ class Database:
     # ---------- reads ----------
 
     def _rows(self, sql: str, params: tuple = ()) -> list[dict]:
+        """Run a read query under the lock, returning plain dicts — detached
+        from the cursor and directly JSON-serializable by the web layer."""
         with self._lock:
             return [dict(row) for row in self._conn.execute(sql, params).fetchall()]
 
@@ -486,6 +531,9 @@ class Database:
         )
 
     def wifi_range(self, t_from: float, t_to: float, max_points: int = 1000) -> list[dict]:
+        """Wi-Fi samples in a range, bucket-averaged down to max_points.
+        Buckets take MIN(connected)/MIN(internet) so a dropout anywhere in a
+        bucket stays visible instead of averaging away."""
         sample_count = self._rows(
             "SELECT COUNT(*) AS n FROM wifi_samples WHERE ts >= ? AND ts <= ?", (t_from, t_to)
         )[0]["n"]
@@ -505,6 +553,9 @@ class Database:
         )
 
     def sessions_range(self, t_from: float, t_to: float) -> list[dict]:
+        """Sessions overlapping [t_from, t_to], newest first. A still-open
+        session (end_ts NULL) is treated as extending to t_to, so a live
+        session always shows in a "recent" query."""
         return self._rows(
             """SELECT * FROM sessions
                WHERE start_ts <= ? AND COALESCE(end_ts, ?) >= ?
@@ -517,6 +568,8 @@ class Database:
         return rows[0] if rows else None
 
     def alerts_range(self, t_from: float, t_to: float) -> list[dict]:
+        """Alerts whose active span [first_ts, last_ts] overlaps the window,
+        active ones first, then newest first."""
         return self._rows(
             """SELECT * FROM alerts WHERE last_ts >= ? AND first_ts <= ?
                ORDER BY active DESC, first_ts DESC""",
@@ -524,6 +577,9 @@ class Database:
         )
 
     def events_range(self, t_from: float, t_to: float, kinds: list[str] | None = None, limit: int = 2000) -> list[dict]:
+        """Events in a window, newest first, optionally filtered to specific
+        kinds. Unlike ambient_range, the limit here keeps the *newest* rows
+        (DESC order), which is what a timeline wants."""
         if kinds:
             marks = ",".join("?" for _ in kinds)
             return self._rows(
@@ -546,6 +602,7 @@ class Database:
         return rows[0]["ts"] if rows and rows[0]["ts"] is not None else None
 
     def counts(self) -> dict[str, Any]:
+        """Row counts for the dashboard footer ("N vitals samples · …")."""
         return {
             "vitals_samples": self._rows("SELECT COUNT(*) AS n FROM vitals_samples")[0]["n"],
             "wifi_samples": self._rows("SELECT COUNT(*) AS n FROM wifi_samples")[0]["n"],

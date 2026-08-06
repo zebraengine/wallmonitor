@@ -93,6 +93,8 @@ const EVSE_STATES = {
 const EVSE_VERIFIED = new Set([1, 4, 9, 11]);
 const evseLabel = (state) => state == null ? "—" : `${EVSE_STATES[state] || "State"} (${state})`;
 
+// kind -> [human label, severity chip class]. Unknown kinds render as their
+// raw name in muted — new server-side kinds degrade visibly, never crash.
 const EVENT_META = {
   session_start: ["Session started", "good"],
   session_end: ["Session ended", "muted"],
@@ -170,6 +172,9 @@ const HANDLE_TRIP_C = 65;
 // Handle temperature below which an active alert 40 clears.
 const HANDLE_CLEAR_C = 60;
 
+// The two sample normalizers: /api/vitals rows and SSE vitals frames use
+// different key names (db columns vs raw device JSON); both funnel into one
+// shape so every chart and tile reads the same fields regardless of origin.
 function fromDbRow(row) {
   return {
     ts: row.ts, power: row.total_power_w, maxPower: row.max_power_w,
@@ -238,6 +243,9 @@ function timeTickFormat(ts, spanS) {
    xLabel, height, digits}) — numeric x axis (not time), one dot per point.
    Used where the relationship between two measured quantities is the story
    (e.g. fitted heat rise vs window ambient), not their history. */
+// scatterChart(box, {series: [{name, color, points: [[x, y, meta]]}], xLabel,
+// height?, digits?, tip(meta, dataset) -> Node[]}) — numeric x axis, nearest-
+// dot tooltip (custom content via opts.tip). Rebuilt from scratch per call.
 function scatterChart(box, opts) {
   box.style.minHeight = `${opts.height || 210}px`;
   box.textContent = "";
@@ -339,6 +347,13 @@ function scatterChart(box, opts) {
 }
 
 /* lineChart(box, {series, height, unit, digits, area, zeroBase, xFrom, xTo}) */
+// lineChart(box, {series: [{name, color, points: [[ts, value]], dash?}],
+// unit?, digits?, height?, area? (single series only), zeroBase?, xFrom?,
+// xTo?, refLines?: [{value, label, below?}]}) — time-series lines with a
+// shared crosshair tooltip and auto legend (≥ 2 series). Null/non-finite
+// values are dropped per series (the path connects across gaps). Every call
+// is a full teardown + redraw; there is no incremental update path, which is
+// what makes 2 s live refreshes safe to reason about.
 function lineChart(box, opts) {
   // Reserve the chart's height before clearing so a live re-render never
   // collapses the page and yanks the scroll position around.
@@ -499,6 +514,7 @@ function lineChart(box, opts) {
 
 /* barChart(box, {bars: [{label, value}], unit, digits, height}) — columns with
    rounded caps, square baseline, per-bar hover tooltip. */
+// barChart(box, {bars: [{label, value}], unit?, digits?, height?, seriesName?})
 function barChart(box, opts) {
   box.style.minHeight = `${opts.height || 220}px`;
   box.textContent = "";
@@ -580,6 +596,9 @@ function barChart(box, opts) {
    session's power with a draggable selection window. Drag the handles to
    resize, drag the middle to pan, drag on empty track to select fresh.
    onChange(win|null) fires as the user drags; null = full range. */
+// timeBrush(box, {samples, range: [t0, t1], win, onChange(win|null)}) — the
+// draggable zoom strip under session-detail charts: drag a new window, move
+// or resize the existing one, or clear it (onChange(null) = full range).
 function timeBrush(box, opts) {
   const HEIGHT = 64;
   box.textContent = "";
@@ -710,6 +729,10 @@ const live = {
   status: null,
 };
 
+// One process-wide EventSource; views register a listener in live.listeners
+// and remove it in their cleanup. Reconnection is the browser's native
+// EventSource retry — the server sends no event ids, so views re-seed
+// history over the JSON API on mount rather than expecting replay.
 function connectSSE() {
   if (live.es) return;
   const es = new EventSource("/api/stream");
@@ -1781,6 +1804,9 @@ async function render(view, arg) {
   root.style.minHeight = "";
 }
 
+// Hash router: #/view, plus two sub-routes (#/sessions/{id} and
+// #/alerts/reference) that keep their parent tab highlighted. Anything
+// unrecognized falls through to Live.
 function route() {
   const hash = location.hash || "#/live";
   const parts = hash.replace(/^#\//, "").split("/");

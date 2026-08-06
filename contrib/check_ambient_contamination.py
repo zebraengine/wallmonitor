@@ -72,6 +72,9 @@ AMBIENT_MAX_AGE_S = 300.0  # an ambient sample this far from a moment is not "at
 
 @dataclass
 class Segment:
+    """One analysed charging segment with its discriminator readings —
+    everything main() needs to print and judge it."""
+
     start_ts: float
     end_ts: float
     mean_current_a: float
@@ -113,6 +116,8 @@ def _linear_slope(points: list[tuple[float, float]]) -> float:
 
 
 def _pearson(xs: list[float], ys: list[float]) -> float | None:
+    """Correlation coefficient; None when n < 4 or either side is flat
+    (a constant series has no correlation to speak of)."""
     n = len(xs)
     if n < 4:
         return None
@@ -177,6 +182,7 @@ def find_segments(conn: sqlite3.Connection, lookback_days: float) -> list[list[d
 
 
 def ambient_between(conn: sqlite3.Connection, t_from: float, t_to: float, source: str) -> list[dict]:
+    """Ambient rows for one source tag in a window, oldest first."""
     return [
         dict(r)
         for r in conn.execute(
@@ -187,6 +193,9 @@ def ambient_between(conn: sqlite3.Connection, t_from: float, t_to: float, source
 
 
 def analyse(conn: sqlite3.Connection, seg: list[dict], source: str) -> Segment | None:
+    """Compute all three discriminators for one charging segment; None when
+    there's nothing to test (too little ambient coverage, or the handle
+    never actually warmed)."""
     t0, t1 = seg[0]["ts"], seg[-1]["ts"]
     amb = ambient_between(conn, t0 - AMBIENT_MAX_AGE_S, t1 + AMBIENT_MAX_AGE_S, source)
     inside = [a for a in amb if t0 <= a["ts"] <= t1]

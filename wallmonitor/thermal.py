@@ -66,6 +66,12 @@ MAX_SEGMENTS_PER_SESSION = 4
 
 @dataclass
 class ThermalParams:
+    """The fitted model, portable: tau (minutes), rise at the 48 A reference
+    current, how many segment fits back each number, and the median
+    per-segment RMSE (the noise floor the amp controller's confidence guard
+    measures against). Defaults are from the telemetry-verified alert-40
+    event and apply until this install has fits of its own."""
+
     tau_min: float = DEFAULT_TAU_MIN
     rise_ref_c: float = DEFAULT_RISE_REF_C
     tau_fits: int = 0
@@ -77,6 +83,8 @@ class ThermalParams:
         return self.tau_fits > 0 and self.rise_fits > 0
 
     def as_dict(self) -> dict:
+        """The `model` object served by /api/thermal and the SSE thermal
+        frame — fitted values plus the fixed thresholds."""
         return {
             "tau_min": round(self.tau_min, 2),
             "rise_ref_c": round(self.rise_ref_c, 1),
@@ -202,11 +210,15 @@ CAR_AMBIENT_SOURCE = "car"
 
 
 def _split_by_mobility(rows: list[dict]) -> tuple[list[dict], str]:
+    """Apply the stationary-beats-car tier (block comment above): drop car
+    rows whenever any fixed-sensor row exists in the set."""
     fixed = [row for row in rows if row.get("source") != CAR_AMBIENT_SOURCE]
     return (fixed, "measured") if fixed else (rows, "measured_car")
 
 
 def _measured_ambient(db: Database, t_from: float, t_to: float) -> tuple[float, str] | None:
+    """Median measured ambient over a window (median, so one glitchy sample
+    or a warm car pulling in can't drag it far), or None if uncovered."""
     rows = db.ambient_range(t_from, t_to, 500)
     if not rows:
         return None
@@ -215,6 +227,9 @@ def _measured_ambient(db: Database, t_from: float, t_to: float) -> tuple[float, 
 
 
 def _latest_measured_ambient(db: Database, now: float) -> tuple[float, str] | None:
+    """Newest measured sample no older than MEASURED_AMBIENT_FRESH_S, or
+    None — the live-forecast reader, where staleness matters more than
+    smoothing."""
     rows = db.ambient_range(now - MEASURED_AMBIENT_FRESH_S, now + 1.0, 500)
     if not rows:
         return None
@@ -279,6 +294,9 @@ def _decay_asymptote(tail: list[dict], tau_min: float) -> float | None:
 
 
 def _idle_rows(rows: list[dict]) -> list[dict]:
+    """Rows where the handle should sit at ambient + IDLE_OFFSET_C:
+    contactor open, no meaningful current, sensor sane (255 sentinel
+    excluded by the < 200 guard)."""
     return [
         row
         for row in rows

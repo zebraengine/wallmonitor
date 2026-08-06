@@ -104,6 +104,11 @@ TRIP_HANDLE_C = 65.0  # mirrors wallmonitor/thermal.py's TRIP_HANDLE_C (Gen 3, f
 
 @dataclass
 class Config:
+    """Tuning knobs, all CLI-overridable; defaults are the deployed values.
+    The asymmetry between capping (eager, trusts model basis too) and
+    restoring (cautious, trajectory-only, stepped, backed-off) is the point
+    — see the module docstring for the incidents behind it."""
+
     normal_amps: float = 48.0
     lead_time_min: float = 20.0
     confirm_ticks: int = 3
@@ -119,6 +124,10 @@ class Config:
 
 @dataclass
 class State:
+    """What survives between 30 s timer runs, via --state-file: the active
+    cap, the debounce streaks, which session state we last saw (so a new
+    session resets everything), and the restore-backoff bookkeeping."""
+
     capped: bool = False
     cap_value: float | None = None
     trip_streak: int = 0
@@ -130,6 +139,9 @@ class State:
 
 @dataclass
 class Action:
+    """decide()'s verdict: do nothing, or set the vehicle's charge current
+    to `value` amps. Every non-"none" Action carries a value."""
+
     kind: str  # "none" | "cap" | "restore"
     value: float | None = None
 
@@ -381,11 +393,14 @@ def decide(thermal: dict, state: State, cfg: Config) -> tuple[Action, State, str
 
 
 def fetch_thermal(base_url: str) -> dict:
+    """One /api/thermal snapshot — the sole input decide() ever sees."""
     with urllib.request.urlopen(f"{base_url}/api/thermal", timeout=10) as resp:
         return json.load(resp)
 
 
 def set_charging_amps(tesla_ble_url: str, amps: float) -> None:
+    """Apply an amp value through the ESPHome tesla-ble bridge's
+    charging_amps number entity (the least-privilege BLE pairing)."""
     req = urllib.request.Request(
         f"{tesla_ble_url}/number/charging_amps/set?value={amps:g}",
         data=b"",  # forces Content-Length: 0; the ESPHome web_server 411s without it
@@ -430,6 +445,8 @@ def post_event(base_url: str, kind: str, detail: dict) -> None:
 
 
 def load_state(path: str) -> State:
+    """State from disk, defaulting on a missing/corrupt file and ignoring
+    unknown fields — a daemon upgrade must never crash on old state."""
     try:
         with open(path) as fh:
             raw = json.load(fh)
@@ -440,6 +457,8 @@ def load_state(path: str) -> State:
 
 
 def save_state(path: str, state: State) -> None:
+    """Atomic write (tmp file + rename): a crash mid-write leaves the old
+    state intact rather than a torn file."""
     tmp = f"{path}.tmp"
     with open(tmp, "w") as fh:
         json.dump(asdict(state), fh)

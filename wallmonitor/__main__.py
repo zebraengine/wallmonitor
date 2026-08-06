@@ -1,4 +1,16 @@
-"""Entry point: wire up config, DB, poller, web UI (and simulator in demo mode)."""
+"""Entry point: wire up config, DB, poller, web UI (and simulator in demo mode).
+
+Component map — one process, one asyncio loop:
+
+    Wall Connector ──HTTP──▶ Poller ──writes──▶ Database (SQLite)
+                               │ └─publishes──▶ EventBus ──SSE──▶ browser
+                               └──POSTs──▶ notify webhook (optional, LAN)
+    browser ◀──JSON/static── web.make_app ◀──reads── Database
+
+The Poller owns all device I/O; the web layer only reads the DB (plus the
+poller's in-memory status), so a busy dashboard can never add load on the
+charger.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +30,11 @@ log = logging.getLogger("wallmonitor")
 
 
 async def run(argv: list[str] | None = None) -> None:
+    """Construct every component, serve until cancelled, unwind in order.
+
+    Shutdown order is deliberate: stop the poller first (the only writer),
+    then the web runner (readers), then the shared HTTP client, and close
+    the database last so nothing can touch a closed connection."""
     cfg = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
