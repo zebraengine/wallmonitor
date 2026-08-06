@@ -62,8 +62,9 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
    through `wallmonitor/alert_codes.json` — Tesla doesn't document the numeric
    codes the local API reports, so only verified entries are labeled; unknown
    codes render honestly with guidance (the Tesla app names active alerts —
-   confirm a code there, then add it to the JSON). The Alerts page includes
-   Tesla's official LED fault categories as a reference. The same
+   confirm a code there, then add it to the JSON). Tesla's official LED fault
+   categories live on their own reference page, linked from the Alerts page
+   so the event timeline stays one short scroll away. The same
    verify-before-label policy covers EVSE state names: states 1, 4, 9, and 11
    are named from telemetry cross-checked against vehicle presence, contactor,
    and power (the community-circulated names had 9 and 11 swapped), and the
