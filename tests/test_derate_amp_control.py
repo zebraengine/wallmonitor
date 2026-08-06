@@ -409,3 +409,24 @@ def test_confidence_guard_only_trusts_trajectory_basis():
     )
     action, state, _ = dac.decide(marginal_model, state, cfg)
     assert action.kind == "none" and not state.capped
+
+
+def test_event_for_cap_records_the_change_and_its_justification():
+    thermal = {
+        "current_a": 40.0,
+        "handle_c": 61.0,
+        "forecast": {"basis": "trajectory", "minutes_to_trip": 12.0, "steady_state_c": 67.0},
+    }
+    kind, detail = dac.event_for(dac.Action("cap", 32.0), "trip in 12min", thermal, dac.State())
+    assert kind == "amp_capped"
+    assert detail["from_a"] == 40.0 and detail["to_a"] == 32.0
+    assert detail["basis"] == "trajectory" and detail["minutes_to_trip"] == 12.0
+
+
+def test_event_for_restore_steps_from_the_active_cap_not_live_current():
+    # Live current can lag the cap (taper, sampling); the cap is what we set.
+    thermal = {"current_a": 30.7, "handle_c": 55.0, "forecast": {"basis": "trajectory", "steady_state_c": 58.0}}
+    prev = dac.State(capped=True, cap_value=32.0)
+    kind, detail = dac.event_for(dac.Action("restore", 34.0), "clear streak met", thermal, prev)
+    assert kind == "amp_restored"
+    assert detail["from_a"] == 32.0 and detail["to_a"] == 34.0

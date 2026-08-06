@@ -489,6 +489,17 @@ before evaluating anything else, so a stale cap can never silently persist
 into a session that never earned it. `journalctl -u derate-amp-control`
 shows each run's decision and reason.
 
+Every applied change is also recorded in the monitor's own event log:
+`amp_capped` / `amp_restored` events carry the from → to amps and the
+forecast numbers that justified the move, and appear on the Alerts & events
+timeline under "Alerts & thermal" (and on the live stream, like any other
+event). They arrive via `POST /api/events`, a write-only ingest allowlisted
+to the controller's event kinds — the controller narrates its actions
+without the timeline becoming a generic log sink. A BLE write that fails
+records `amp_adjust_failed`, so bridge flakiness shows up in the same place
+as the decisions it blocked. Recording is best-effort by design: the event
+log is observability, never control flow.
+
 **Checking whether it would actually help, before or after deploying it:**
 `contrib/backtest_derate_amp_control.py` replays `decide()` against real
 historical sessions read straight from `wallmonitor.db` (point it at a copy,
