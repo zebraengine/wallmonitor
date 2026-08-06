@@ -1612,28 +1612,11 @@ async function viewAlerts(root, rangeKey = "7d") {
   }
   root.append(wrap);
 
-  // Official fault categories (from Tesla's Gen 3 manual) as a reference —
-  // the numeric API codes themselves are undocumented by Tesla, so an
-  // unmapped code can be cross-read against the charger's LED blink pattern.
-  const cats = (alertCodes && alertCodes.categories) || [];
-  if (cats.length) {
-    root.append(el("h2", {}, "Alert reference — official fault categories"),
-      el("div", { class: "note" },
-        "Tesla documents Wall Connector faults by LED blink pattern, not by the numeric codes the local API reports. " +
-        "If an undocumented code appears here, check the charger's LED and the Tesla app (it names active alerts), " +
-        "then teach the monitor by adding the code to alert_codes.json."));
-    const rtbl = el("table", {},
-      el("thead", {}, el("tr", {}, el("th", {}, "LED"), el("th", {}, "Fault"), el("th", {}, "Meaning / action"))));
-    const rbody = el("tbody", {});
-    for (const category of cats) {
-      rbody.append(el("tr", {},
-        el("td", {}, category.led),
-        el("td", {}, category.label),
-        el("td", { style: "white-space:normal" }, category.description)));
-    }
-    rtbl.append(rbody);
-    root.append(el("div", { class: "tbl-wrap" }, rtbl));
-  }
+  // The official fault-category table is static reference material; it lives
+  // on its own page so the timeline below stays one short scroll away.
+  root.append(el("div", { class: "note" },
+    el("a", { href: "#/alerts/reference" }, "Alert reference — official fault categories →"),
+    " Tesla's LED blink patterns and what each fault means."));
 
   root.append(el("h2", {}, "Event timeline"),
     el("div", { class: "note" },
@@ -1738,6 +1721,35 @@ async function viewAlerts(root, rangeKey = "7d") {
 
 let lastViewKey = "";
 
+async function viewAlertReference(root) {
+  // Official fault categories (from Tesla's Gen 3 manual) as a reference —
+  // the numeric API codes themselves are undocumented by Tesla, so an
+  // unmapped code can be cross-read against the charger's LED blink pattern.
+  await loadAlertCodes(); // deep links can land here before the boot fetch resolves
+  root.append(el("div", { class: "note" }, el("a", { href: "#/alerts" }, "← Alerts & events")));
+  root.append(el("h2", {}, "Alert reference — official fault categories"),
+    el("div", { class: "note" },
+      "Tesla documents Wall Connector faults by LED blink pattern, not by the numeric codes the local API reports. " +
+      "If an undocumented code appears here, check the charger's LED and the Tesla app (it names active alerts), " +
+      "then teach the monitor by adding the code to alert_codes.json."));
+  const cats = (alertCodes && alertCodes.categories) || [];
+  if (!cats.length) {
+    root.append(el("div", { class: "empty" }, "No fault-category reference data available."));
+    return;
+  }
+  const rtbl = el("table", {},
+    el("thead", {}, el("tr", {}, el("th", {}, "LED"), el("th", {}, "Fault"), el("th", {}, "Meaning / action"))));
+  const rbody = el("tbody", {});
+  for (const category of cats) {
+    rbody.append(el("tr", {},
+      el("td", {}, category.led),
+      el("td", {}, category.label),
+      el("td", { style: "white-space:normal" }, category.description)));
+  }
+  rtbl.append(rbody);
+  root.append(el("div", { class: "tbl-wrap" }, rtbl));
+}
+
 async function render(view, arg) {
   if (cleanup) { try { cleanup(); } catch { /* noop */ } cleanup = null; }
   // Re-rendering the same view (live session refresh) must not move the
@@ -1750,8 +1762,9 @@ async function render(view, arg) {
   const root = $("#view");
   root.style.minHeight = sameView ? `${root.offsetHeight}px` : "";
   root.textContent = "";
+  const tabFor = view === "session" ? "sessions" : view === "alertref" ? "alerts" : view;
   document.querySelectorAll(".tabs a").forEach((tab) => {
-    tab.classList.toggle("active", tab.dataset.view === (view === "session" ? "sessions" : view));
+    tab.classList.toggle("active", tab.dataset.view === tabFor);
   });
   try {
     if (view === "live") cleanup = await viewLive(root);
@@ -1760,6 +1773,7 @@ async function render(view, arg) {
     else if (view === "energy") await viewEnergy(root, arg);
     else if (view === "wifi") await viewWifi(root, arg);
     else if (view === "alerts") await viewAlerts(root, arg);
+    else if (view === "alertref") await viewAlertReference(root);
   } catch (ex) {
     root.append(el("div", { class: "empty" }, `Failed to load: ${ex.message}`));
   }
@@ -1771,6 +1785,7 @@ function route() {
   const hash = location.hash || "#/live";
   const parts = hash.replace(/^#\//, "").split("/");
   if (parts[0] === "sessions" && parts[1]) render("session", parts[1]);
+  else if (parts[0] === "alerts" && parts[1] === "reference") render("alertref");
   else if (["live", "sessions", "energy", "wifi", "alerts"].includes(parts[0])) render(parts[0]);
   else render("live");
 }
