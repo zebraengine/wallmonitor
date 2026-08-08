@@ -17,8 +17,11 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
 - Full-fidelity recording — every response stored with its complete raw JSON
 - Live dashboard (SSE) with rolling charts and an active-alert banner,
   including a live derate-forecast chart: the measured handle temperature
-  against the model's projected plateau and the trip threshold, updated with
-  every 30 s forecast tick — the same values the amp controller acts on
+  against the model's projected plateau and the trip threshold, with the
+  projection drawn forward past "now" so the predicted trip intercept is
+  visible on the chart itself. Every 30 s forecast tick — the same values
+  the amp controller acts on — is recorded (`forecast_samples`) and served
+  at `GET /api/forecasts`, so the prediction history survives reloads
 - Session review: energy, peak/average power, per-phase telemetry, drillable charts
 - Event timeline with range presets, category filters, and paging
 - Alert decoding and EVSE-state labels, each marked verified vs community-reported

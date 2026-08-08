@@ -154,6 +154,16 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
         history = await asyncio.to_thread(db.alerts_range, t_from, t_to)
         return web.json_response({"active": active, "history": history})
 
+    async def api_forecasts(request: web.Request) -> web.Response:
+        """Recorded derate-forecast snapshots — what the model said at each
+        30 s charging tick, i.e. exactly what the amp controller saw. Seeds
+        the live chart's prediction history across reloads and tab switches."""
+        now = time.time()
+        t_from = _float_q(request, "from", now - 24 * 3600)
+        t_to = _float_q(request, "to", now)
+        rows = await asyncio.to_thread(db.forecast_range, t_from, t_to)
+        return web.json_response({"from": t_from, "to": t_to, "samples": rows})
+
     async def api_events(request: web.Request) -> web.Response:
         """Event log, newest first; ?kinds=a,b,c filters server-side so the
         timeline's category chips don't pull thousands of unwanted rows."""
@@ -361,6 +371,7 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
     app.router.add_delete("/api/thermal/baseline-anchor", api_baseline_anchor)
     app.router.add_post("/api/ambient", api_ambient_ingest)
     app.router.add_get("/api/ambient", api_ambient_history)
+    app.router.add_get("/api/forecasts", api_forecasts)
     app.router.add_get("/api/events", api_events)
     app.router.add_post("/api/events", api_event_ingest)
     app.router.add_get("/api/stream", api_stream)
