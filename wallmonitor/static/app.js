@@ -836,10 +836,22 @@ async function viewLive(root) {
     const amb = await getJSON(`/api/ambient?from=${now - 900}&to=${now}`);
     abuf = ambientRows(amb.samples || []);
   } catch { /* no ambient feed yet */ }
-  // Forecast snapshots: one point per 30 s poller tick (SSE), with the 60 s
-  // /api/thermal poll as fallback. Nothing server-side stores these, so the
-  // series builds from view-mount onward.
+  // Forecast snapshots: one point per 30 s poller tick, seeded from the
+  // recorded history (so the prediction line survives tab switches and
+  // reloads) and then extended live by SSE thermal frames, with the 60 s
+  // /api/thermal poll as fallback.
   let tbuf = [];
+  try {
+    const fc = await getJSON(`/api/forecasts?from=${now - 900}&to=${now}`);
+    // insufficient-basis ticks are recorded for fidelity but carry no
+    // chartable plateau — filter them here exactly as pushThermal does, so
+    // every tbuf entry has a steady value the chart and sub-line rely on.
+    tbuf = (fc.samples || []).filter((row) => row.steady_state_c != null).map((row) => ({
+      ts: row.ts, steady: row.steady_state_c, willTrip: row.will_trip,
+      mtt: row.minutes_to_trip, basis: row.basis, suggested: row.suggested_max_a,
+      rmse: row.fit_rmse_c, trip: row.trip_c, tau: row.tau_min, tripTs: row.trip_ts,
+    }));
+  } catch { /* server predates forecast recording */ }
 
   function renderTiles(sample) {
     tiles.textContent = "";
@@ -1066,7 +1078,11 @@ async function viewLive(root) {
       const trip = latest.trip ?? HANDLE_TRIP_C;
       const margin = trip - latest.steady;
       const sigma = latest.rmse > 0 ? margin / latest.rmse : null;
-      sub.textContent = `${latest.basis} basis · plateau ~${fmtNum(latest.steady, 1)} °C · margin to trip ${fmtNum(margin, 1)} °C` +
+      // A plateau below the live handle means the projection points DOWN —
+      // typically right after the amp controller cut current. Name it, so a
+      // descending dashed curve reads as recovery rather than a glitch.
+      const recovering = anchor && anchor.tHandle != null && latest.steady < anchor.tHandle - 0.3;
+      sub.textContent = `${latest.basis} basis · ${recovering ? "recovering, settling toward" : "plateau"} ~${fmtNum(latest.steady, 1)} °C · margin to trip ${fmtNum(margin, 1)} °C` +
         (sigma != null ? ` = ${fmtNum(sigma, 0)}× the model's fit noise` +
           (sigma < 2 ? " — inside the controller's 2× guard band, treated as trip risk" : "") : "") + ".";
     }

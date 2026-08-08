@@ -492,10 +492,11 @@ class Poller:
             return
         if out.get("state") != "charging":
             return
-        # Every computed forecast goes to the live stream, not just alert
-        # edges — the dashboard charts the same values the amp controller
-        # acts on, at the cadence it sees them.
+        # Every computed forecast is recorded and streamed, not just alert
+        # edges — these are the values the amp controller acts on, and the
+        # recorded history is what re-seeds the live chart across reloads.
         self.bus.publish({"type": "thermal", **out})
+        await asyncio.to_thread(self.db.insert_forecast, ts, out, self._session_id)
         forecast = out.get("forecast") or {}
         will_trip = forecast.get("will_trip")
         minutes = forecast.get("minutes_to_trip")

@@ -127,6 +127,25 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS forecast_samples (
+    id INTEGER PRIMARY KEY,
+    ts REAL NOT NULL,
+    session_id INTEGER,
+    basis TEXT,
+    steady_state_c REAL,
+    will_trip INTEGER,
+    minutes_to_trip REAL,
+    trip_ts REAL,
+    suggested_max_a REAL,
+    handle_c REAL,
+    current_a REAL,
+    tau_min REAL,
+    fit_rmse_c REAL,
+    trip_c REAL,
+    raw TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_forecast_ts ON forecast_samples(ts);
+
 CREATE TABLE IF NOT EXISTS ambient_samples (
     id INTEGER PRIMARY KEY,
     ts REAL NOT NULL,
@@ -371,6 +390,49 @@ class Database:
                 (ts, ts, alert, source),
             )
             return cur.rowcount > 0
+
+    def insert_forecast(self, ts: float, out: dict, session_id: int | None = None) -> int:
+        """Store one computed derate forecast (the poller's 30 s tick while
+        charging) — the same values the amp controller acts on. Extracted
+        columns plus the complete payload as raw JSON, like every other
+        sample table."""
+        forecast = out.get("forecast") or {}
+        model = out.get("model") or {}
+        will_trip = forecast.get("will_trip")
+        with self._lock:
+            cur = self._execute(
+                """INSERT INTO forecast_samples
+                   (ts, session_id, basis, steady_state_c, will_trip, minutes_to_trip,
+                    trip_ts, suggested_max_a, handle_c, current_a, tau_min, fit_rmse_c, trip_c, raw)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    ts,
+                    session_id,
+                    forecast.get("basis"),
+                    forecast.get("steady_state_c"),
+                    None if will_trip is None else int(will_trip),
+                    forecast.get("minutes_to_trip"),
+                    forecast.get("trip_ts"),
+                    forecast.get("suggested_max_a"),
+                    out.get("handle_c"),
+                    out.get("current_a"),
+                    model.get("tau_min"),
+                    model.get("fit_rmse_c"),
+                    model.get("trip_c"),
+                    json.dumps(out),
+                ),
+            )
+            return cur.lastrowid or 0
+
+    def forecast_range(self, t_from: float, t_to: float, limit: int = 2000) -> list[dict]:
+        """Forecast snapshots in a window, oldest first, columns only (the
+        raw payload stays queryable but is not shipped to the chart)."""
+        return self._rows(
+            """SELECT ts, session_id, basis, steady_state_c, will_trip, minutes_to_trip,
+                      trip_ts, suggested_max_a, handle_c, current_a, tau_min, fit_rmse_c, trip_c
+               FROM forecast_samples WHERE ts >= ? AND ts <= ? ORDER BY ts LIMIT ?""",
+            (t_from, t_to, limit),
+        )
 
     def insert_ambient(self, ts: float, temp_c: float, humidity_pct: float | None = None,
                        pressure_hpa: float | None = None, raw: dict | None = None,

@@ -1069,6 +1069,12 @@ async def test_derate_forecast_warns_then_clears(db):
         assert frame["type"] == "thermal" and frame["state"] == "charging"
         assert frame["forecast"]["will_trip"] is True
         assert frame["model"]["trip_c"] == thermal.TRIP_HANDLE_C
+        # ...and recorded, so the chart can re-seed its history on mount.
+        recorded = db.forecast_range(now - 1, now + 1)
+        assert len(recorded) == 1
+        assert recorded[0]["will_trip"] == 1
+        assert recorded[0]["steady_state_c"] == frame["forecast"]["steady_state_c"]
+        assert recorded[0]["tau_min"] == frame["model"]["tau_min"]
         alerts = db.active_alerts()
         assert any(a["alert"] == thermal.DERATE_ALERT and a["source"] == "monitor" for a in alerts)
         events = db.events_range(now - 1, now + 1, kinds=["derate_warning"])
@@ -1115,6 +1121,25 @@ async def test_event_ingest_records_amp_controller_actions(db):
     assert _json.loads(events[0]["detail"])["to_a"] == 32.0
     frame = queue.get_nowait()
     assert frame["type"] == "event" and frame["kind"] == "amp_capped"
+
+
+async def test_forecasts_api_serves_recorded_snapshots(db):
+    now = time.time()
+    out = {
+        "state": "charging", "handle_c": 55.0, "current_a": 40.0,
+        "model": {"tau_min": 10.5, "fit_rmse_c": 0.3, "trip_c": 65.0},
+        "forecast": {"basis": "trajectory", "steady_state_c": 62.0, "will_trip": False,
+                     "minutes_to_trip": None, "trip_ts": None},
+    }
+    db.insert_forecast(now - 60, out, session_id=7)
+    app = make_app(db, EventBus(), None)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(f"/api/forecasts?from={now - 900}&to={now}")
+        data = await resp.json()
+    assert resp.status == 200 and len(data["samples"]) == 1
+    row = data["samples"][0]
+    assert row["steady_state_c"] == 62.0 and row["will_trip"] == 0
+    assert row["tau_min"] == 10.5 and row["session_id"] == 7
 
 
 async def test_notify_webhook_posts_actionable_warning(db):
