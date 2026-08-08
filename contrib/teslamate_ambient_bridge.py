@@ -51,6 +51,9 @@ TEMP_MIN_C, TEMP_MAX_C = -40.0, 85.0
 
 @dataclass
 class Reading:
+    """One outside-temperature report from TeslaMate: when, what, and where
+    (position may be absent — TeslaMate doesn't attach one to every row)."""
+
     ts: float
     temp_c: float
     lat: float | None
@@ -59,6 +62,10 @@ class Reading:
 
 @dataclass
 class Config:
+    """Gating parameters for decide(); the defaults encode the physics:
+    drive_cooldown_s covers the sensor housing's post-drive heat soak, and
+    max_age_s bounds how stale a parked car's last report may be."""
+
     car_id: int
     max_age_s: float = 600.0
     drive_cooldown_s: float = 2700.0
@@ -67,6 +74,7 @@ class Config:
 
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in meters — the am-I-home test."""
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlam = math.radians(lon2 - lon1)
@@ -115,6 +123,8 @@ def decide(
 
 
 def _psql(psql_cmd: list[str], sql: str) -> list[list[str]]:
+    """Run one statement through the configured psql command (docker exec
+    by default); rows come back as lists of pipe-split strings."""
     out = subprocess.run(
         psql_cmd + ["-t", "-A", "-F", "|", "-c", sql],
         capture_output=True, text=True, timeout=30, check=True,
@@ -123,6 +133,7 @@ def _psql(psql_cmd: list[str], sql: str) -> list[list[str]]:
 
 
 def _reading_rows(rows: list[list[str]]) -> Reading | None:
+    """First parseable row as a Reading; position columns are optional."""
     for row in rows:
         try:
             ts, temp = float(row[0]), float(row[1])
@@ -156,6 +167,8 @@ def fetch_readings(psql_cmd: list[str], car_id: int) -> list[Reading | None]:
 
 
 def fetch_drive_state(psql_cmd: list[str], car_id: int) -> tuple[float, bool]:
+    """(epoch of the last drive's end, drive in progress now). An open
+    drive older than 6 h is presumed a crashed recording, not a drive."""
     rows = _psql(psql_cmd, (
         "SELECT coalesce(extract(epoch from max(end_date)), 0), "
         "count(*) FILTER (WHERE end_date IS NULL AND start_date > now() - interval '6 hours') "
@@ -167,6 +180,8 @@ def fetch_drive_state(psql_cmd: list[str], car_id: int) -> tuple[float, bool]:
 
 
 def fetch_geofence(psql_cmd: list[str], name: str) -> tuple[float, float, float]:
+    """(lat, lon, radius_m) of a named TeslaMate geofence — how home stays
+    on-box instead of in a flag, a repo, or this chat."""
     quoted = name.replace("'", "''")
     rows = _psql(psql_cmd, (
         "SELECT latitude, longitude, radius FROM geofences "
@@ -182,6 +197,8 @@ def fetch_geofence(psql_cmd: list[str], name: str) -> tuple[float, float, float]
 
 
 def wallmonitor_plugged_in(base_url: str) -> bool:
+    """Fallback home test when no geofence/coords are configured: a car
+    plugged into this Wall Connector is, by definition, home."""
     try:
         with urllib.request.urlopen(f"{base_url}/api/status", timeout=10) as resp:
             status = json.load(resp)
@@ -191,6 +208,8 @@ def wallmonitor_plugged_in(base_url: str) -> bool:
 
 
 def post_reading(base_url: str, temp_c: float) -> dict:
+    """POST one reading to /api/ambient as source "car" (the tier a
+    stationary sensor outranks). Position never leaves this process."""
     req = urllib.request.Request(
         f"{base_url}/api/ambient",
         data=json.dumps({"temp_c": round(temp_c, 2), "source": "car"}).encode(),

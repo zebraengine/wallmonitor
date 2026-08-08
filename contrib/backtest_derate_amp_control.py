@@ -52,6 +52,8 @@ POLL_INTERVAL_S = 30.0
 
 @dataclass
 class Event:
+    """One real alert-40 and the charging session that contains it."""
+
     alert_id: int
     trip_ts: float
     session_id: int
@@ -60,6 +62,8 @@ class Event:
 
 
 def real_trip_events(db: Database, t_from: float, t_to: float) -> list[Event]:
+    """Every recorded alert 40 in the window, matched to its enclosing
+    session (skipped, loudly, if no session contains it)."""
     events = []
     for row in db.alerts_range(t_from, t_to):
         if row.get("alert") != "40":
@@ -88,6 +92,10 @@ def nearest_predicted_alert(db: Database, trip_ts: float) -> float | None:
 
 
 def replay(db: Database, event: Event, cfg: Config, poll_interval_s: float) -> dict:
+    """Re-live one real derate: fit the model as of just before the session
+    started (nothing later may leak into its own baseline), then step
+    predict() + decide() at the daemon's cadence from session start through
+    the trip. Returns the first cap tick (if any) and comparison data."""
     fits = thermal.fit_sessions(db, event.session_start - 1)
     params = thermal.fit_history(db, event.session_start - 1, fits=fits)
 

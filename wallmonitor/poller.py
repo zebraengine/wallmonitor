@@ -44,6 +44,9 @@ class EventBus:
         self._subscribers: set[asyncio.Queue] = set()
 
     def subscribe(self) -> asyncio.Queue:
+        """New bounded queue receiving every published message from now on.
+        The bound (500) is the contract: a subscriber that stops draining
+        gets dropped by publish() rather than allowed to grow unbounded."""
         queue: asyncio.Queue = asyncio.Queue(maxsize=500)
         self._subscribers.add(queue)
         return queue
@@ -52,6 +55,7 @@ class EventBus:
         self._subscribers.discard(queue)
 
     def publish(self, message: dict) -> None:
+        """Fan one message out to every subscriber, never blocking."""
         for queue in list(self._subscribers):
             try:
                 queue.put_nowait(message)
@@ -61,6 +65,9 @@ class EventBus:
 
 
 def _total_power(raw: dict, split_phase: bool) -> float | None:
+    """Instantaneous vehicle power (W) from one vitals body: grid_v ×
+    vehicle_current for a North American split-phase install, else the sum
+    of per-phase V×I. None when fields are missing (device still booting)."""
     try:
         if split_phase:
             return round(raw["grid_v"] * raw["vehicle_current_a"], 1)
@@ -75,6 +82,20 @@ def _total_power(raw: dict, split_phase: bool) -> float | None:
 
 
 class Poller:
+    """The single owner of all Wall Connector I/O.
+
+    One asyncio task polls the four device endpoints on their own cadences,
+    stores every response, derives events/alerts by diffing against the
+    previous sample, runs the in-line derate forecast, and publishes live
+    frames on the EventBus. The web layer never talks to the charger — it
+    reads the DB and this object's status() — so dashboard load can never
+    add device load.
+
+    Threading model: everything here runs on the event loop; the only
+    blocking work (SQLite) hops to a worker thread via asyncio.to_thread,
+    which is safe because Database serializes access internally.
+    """
+
     def __init__(self, cfg: Config, db: Database, bus: EventBus, session: aiohttp.ClientSession):
         self.cfg = cfg
         self.db = db
@@ -106,6 +127,7 @@ class Poller:
     # ---------- lifecycle ----------
 
     async def start(self) -> None:
+        """Reconcile persisted state with reality, then launch the poll task."""
         now = time.time()
         await asyncio.to_thread(self._startup_reconcile, now)
         self._task = asyncio.create_task(self._run(), name="wallmonitor-poller")
@@ -115,6 +137,11 @@ class Poller:
     GAP_THRESHOLD_S = 120.0
 
     def _startup_reconcile(self, now: float) -> None:
+        """Runs once (in a thread) before the first poll: record any
+        monitoring gap plus monitor_start, adopt a session the previous run
+        left open (its legitimacy is verified against the charger's own
+        session timer on the first sample), and re-latch alerts that were
+        active when the last run exited so they clear on real edges."""
         last = self.db.last_activity_ts()
         if last is not None and now - last > self.GAP_THRESHOLD_S:
             self.db.add_event(
@@ -134,6 +161,7 @@ class Poller:
                 self._derate_active = True
 
     async def stop(self) -> None:
+        """Signal the loop, wait for it to finish, record monitor_stop."""
         self._stop.set()
         task = getattr(self, "_task", None)
         if task:
@@ -141,6 +169,9 @@ class Poller:
         await asyncio.to_thread(self.db.add_event, time.time(), "monitor_stop", None)
 
     async def _run(self) -> None:
+        """The scheduler loop. Each endpoint has a next-due timestamp; every
+        iteration polls at most one (most overdue first), then sleeps until
+        the earliest due time, capped at 1 s so stop() stays responsive."""
         handlers = {
             "vitals": self._handle_vitals,
             "wifi": self._handle_wifi,
@@ -166,6 +197,8 @@ class Poller:
     # ---------- polling core ----------
 
     def _base_interval(self, endpoint: str) -> float:
+        """Healthy poll interval for an endpoint; vitals is the only one
+        that adapts (tight while a vehicle is attached)."""
         if endpoint == "vitals":
             active = bool(self._prev_vitals and self._prev_vitals.get("vehicle_connected"))
             return self.cfg.vitals_interval_active if active else self.cfg.vitals_interval_idle
@@ -176,6 +209,11 @@ class Poller:
         return self.cfg.version_interval
 
     async def _poll(self, endpoint: str, handler) -> None:
+        """One request → handler cycle. Success resets that endpoint's
+        backoff and clears any 'unreachable' alert (recovery, or first
+        success of a run whose predecessor died offline). A handler
+        exception is logged with the raw body but never kills the loop —
+        one malformed response must not stop recording."""
         try:
             raw = await self.wc.api.async_request(endpoint if endpoint != "wifi" else "wifi_status")
         except (WallConnectorError, aiohttp.ClientError, OSError, asyncio.CancelledError) as ex:
@@ -204,6 +242,11 @@ class Poller:
             log.exception("handler for %s failed; raw=%s", endpoint, json.dumps(raw)[:500])
 
     async def _on_poll_error(self, endpoint: str, ex: Exception) -> None:
+        """Back the failing endpoint off exponentially (factor^streak, capped)
+        and, on the third consecutive vitals failure, declare the device
+        offline: raise the alert, record the event, notify. Three failures
+        ≈ seconds of outage — early enough to matter, late enough that one
+        dropped packet doesn't page anyone."""
         ts = time.time()
         streak = self._fail_streak[endpoint] = self._fail_streak[endpoint] + 1
         base = self._base_interval(endpoint)
@@ -229,6 +272,16 @@ class Poller:
     # ---------- handlers ----------
 
     async def _handle_vitals(self, ts: float, raw: dict) -> None:
+        """The heart of the monitor: store one vitals sample and derive
+        everything stateful by diffing against the previous one.
+
+        Events that originate here: charger_reboot (uptime went backwards),
+        session_start/session_end (vehicle_connected edges, with backdating
+        from the charger's session timer), charging_start/charging_stop
+        (contactor edges), evse_state_change, evse_not_ready_change, and
+        alert_raised/alert_cleared (current_alerts set-diff). Order at the
+        end matters: store the sample, run the derate forecast (which may
+        publish a thermal frame), then publish the vitals frame."""
         prev = self._prev_vitals
         power = _total_power(raw, self.cfg.split_phase)
 
@@ -332,6 +385,8 @@ class Poller:
         )
 
     async def _handle_wifi(self, ts: float, raw: dict) -> None:
+        """Store a Wi-Fi sample; derive connect/disconnect and internet
+        lost/restored events (plus the Wi-Fi alert) from edges."""
         prev = self._prev_wifi
         if prev is not None:
             if bool(raw.get("wifi_connected")) != bool(prev.get("wifi_connected")):
@@ -358,6 +413,8 @@ class Poller:
         self.bus.publish({"type": "lifetime", "ts": ts, "data": raw})
 
     async def _handle_version(self, ts: float, raw: dict) -> None:
+        """Store version info only when it changed (it's polled every 6 h
+        but almost never differs), and event on firmware changes."""
         latest = await asyncio.to_thread(self.db.latest_version)
         if latest is not None and latest.get("firmware_version") != raw.get("firmware_version"):
             await self._event(
@@ -473,6 +530,7 @@ class Poller:
             await self._clear_derate(ts)
 
     async def _clear_derate(self, ts: float) -> None:
+        """Clear the derate warning once (edge-triggered via _derate_active)."""
         if not self._derate_active:
             return
         self._derate_active = False
@@ -545,12 +603,16 @@ class Poller:
             log.debug("notify webhook failed: %s", ex)
 
     async def _event(self, ts: float, kind: str, detail: dict | None) -> None:
+        """Record an event and publish it live — the one path every poller
+        event takes, so the DB and the SSE stream can never disagree."""
         await asyncio.to_thread(self.db.add_event, ts, kind, detail)
         self.bus.publish({"type": "event", "ts": ts, "kind": kind, "detail": detail})
 
     # ---------- status ----------
 
     def status(self) -> dict[str, Any]:
+        """Live poller state for /api/status (the header's online dot and
+        the footer's "watching …" line)."""
         return {
             "host": self.cfg.host,
             "offline": self._offline,

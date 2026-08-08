@@ -29,6 +29,12 @@ CYCLE = [
 
 
 class SimState:
+    """The simulated world, derived purely from the wall clock.
+
+    Phase comes from elapsed-time-modulo-cycle (× speedup), so there is no
+    background task to run or state to advance — every request computes the
+    world as of "now", and a test can pin `start` to make it deterministic."""
+
     def __init__(self, speedup: float = 1.0, start: float | None = None):
         self.t0 = start if start is not None else time.time()
         self.speedup = speedup
@@ -54,6 +60,10 @@ class SimState:
         return "idle", 0.0, cycle_n
 
     def vitals(self) -> dict:
+        """Synthesize a /api/1/vitals body for the current phase: current
+        ramps in and tapers, the handle warms while charging, and a device
+        alert appears mid-charge from the Nth cycle on so alert plumbing
+        gets exercised without waiting for real trouble."""
         name, into, cycle_n = self.phase()
         rng = self.rng
         grid_v = 230.0 + rng.uniform(-1.5, 1.5)
@@ -162,6 +172,8 @@ class SimState:
 
 
 def make_app(state: SimState | None = None) -> web.Application:
+    """The four real device endpoints; vitals additionally reproduces the
+    firmware's occasional literal-nan JSON quirk."""
     state = state or SimState()
     app = web.Application()
 
