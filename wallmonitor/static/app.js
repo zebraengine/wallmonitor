@@ -427,6 +427,22 @@ function lineChart(box, opts) {
     root.append(refLabel);
   }
 
+  // Vertical rules (e.g. the now-line separating measured past from
+  // projected future) — same layer as refLines: above data, below crosshair.
+  for (const vline of opts.vlines || []) {
+    const x = xOf(vline.ts);
+    if (x < margin.left || x > width - margin.right) continue;
+    root.append(svg("line", {
+      x1: x, x2: x, y1: margin.top, y2: margin.top + ph,
+      stroke: "var(--baseline)", "stroke-width": 1, "stroke-dasharray": "4 3",
+    }));
+    if (vline.label) {
+      const vlabel = svg("text", { x: x + 4, y: margin.top + 10, class: "axis-text" });
+      vlabel.textContent = vline.label;
+      root.append(vlabel);
+    }
+  }
+
   const cross = svg("line", { x1: 0, x2: 0, y1: margin.top, y2: margin.top + ph, stroke: "var(--baseline)", "stroke-width": 1, visibility: "hidden" });
   root.append(cross);
   const dots = series.map((dataset) => {
@@ -965,35 +981,63 @@ async function viewLive(root) {
     tbuf.push({
       ts, steady: forecast.steady_state_c, willTrip: forecast.will_trip,
       mtt: forecast.minutes_to_trip, basis: forecast.basis, suggested: forecast.suggested_max_a,
-      rmse: model.fit_rmse_c, trip: model.trip_c,
+      rmse: model.fit_rmse_c, trip: model.trip_c, tau: model.tau_min, tripTs: forecast.trip_ts,
     });
     const cutoff = Date.now() / 1000 - 960;
     while (tbuf.length && tbuf[0].ts < cutoff) tbuf.shift();
   }
 
+  // How far past "now" the projection curve extends. 20 min matches the
+  // controller's lead-time horizon, so by the time a predicted trip is
+  // actionable its intercept with the trip line is on screen.
+  const FORECAST_FUTURE_S = 1200;
+
   function renderForecast() {
-    const xTo = Date.now() / 1000;
-    const xFrom = xTo - 900;
+    const now = Date.now() / 1000;
+    const xFrom = now - 900;
+    const latest = tbuf[tbuf.length - 1];
+    // Project forward only with a live forecast AND a live handle sample to
+    // anchor the curve on — otherwise the future region would extrapolate
+    // from stale data and the chart falls back to its measured-only layout.
+    const anchor = buf.length ? buf[buf.length - 1] : null;
+    const projecting = Boolean(
+      latest && now - latest.ts <= 180 && latest.steady != null && latest.tau > 0 &&
+      anchor && anchor.tHandle != null && now - anchor.ts <= 120
+    );
+    const series = [
+      { name: "Plug handle", color: colors.s2, points: buf.filter((sample) => sample.ts >= xFrom).map((sample) => [sample.ts, sample.tHandle]) },
+      { name: "Projected plateau", color: colors.s5, dash: "6 4", points: tbuf.map((point) => [point.ts, point.steady]) },
+      { name: "Garage ambient", color: colors.s3, points: abuf.filter((point) => point[0] >= xFrom) },
+    ];
+    if (projecting) {
+      // The model's own forward path from the newest measured sample:
+      // T(t) = plateau − (plateau − T_now)·e^(−t/τ). Where this curve meets
+      // the 65 °C line IS the predicted trip moment — the intercept is the
+      // whole point of extending the axis into the future.
+      const tauS = latest.tau * 60;
+      const pts = [];
+      for (let dt = 0; dt <= FORECAST_FUTURE_S; dt += 30) {
+        pts.push([now + dt, latest.steady - (latest.steady - anchor.tHandle) * Math.exp(-dt / tauS)]);
+      }
+      series.push({ name: "Projected path", color: colors.s5, dash: "2 4", points: pts });
+    }
     lineChart(fcast.box, {
-      series: [
-        { name: "Plug handle", color: colors.s2, points: buf.filter((sample) => sample.ts >= xFrom).map((sample) => [sample.ts, sample.tHandle]) },
-        { name: "Projected plateau", color: colors.s5, dash: "6 4", points: tbuf.map((point) => [point.ts, point.steady]) },
-        { name: "Garage ambient", color: colors.s3, points: abuf.filter((point) => point[0] >= xFrom) },
-      ],
-      unit: "°C", digits: 1, xFrom, xTo, height: 210,
+      series,
+      unit: "°C", digits: 1, xFrom, xTo: projecting ? now + FORECAST_FUTURE_S : now, height: 210,
       refLines: [
         { value: HANDLE_TRIP_C, label: `${HANDLE_TRIP_C}°C handle → alert 40 derate` },
         { value: HANDLE_CLEAR_C, label: `${HANDLE_CLEAR_C}°C → clears`, below: true },
       ],
+      vlines: projecting ? [{ ts: now, label: "now" }] : [],
     });
     // The sub line spells out the same arithmetic the amp controller's
     // confidence guard runs: margin to trip, measured in fit-noise units.
     const sub = fcast.card.querySelector(".chart-sub");
-    const latest = tbuf[tbuf.length - 1];
-    if (!latest || xTo - latest.ts > 180) {
+    if (!latest || now - latest.ts > 180) {
       sub.textContent = "The dashed plateau appears while charging — recomputed every 30 s from the handle's live trajectory. Solid lines are measured.";
     } else if (latest.willTrip) {
       sub.textContent = `Projected to reach ${fmtNum(latest.trip ?? HANDLE_TRIP_C, 0)} °C in ~${fmtNum(latest.mtt, 0)} min` +
+        (latest.tripTs ? ` (≈ ${fmtT(latest.tripTs).slice(0, 5)})` : "") +
         (latest.suggested ? ` — capping at ≤ ${fmtNum(latest.suggested, 0)} A avoids the derate.` : ".");
     } else {
       const trip = latest.trip ?? HANDLE_TRIP_C;
