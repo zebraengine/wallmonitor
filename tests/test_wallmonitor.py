@@ -326,7 +326,7 @@ def _seed_idle(db, t_from, t_to, ambient_c, dt=10.0):
     while ts < t_to:
         db.insert_vitals(ts, {
             "vehicle_connected": 0, "contactor_closed": 0, "vehicle_current_a": 0.0,
-            "handle_temp_c": round(ambient_c + thermal.IDLE_OFFSET_C, 2),
+            "handle_temp_c": round(thermal.idle_handle_c(ambient_c), 2),
             "pcba_temp_c": 38.0, "mcu_temp_c": 46.0,
         }, None, 0.0)
         ts += dt
@@ -345,7 +345,7 @@ def _seed_thermal_session(db, start_ts, ambient_c, tau_s=720.0, rise_ref_c=36.0,
     """
     _seed_idle(db, start_ts - 1800, start_ts, ambient_c, dt)
     sid = db.start_session(start_ts)
-    t0_temp = ambient_c + thermal.IDLE_OFFSET_C
+    t0_temp = thermal.idle_handle_c(ambient_c)
     rise_at = rise_ref_c * (amps / thermal.REF_CURRENT_A) ** 2
     temp = t0_temp
     ts = start_ts
@@ -364,7 +364,7 @@ def _seed_thermal_session(db, start_ts, ambient_c, tau_s=720.0, rise_ref_c=36.0,
     db.close_session(sid, start_ts + charge_s, "vehicle_disconnected")
     ambient_final = ambient_end_c if ambient_end_c is not None else ambient_c
     while ts <= start_ts + charge_s + cooldown_s:
-        temp += dt * ((ambient_final + thermal.IDLE_OFFSET_C - temp) / tau_s)
+        temp += dt * ((thermal.idle_handle_c(ambient_final) - temp) / tau_s)
         db.insert_vitals(ts, {
             "vehicle_connected": 0, "contactor_closed": 0, "vehicle_current_a": 0.0,
             "handle_temp_c": round(temp, 3), "pcba_temp_c": 45.0, "mcu_temp_c": 48.0,
@@ -590,7 +590,7 @@ async def test_thermal_fit_covers_late_charging_segments(db):
     ambient, tau_s, rise, amps = 23.0, 720.0, 36.0, 48.6
     _seed_idle(db, start - 1800, start, ambient)
     sid = db.start_session(start)
-    t0_temp = ambient + thermal.IDLE_OFFSET_C
+    t0_temp = thermal.idle_handle_c(ambient)
     t_inf = ambient + rise * (amps / thermal.REF_CURRENT_A) ** 2
 
     def charge(seg_start, seg_len):
@@ -609,7 +609,7 @@ async def test_thermal_fit_covers_late_charging_segments(db):
         while ts < t_to:
             db.insert_vitals(ts, {
                 "vehicle_connected": 1, "contactor_closed": 0, "vehicle_current_a": 0.0,
-                "handle_temp_c": round(ambient + thermal.IDLE_OFFSET_C, 2),
+                "handle_temp_c": round(thermal.idle_handle_c(ambient), 2),
                 "pcba_temp_c": 38.0, "mcu_temp_c": 46.0,
             }, sid, 0.0)
             ts += 10.0
@@ -643,7 +643,7 @@ async def test_thermal_fit_cooldown_tail_ambient(db):
     now = time.time()
     start = now - 3 * 3600
     ambient, tau_s, rise, amps = 25.0, 720.0, 36.0, 48.6
-    idle_temp = ambient + thermal.IDLE_OFFSET_C
+    idle_temp = thermal.idle_handle_c(ambient)
     t_inf = ambient + rise * (amps / thermal.REF_CURRENT_A) ** 2
     _seed_idle(db, start - 1800, start, ambient)
     sid = db.start_session(start)
@@ -1046,7 +1046,7 @@ async def test_derate_forecast_warns_then_clears(db):
     now = time.time()
     ambient, tau_s, amps = 33.0, 720.0, 48.0
     t_inf = ambient + thermal.DEFAULT_RISE_REF_C  # 69 °C steady state at 48 A
-    t0_temp = ambient + thermal.IDLE_OFFSET_C
+    t0_temp = thermal.idle_handle_c(ambient)
     start = now - 810.0
     ts = start
     while ts <= now:

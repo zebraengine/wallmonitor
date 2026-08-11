@@ -12,10 +12,14 @@ toward a steady state that sits a roughly constant rise above ambient:
     T(t) = T_inf - (T_inf - T0) * exp(-t / tau)
     T_inf = ambient + rise_ref * (I / REF_CURRENT_A)^2   (resistive heating)
 
-and at idle the handle settles ~2 C above ambient, so the charger doubles
-as its own ambient thermometer. tau and rise_ref are fitted per install
-from recorded sessions; the defaults come from a verified alert-40 event
-where the fit reproduced the observed time-to-trip within 1%.
+and at idle the handle settles a small offset above ambient, so the charger
+doubles as its own ambient thermometer. The offset is not constant: measured
+against a week of LAN ambient-sensor overlap it shrinks as the garage warms
+(~2.3 C on cool nights, ~0.7 C on hot afternoons; see idle_offset_c), so the
+proxy models it as linear in ambient, clamped to the calibrated range. tau
+and rise_ref are fitted per install from recorded sessions; the defaults
+come from a verified alert-40 event where the fit reproduced the observed
+time-to-trip within 1%.
 
 The unit of thermal analysis is the load window — the stretch where current
 actually flows — not the plug-in session. Ambient is read at both ends of
@@ -34,7 +38,50 @@ from .db import Database
 
 TRIP_HANDLE_C = 65.0  # alert 40 raises here (observed, firmware 26.18.0)
 CLEAR_HANDLE_C = 60.0  # ...and clears here, but the 50% derate persists
-IDLE_OFFSET_C = 2.0  # idle handle temperature sits about this far above ambient
+# Idle handle offset above garage air. Calibrated against the LAN ambient
+# sensor (source "ecowitt", 2026-08-04..11): 42 settled-idle segments across
+# 8 days — samples >= 1 h after any charging, ambient quasi-static, segment
+# means used so autocorrelation can't fake precision. The old constant 2.0
+# was rejected (mean 1.45, 95% CI [1.13, 1.78]); the offset falls as the
+# garage warms — night ~2.3 C vs hot afternoon ~0.7 C, slope -0.124 C/C
+# (t = -4.0 under leave-one-day-out jackknife) — so it is modeled linear in
+# ambient and clamped to the ambient range the calibration actually covered.
+# Recalibrate with contrib/calibrate_idle_offset.py as seasons extend the
+# covered range.
+IDLE_OFFSET_REF_C = 1.4  # offset at IDLE_OFFSET_AMBIENT_REF_C
+IDLE_OFFSET_SLOPE = -0.124  # d(offset)/d(ambient)
+IDLE_OFFSET_AMBIENT_REF_C = 30.0
+IDLE_OFFSET_AMBIENT_RANGE_C = (23.0, 38.5)  # calibration coverage; clamp outside
+
+
+def idle_offset_c(ambient_c: float) -> float:
+    """How far above garage air the idle handle settles, at this ambient."""
+    lo, hi = IDLE_OFFSET_AMBIENT_RANGE_C
+    clamped = min(max(ambient_c, lo), hi)
+    return IDLE_OFFSET_REF_C + IDLE_OFFSET_SLOPE * (clamped - IDLE_OFFSET_AMBIENT_REF_C)
+
+
+def idle_handle_c(ambient_c: float) -> float:
+    """Idle handle temperature expected at a given garage air temperature."""
+    return ambient_c + idle_offset_c(ambient_c)
+
+
+def ambient_from_idle_handle(handle_c: float) -> float:
+    """Garage air implied by a settled idle handle: inverse of idle_handle_c.
+
+    Linear inside the calibrated ambient band; beyond it the offset holds at
+    the boundary value (continuous at both edges), so out-of-range readings
+    degrade to a constant-offset proxy instead of extrapolating the slope.
+    """
+    ta = (handle_c - IDLE_OFFSET_REF_C + IDLE_OFFSET_SLOPE * IDLE_OFFSET_AMBIENT_REF_C) / (
+        1.0 + IDLE_OFFSET_SLOPE
+    )
+    lo, hi = IDLE_OFFSET_AMBIENT_RANGE_C
+    if ta < lo:
+        return handle_c - idle_offset_c(lo)
+    if ta > hi:
+        return handle_c - idle_offset_c(hi)
+    return ta
 REF_CURRENT_A = 48.0  # rise_ref_c is normalized to this charge current
 
 DEFAULT_TAU_MIN = 12.0
@@ -91,7 +138,8 @@ class ThermalParams:
             "ref_current_a": REF_CURRENT_A,
             "trip_c": TRIP_HANDLE_C,
             "clear_c": CLEAR_HANDLE_C,
-            "idle_offset_c": IDLE_OFFSET_C,
+            "idle_offset_ref_c": IDLE_OFFSET_REF_C,
+            "idle_offset_slope": IDLE_OFFSET_SLOPE,
             "tau_fits": self.tau_fits,
             "rise_fits": self.rise_fits,
             "fit_rmse_c": round(self.fit_rmse_c, 3) if self.fit_rmse_c is not None else None,
@@ -249,7 +297,7 @@ def _ambient_before(db: Database, start_ts: float) -> float | None:
     ]
     if len(idle) < 5 or max(idle) - min(idle) > 2.0:
         return None
-    return median(idle) - IDLE_OFFSET_C
+    return ambient_from_idle_handle(median(idle))
 
 
 # Cool-down-tail ambient: gates for reading ambient from a still-warm
@@ -287,14 +335,14 @@ def _decay_asymptote(tail: list[dict], tau_min: float) -> float | None:
     )
     if rmse > COOLDOWN_MAX_RMSE_C:
         return None  # not a clean single-exponential decay at this tau
-    ambient = asymptote - IDLE_OFFSET_C
+    ambient = ambient_from_idle_handle(asymptote)
     if not (-30.0 <= ambient <= TRIP_HANDLE_C):
         return None
     return ambient
 
 
 def _idle_rows(rows: list[dict]) -> list[dict]:
-    """Rows where the handle should sit at ambient + IDLE_OFFSET_C:
+    """Rows where the handle should sit at idle_handle_c(ambient):
     contactor open, no meaningful current, sensor sane (255 sentinel
     excluded by the < 200 guard)."""
     return [
@@ -314,7 +362,7 @@ def _ambient_from_cooldown(db: Database, start_ts: float, tau_min: float) -> flo
     cooled, so _ambient_before finds no stable idle window and the segment
     loses its rise fit. But the decay itself encodes ambient: idle cooling
     follows the same first-order lag as the charge ramp, settling at
-    ambient + IDLE_OFFSET_C. With tau known from this install's fitted
+    the idle handle temperature. With tau known from this install's fitted
     ramps, the asymptote is a closed-form least squares over a few minutes
     of tail — no flat stretch needed. (The live forecast bridges the same
     gap by inferring ambient *from* the fitted rise; that would be circular
@@ -338,7 +386,7 @@ def _ambient_after(db: Database, end_ts: float, tau_min: float) -> float | None:
     """Ambient at the end of a load window, from the cool-down that follows.
 
     The moment current stops, the handle decays from its working temperature
-    toward ambient + IDLE_OFFSET_C along the same first-order lag as the
+    toward idle_handle_c(ambient) along the same first-order lag as the
     charge ramp, so the tail right after the window closes encodes the
     ambient *then* — the other bracket of the window. A point ambient read
     only at the window's start silently assumes the garage held still for
@@ -830,7 +878,7 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
             ambient, ambient_source = measured
             stable = True
         else:
-            ambient = last["handle_temp_c"] - IDLE_OFFSET_C
+            ambient = ambient_from_idle_handle(last["handle_temp_c"])
             ambient_source = "idle_handle"
         out["ambient_c"] = round(ambient, 1)
         out["ambient_source"] = ambient_source
