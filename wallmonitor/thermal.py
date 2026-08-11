@@ -48,6 +48,16 @@ CLEAR_HANDLE_C = 60.0  # ...and clears here, but the 50% derate persists
 # ambient and clamped to the ambient range the calibration actually covered.
 # Recalibrate with contrib/calibrate_idle_offset.py as seasons extend the
 # covered range.
+#
+# Changing these constants reinterprets history: fits are recomputed from
+# raw vitals on every read, so adopting a new offset model shifts the
+# rise_ref of every fit whose ambient came through the proxy
+# (ambient_source "pre_idle" or "cooldown_tail") while leaving
+# measured-sourced fits untouched. That shift is the correction working —
+# but a drift comparison spanning a recalibration will show it as a step
+# in proxy-era fits. Compare rise_ref within one ambient_source tier, or
+# re-anchor the verified baseline after recalibrating, before reading any
+# movement as hardware degradation.
 IDLE_OFFSET_REF_C = 1.4  # offset at IDLE_OFFSET_AMBIENT_REF_C
 IDLE_OFFSET_SLOPE = -0.124  # d(offset)/d(ambient)
 IDLE_OFFSET_AMBIENT_REF_C = 30.0

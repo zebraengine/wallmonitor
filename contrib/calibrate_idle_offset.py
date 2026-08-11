@@ -37,6 +37,14 @@ night ~2.3 C, hot afternoon ~0.7 C, slope -0.124 C/C), the ambient range
 the data covers, and drop-in constants for ``thermal.py``. Run it again
 when a new season extends the covered ambient range — the clamp in
 ``idle_offset_c`` marks where the current calibration stops being evidence.
+
+After adopting new constants, remember that fit history is recomputed, not
+stored: every fit whose ambient came through the handle proxy
+(``ambient_source`` "pre_idle"/"cooldown_tail") shifts to the new model on
+the next read, while measured-sourced fits stay put. Before reading
+rise_ref movement as degradation across a recalibration, compare within
+one ambient_source tier or re-anchor the verified baseline
+(POST /api/thermal/baseline-anchor).
 """
 
 from __future__ import annotations
