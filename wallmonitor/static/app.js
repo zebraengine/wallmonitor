@@ -817,11 +817,22 @@ async function viewLive(root) {
   const currents = chartCard("Phase currents", "Per-phase current at the charger — live");
   root.append(tiles, sessionCard, thermalCard, fcast.card, power.card, currents.card);
 
-  // Seed the rolling buffer with the last 15 minutes from the DB.
+  // Seed the buffer from the DB — the last 15 minutes normally, or the whole
+  // session so far when a charge is in progress, so the session-pinned window
+  // (below) has its full history even after a reload mid-charge.
   const now = Date.now() / 1000;
+  let seedFrom = now - 900;
+  try {
+    const st = live.status || (live.status = await getJSON("/api/status"));
+    const sess = st.active_session;
+    if (sess && sess.start_ts && st.vitals && st.vitals.contactor_closed) {
+      seedFrom = Math.min(seedFrom, sess.start_ts - 60);
+    }
+  } catch { /* no status yet — fall back to the rolling window */ }
   let buf = [];
   try {
-    const hist = await getJSON(`/api/vitals?from=${now - 900}&to=${now}&points=900`);
+    const points = Math.min(5000, Math.ceil(now - seedFrom));
+    const hist = await getJSON(`/api/vitals?from=${seedFrom}&to=${now}&points=${points}`);
     buf = hist.samples.map(fromDbRow);
   } catch { /* fresh DB */ }
 
@@ -833,25 +844,69 @@ async function viewLive(root) {
   };
   let abuf = [];
   try {
-    const amb = await getJSON(`/api/ambient?from=${now - 900}&to=${now}`);
+    const amb = await getJSON(`/api/ambient?from=${seedFrom}&to=${now}`);
     abuf = ambientRows(amb.samples || []);
   } catch { /* no ambient feed yet */ }
   // Forecast snapshots: one point per 30 s poller tick, seeded from the
   // recorded history (so the prediction line survives tab switches and
   // reloads) and then extended live by SSE thermal frames, with the 60 s
-  // /api/thermal poll as fallback.
+  // /api/thermal poll as fallback. The prediction is session-scoped: it seeds
+  // only while a charge is running and is dropped when the charge ends.
+  // insufficient-basis ticks are recorded for fidelity but carry no
+  // chartable plateau — filter them exactly as pushThermal does, so every
+  // tbuf entry has a steady value the chart and sub-line rely on.
+  const tickFromRow = (row) => ({
+    ts: row.ts, steady: row.steady_state_c, willTrip: row.will_trip,
+    mtt: row.minutes_to_trip, basis: row.basis, suggested: row.suggested_max_a,
+    rmse: row.fit_rmse_c, trip: row.trip_c, tau: row.tau_min, tripTs: row.trip_ts,
+  });
   let tbuf = [];
+  async function seedForecasts(from) {
+    const fc = await getJSON(`/api/forecasts?from=${from}&to=${Date.now() / 1000}`);
+    const rows = (fc.samples || []).filter((row) => row.steady_state_c != null).map(tickFromRow);
+    // Keep any live SSE ticks that arrived while the fetch was in flight.
+    const lastTs = rows.length ? rows[rows.length - 1].ts : -Infinity;
+    tbuf = rows.concat(tbuf.filter((point) => point.ts > lastTs + 1));
+  }
   try {
-    const fc = await getJSON(`/api/forecasts?from=${now - 900}&to=${now}`);
-    // insufficient-basis ticks are recorded for fidelity but carry no
-    // chartable plateau — filter them here exactly as pushThermal does, so
-    // every tbuf entry has a steady value the chart and sub-line rely on.
-    tbuf = (fc.samples || []).filter((row) => row.steady_state_c != null).map((row) => ({
-      ts: row.ts, steady: row.steady_state_c, willTrip: row.will_trip,
-      mtt: row.minutes_to_trip, basis: row.basis, suggested: row.suggested_max_a,
-      rmse: row.fit_rmse_c, trip: row.trip_c, tau: row.tau_min, tripTs: row.trip_ts,
-    }));
+    if (buf.length && buf[buf.length - 1].charging) await seedForecasts(seedFrom);
   } catch { /* server predates forecast recording */ }
+
+  // While a charge runs, the forecast chart pins its window to the start of
+  // the current charging stretch so the whole charge — measured lines and
+  // every prediction tick — stays on screen instead of scrolling off. The
+  // stretch is read from the buffer itself rather than the session record:
+  // a session spans plug-in to unplug, so an overnight top-off burst would
+  // otherwise pin the window back to the previous evening. A short grace
+  // keeps the pin through momentary contactor pauses (current ramps, brief
+  // vehicle pauses); once the charge is really over — grace expired with no
+  // charging sample — the view returns to the rolling 15-minute window.
+  const PIN_GRACE_S = 180;
+  function sessionAnchorTs() {
+    const last = buf.length ? buf[buf.length - 1] : null;
+    if (!last) return null;
+    let anchor = null;
+    let newer = last.ts;
+    for (let i = buf.length - 1; i >= 0; i--) {
+      const sample = buf[i];
+      // A hole in the samples longer than the grace also ends the stretch —
+      // without this, a buffer holding two bursts hours apart (or an SSE
+      // dropout) would let the walk jump the gap and over-extend the anchor.
+      if (newer - sample.ts > PIN_GRACE_S) break;
+      newer = sample.ts;
+      if (sample.charging) { anchor = sample.ts; continue; }
+      // Walking back from the newest charging sample found so far (or from
+      // the tail while still looking): a non-charging gap longer than the
+      // grace ends the stretch.
+      if ((anchor ?? last.ts) - sample.ts > PIN_GRACE_S) break;
+    }
+    return anchor;
+  }
+  function bufferCutoff() {
+    const rolling = Date.now() / 1000 - 960;
+    const pinned = sessionAnchorTs();
+    return pinned != null ? Math.min(pinned - 60, rolling) : rolling;
+  }
 
   function renderTiles(sample) {
     tiles.textContent = "";
@@ -1018,7 +1073,7 @@ async function viewLive(root) {
       mtt: forecast.minutes_to_trip, basis: forecast.basis, suggested: forecast.suggested_max_a,
       rmse: model.fit_rmse_c, trip: model.trip_c, tau: model.tau_min, tripTs: forecast.trip_ts,
     });
-    const cutoff = Date.now() / 1000 - 960;
+    const cutoff = bufferCutoff();
     while (tbuf.length && tbuf[0].ts < cutoff) tbuf.shift();
   }
 
@@ -1029,7 +1084,8 @@ async function viewLive(root) {
 
   function renderForecast() {
     const now = Date.now() / 1000;
-    const xFrom = now - 900;
+    const pinned = sessionAnchorTs();
+    const xFrom = pinned != null ? Math.min(pinned - 60, now - 900) : now - 900;
     const latest = tbuf[tbuf.length - 1];
     // Project forward only with a live forecast AND a live handle sample to
     // anchor the curve on — otherwise the future region would extrapolate
@@ -1039,10 +1095,19 @@ async function viewLive(root) {
       latest && now - latest.ts <= 180 && latest.steady != null && latest.tau > 0 &&
       anchor && anchor.tHandle != null && now - anchor.ts <= 120
     );
+    // A pinned multi-hour session accumulates thousands of 2 s handle samples;
+    // temperatures move on minutes, so thin the drawn line instead of pushing
+    // an ever-growing polyline through the SVG on every tick.
+    const thin = (points) => {
+      const stride = Math.ceil(points.length / 1200);
+      return stride > 1
+        ? points.filter((_, index) => index % stride === 0 || index === points.length - 1)
+        : points;
+    };
     const series = [
-      { name: "Plug handle", color: colors.s2, points: buf.filter((sample) => sample.ts >= xFrom).map((sample) => [sample.ts, sample.tHandle]) },
+      { name: "Plug handle", color: colors.s2, points: thin(buf.filter((sample) => sample.ts >= xFrom).map((sample) => [sample.ts, sample.tHandle])) },
       { name: "Projected plateau", color: colors.s5, dash: "6 4", points: tbuf.map((point) => [point.ts, point.steady]) },
-      { name: "Garage ambient", color: colors.s3, points: abuf.filter((point) => point[0] >= xFrom) },
+      { name: "Garage ambient", color: colors.s3, points: thin(abuf.filter((point) => point[0] >= xFrom)) },
     ];
     if (projecting) {
       // The model's own forward path from the newest measured sample:
@@ -1098,7 +1163,7 @@ async function viewLive(root) {
       const from = abuf.length ? abuf[abuf.length - 1][0] + 0.001 : Date.now() / 1000 - 900;
       const amb = await getJSON(`/api/ambient?from=${from}`);
       abuf.push(...ambientRows(amb.samples || []).filter((point) => !abuf.length || point[0] > abuf[abuf.length - 1][0]));
-      const cutoff = Date.now() / 1000 - 960;
+      const cutoff = bufferCutoff();
       while (abuf.length && abuf[0][0] < cutoff) abuf.shift();
     } catch { /* no ambient feed yet */ }
     renderForecast();
@@ -1116,16 +1181,22 @@ async function viewLive(root) {
     if (msg.type !== "vitals") return;
     const sample = fromSse(msg);
     buf.push(sample);
-    const cutoff = Date.now() / 1000 - 960;
+    const cutoff = bufferCutoff();
     while (buf.length && buf[0].ts < cutoff) buf.shift();
+    // Refresh the forecast immediately when charging starts or stops rather
+    // than waiting out the poll interval — and scope the prediction to the
+    // session: rebuild its recorded ticks on a (re)start, drop them the
+    // moment the charge ends so a finished session shows measured lines only.
+    if (lastCharging !== null && sample.charging !== lastCharging) {
+      if (sample.charging) seedForecasts(sessionAnchorTs() ?? Date.now() / 1000 - 900).then(renderForecast, () => {});
+      else tbuf.length = 0;
+      loadThermal();
+    }
+    lastCharging = sample.charging;
     renderTiles(sample);
     renderSessionCard(sample);
     renderCharts();
     renderForecast();
-    // Refresh the forecast immediately when charging starts or stops rather
-    // than waiting out the poll interval.
-    if (lastCharging !== null && sample.charging !== lastCharging) loadThermal();
-    lastCharging = sample.charging;
   };
   live.listeners.add(onMsg);
   return () => { live.listeners.delete(onMsg); clearInterval(thermalTimer); };
