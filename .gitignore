@@ -2,3 +2,12 @@
 *.db
 *.db-shm
 *.db-wal
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+.pytest_cache/

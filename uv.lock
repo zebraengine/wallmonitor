@@ -570,24 +570,13 @@ wheels = [
 [[package]]
 name = "tesla-wall-connector"
 version = "1.2.0"
-source = { editable = "../" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
 ]
-
-[package.metadata]
-requires-dist = [{ name = "aiohttp", specifier = ">=3.13.5,<4" }]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "aresponses", specifier = ">=3.0.0,<4" },
-    { name = "bandit", specifier = ">=1.7,<2" },
-    { name = "codespell", specifier = ">=2.1,<3" },
-    { name = "pre-commit", specifier = ">=4.0,<5" },
-    { name = "pyright", specifier = ">=1.1,<2" },
-    { name = "pytest", specifier = ">=9.1,<10" },
-    { name = "pytest-asyncio", specifier = ">=1.4,<2" },
-    { name = "ruff", specifier = ">=0.15,<1" },
+sdist = { url = "https://files.pythonhosted.org/packages/4a/51/36305975af5c7ca699d8a1a59cc6295e7ffdbe207f6e8811bf7d0df2a38b/tesla_wall_connector-1.2.0.tar.gz", hash = "sha256:851a3090bfaab500eeaf8c3d18533608fc42bd5cdb81cb731456b3240110a910", size = 5618 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b4/4d/277c0c51d2141f891c180cbb92038f5485c45fb856aab323de4385f26c80/tesla_wall_connector-1.2.0-py3-none-any.whl", hash = "sha256:b31d43bf93468b72d5a3166d795d3e935fb7d43231a517f17c16f0117f68eeae", size = 8163 },
 ]
 
 [[package]]
@@ -617,7 +606,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.13.5,<4" },
-    { name = "tesla-wall-connector", editable = "../" },
+    { name = "tesla-wall-connector", specifier = ">=1.2.0,<2" },
 ]
 
 [package.metadata.requires-dev]

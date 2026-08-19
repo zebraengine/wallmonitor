@@ -5,8 +5,9 @@ beyond reading data off the charger: it records everything the device
 reports, turns that history into a thermal model fitted to *your* install,
 forecasts derates before they happen (with the charge-current cap that
 avoids them), watches for connector degradation with honest statistics, and
-pushes actionable warnings to your browser or phone. Built on the
-`tesla-wall-connector` library in the parent directory.
+pushes actionable warnings to your browser or phone. Talks to the charger
+through the [`tesla-wall-connector`](https://github.com/einarhauks/tesla-wall-connector)
+library (MIT, by Einar Bragi Hauksson).
 
 Everything stays on your machine and your LAN: the only network traffic is
 HTTP GETs to the charger's local API, storage is a local SQLite file, and the
@@ -205,7 +206,8 @@ web UI serves no external assets (no CDNs, fonts, or analytics).
 ## Run
 
 ```bash
-cd monitor
+git clone https://github.com/zebraengine/wallmonitor
+cd wallmonitor
 uv sync
 
 # against your real Wall Connector (find its IP in your router, or use
@@ -257,7 +259,7 @@ unattended OS updates (any downtime shows up as a `monitor_gap` event in the
 timeline):
 
 ```bash
-cd monitor
+cd wallmonitor
 sudo ./deploy/install-service.sh --host 192.168.1.50 --split-phase
 ```
 
@@ -282,7 +284,7 @@ leaves your LAN. `deploy/ntfy/docker-compose.yml` runs it next to the
 monitor:
 
 ```bash
-cd monitor/deploy/ntfy
+cd wallmonitor/deploy/ntfy
 # edit NTFY_BASE_URL in docker-compose.yml to this box's LAN address first
 docker compose up -d
 cd ..
