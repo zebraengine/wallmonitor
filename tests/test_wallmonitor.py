@@ -1286,3 +1286,30 @@ async def test_backoff_on_unreachable_host(db, unused_tcp_port):
             await poller.stop()
     alerts = db.active_alerts()
     assert any(alert["alert"] == "Wall Connector unreachable" for alert in alerts)
+
+
+def test_simulator_split_phase_profile():
+    from wallmonitor.poller import _total_power
+    from wallmonitor.simulator import SimState
+
+    # Pin the clock mid-charge (55s of idle+connected, then 95s into charging)
+    # so the ramp is complete and the taper hasn't started.
+    mid_charge = time.time() - 150.0
+
+    na = SimState(split_phase=True, start=mid_charge).vitals()
+    assert 59.9 < na["grid_hz"] < 60.1
+    assert 44.0 < na["vehicle_current_a"] <= 48.5
+    # Recorded Gen 3 split-phase quirks: each leg reads about half the vehicle
+    # current (neutral included) and voltageC sits near half of grid_v.
+    assert na["currentA_a"] < na["vehicle_current_a"] * 0.6
+    assert na["currentN_a"] > na["vehicle_current_a"] * 0.3
+    assert abs(na["voltageC_v"] - na["grid_v"] / 2.0) < 2.0
+    # The --split-phase power path must land near grid_v × vehicle_current
+    # (~11 kW at full rate); the three-phase sum would be wildly different.
+    power = _total_power(na, split_phase=True)
+    assert 10_000 < power < 11_800
+
+    eu = SimState(split_phase=False, start=mid_charge).vitals()
+    assert 49.9 < eu["grid_hz"] < 50.1
+    assert 15.0 < eu["vehicle_current_a"] <= 16.5
+    assert 10_500 < _total_power(eu, split_phase=False) < 11_800

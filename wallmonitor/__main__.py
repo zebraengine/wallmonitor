@@ -40,7 +40,7 @@ async def run(argv: list[str] | None = None) -> None:
 
     sim_runner = None
     if cfg.demo:
-        sim_runner, sim_port = await start_simulator()
+        sim_runner, sim_port = await start_simulator(split_phase=cfg.split_phase)
         cfg.host = f"127.0.0.1:{sim_port}"
         log.info("demo mode: simulator running at http://%s", cfg.host)
 
