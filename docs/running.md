@@ -18,6 +18,11 @@ uv run python -m wallmonitor --host 192.168.1.50 --split-phase
 
 # no hardware? demo mode runs a built-in simulator:
 uv run python -m wallmonitor --demo
+
+# the simulator honors --split-phase too: a 240 V / 60 Hz North American
+# install (48 A, with the Gen 3's odd split-phase per-leg telemetry)
+# instead of the European 230 V / 50 Hz three-phase default:
+uv run python -m wallmonitor --demo --split-phase
 ```
 
 Then open <http://127.0.0.1:8480>. The UI binds to localhost by default; use
