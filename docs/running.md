@@ -9,8 +9,11 @@ git clone https://github.com/zebraengine/wallmonitor
 cd wallmonitor
 uv sync
 
-# against your real Wall Connector (find its IP in your router, or use
-# the TeslaWallConnector_XXXXXX.local hostname):
+# against your real Wall Connector: find its IP in your router's client
+# list — it registers a DHCP hostname like TeslaWallConnector_XXXXXX
+# (same suffix as its setup Wi-Fi SSID), which some routers make
+# resolvable by name. The device does not answer mDNS, so a bare
+# ".local" name won't work; when in doubt, use the IP:
 uv run python -m wallmonitor --host 192.168.1.50
 
 # North American split-phase install (power = grid_v × vehicle_current):

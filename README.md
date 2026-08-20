@@ -23,8 +23,9 @@ uvx wallmonitor --demo
 
 Then open <http://127.0.0.1:8480>.
 
-Against your real Wall Connector (find its IP in your router, or use the
-`TeslaWallConnector_XXXXXX.local` hostname; add `--split-phase` on a North
+Against your real Wall Connector (find its IP in your router's client list —
+it registers a DHCP hostname like `TeslaWallConnector_XXXXXX`, which some
+routers also make resolvable by name; add `--split-phase` on a North
 American split-phase install):
 
 ```bash
@@ -94,3 +95,7 @@ detection, alert lifecycle, the web API, and the thermal model end to end.
 [MIT](https://github.com/zebraengine/wallmonitor/blob/main/LICENSE). Built on the
 [`tesla-wall-connector`](https://github.com/einarhauks/tesla-wall-connector)
 library (MIT, by Einar Bragi Hauksson).
+
+wallmonitor is an independent project, not affiliated with, endorsed by, or
+sponsored by Tesla, Inc. "Tesla" and "Tesla Wall Connector" are trademarks of
+Tesla, Inc., used here only to identify the hardware this software monitors.
