@@ -11,7 +11,7 @@ Everything stays on your machine and your LAN: the only network traffic is
 HTTP GETs to the charger's local API, storage is a local SQLite file, and the
 web UI serves no external assets (no CDNs, fonts, or analytics).
 
-![Live dashboard during a charge, then the session detail view — recorded in demo mode](https://raw.githubusercontent.com/zebraengine/wallmonitor/main/docs/assets/wallmonitor-demo.gif)
+![Reviewing a real charge session: the dashed line is what the forecast predicted at each 30 s tick, converging onto the measured handle temperature — and the event log shows the automatic amp control acting on those predictions](https://raw.githubusercontent.com/zebraengine/wallmonitor/main/docs/assets/wallmonitor-demo.gif)
 
 ## Try it in 30 seconds
 
