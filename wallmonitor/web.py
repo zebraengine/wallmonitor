@@ -144,7 +144,11 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
             if sample.get("session_id") == sid or sample["ts"] >= session["start_ts"]
         ]
         events = await asyncio.to_thread(db.events_range, session["start_ts"] - 1, end + 1)
-        return web.json_response({"session": session, "samples": samples, "events": events})
+        forecasts = await asyncio.to_thread(db.forecast_range, session["start_ts"] - 1, end + 1)
+        forecasts = [row for row in forecasts if row.get("session_id") in (sid, None)]
+        return web.json_response(
+            {"session": session, "samples": samples, "events": events, "forecasts": forecasts}
+        )
 
     async def api_alerts(request: web.Request) -> web.Response:
         now = time.time()

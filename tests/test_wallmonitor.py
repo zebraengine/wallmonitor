@@ -1313,3 +1313,31 @@ def test_simulator_split_phase_profile():
     assert 49.9 < eu["grid_hz"] < 50.1
     assert 15.0 < eu["vehicle_current_a"] <= 16.5
     assert 10_500 < _total_power(eu, split_phase=False) < 11_800
+
+
+async def test_session_detail_includes_forecast_history(db):
+    now = time.time()
+    sid = db.start_session(now - 600)
+    db.close_session(sid, now - 60, "vehicle_disconnected")
+    out = {
+        "state": "charging", "handle_c": 40.0, "current_a": 48.0,
+        "model": {"tau_min": 11.0, "fit_rmse_c": 0.4, "trip_c": 65.0},
+        "forecast": {"basis": "trajectory", "steady_state_c": 70.0, "will_trip": True,
+                     "minutes_to_trip": 12.0, "trip_ts": now - 100},
+    }
+    # Three ticks converging downward, plus one from another session and one
+    # outside the window — the detail payload must include only the first three.
+    db.insert_forecast(now - 500, out, session_id=sid)
+    out["forecast"]["steady_state_c"] = 58.0
+    db.insert_forecast(now - 400, out, session_id=sid)
+    out["forecast"]["steady_state_c"] = 54.0
+    db.insert_forecast(now - 300, out, session_id=sid)
+    db.insert_forecast(now - 450, out, session_id=sid + 1)
+    db.insert_forecast(now - 5, out, session_id=None)
+
+    app = make_app(db, EventBus(), None)
+    async with TestClient(TestServer(app)) as client:
+        detail = await (await client.get(f"/api/sessions/{sid}")).json()
+    plateaus = [row["steady_state_c"] for row in detail["forecasts"]]
+    assert plateaus == [70.0, 58.0, 54.0]
+    assert all(row["session_id"] == sid for row in detail["forecasts"])

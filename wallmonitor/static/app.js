@@ -1313,7 +1313,8 @@ async function viewSessionDetail(root, id) {
   const volt = chartCard("Phase voltages", "Per-phase voltage");
   const temp = chartCard("Temperatures",
     `Plug handle, charger circuit board (PCBA), and processor (MCU). At ${HANDLE_TRIP_C}°C on the handle, alert 40 raises ` +
-    `and current is halved (observed on this firmware); the ≈${PCBA_THROTTLE_C}°C line is the community-observed PCBA throttle point.`);
+    `and current is halved (observed on this firmware); the ≈${PCBA_THROTTLE_C}°C line is the community-observed PCBA throttle point. ` +
+    `The dashed line is the plateau the forecast predicted at each 30 s tick — watch it converge onto the measured curve as the fit gets data.`);
   const pilot = chartCard("Pilot & proximity", "J1772 handshake signals — flaky values here often precede charging errors");
   const relay = chartCard("Relay voltages", "Contactor coil drive");
   const eventsWrap = el("div", {});
@@ -1339,6 +1340,7 @@ async function viewSessionDetail(root, id) {
   let win = null;
   let fullSamples = [];
   let fullEvents = [];
+  let fullForecasts = [];
   let sessionRange = [0, 1];
   let winSeq = 0;
   let winTimer = null;
@@ -1362,12 +1364,23 @@ async function viewSessionDetail(root, id) {
         { name: "Phase C", color: colors.s3, points: samples.map((sample) => [sample.ts, sample.vc]) },
       ], unit: "V", digits: 1, xFrom, xTo, height: 190,
     });
+    // The recorded forecast history: what the model believed the handle
+    // would plateau at, at each 30 s tick. Early guesses run high on thin
+    // trajectory data and converge as the fit firms up — that convergence
+    // is the point of drawing it against the measured curve.
+    const forecastPts = fullForecasts
+      .filter((row) => row.ts >= xFrom && row.ts <= xTo)
+      .map((row) => [row.ts, row.steady_state_c]);
+    const tempSeries = [
+      { name: "Circuit board (PCBA)", color: colors.s1, points: samples.map((sample) => [sample.ts, sample.tPcba]) },
+      { name: "Plug handle", color: colors.s2, points: samples.map((sample) => [sample.ts, sample.tHandle]) },
+      { name: "Processor (MCU)", color: colors.s3, points: samples.map((sample) => [sample.ts, sample.tMcu]) },
+    ];
+    if (forecastPts.length) {
+      tempSeries.push({ name: "Predicted plateau", color: colors.s5, dash: "6 4", points: forecastPts });
+    }
     lineChart(temp.box, {
-      series: [
-        { name: "Circuit board (PCBA)", color: colors.s1, points: samples.map((sample) => [sample.ts, sample.tPcba]) },
-        { name: "Plug handle", color: colors.s2, points: samples.map((sample) => [sample.ts, sample.tHandle]) },
-        { name: "Processor (MCU)", color: colors.s3, points: samples.map((sample) => [sample.ts, sample.tMcu]) },
-      ], unit: "°C", digits: 1, xFrom, xTo, height: 190,
+      series: tempSeries, unit: "°C", digits: 1, xFrom, xTo, height: 190,
       refLines: [
         { value: HANDLE_TRIP_C, label: `${HANDLE_TRIP_C}°C handle → alert 40 derate` },
         { value: PCBA_THROTTLE_C, label: `≈${PCBA_THROTTLE_C}°C PCBA throttle (approx.)` },
@@ -1458,6 +1471,7 @@ async function viewSessionDetail(root, id) {
 
     fullSamples = samples;
     fullEvents = data.events;
+    fullForecasts = (data.forecasts || []).filter((row) => row.steady_state_c != null);
     sessionRange = [backdated ? firstSeen : session.start_ts, ongoing ? now : session.end_ts];
     renderBrush();
     await applyWindow();
