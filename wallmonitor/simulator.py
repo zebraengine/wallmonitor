@@ -35,9 +35,12 @@ class SimState:
     background task to run or state to advance — every request computes the
     world as of "now", and a test can pin `start` to make it deterministic."""
 
-    def __init__(self, speedup: float = 1.0, start: float | None = None):
+    def __init__(
+        self, speedup: float = 1.0, start: float | None = None, split_phase: bool = False
+    ):
         self.t0 = start if start is not None else time.time()
         self.speedup = speedup
+        self.split_phase = split_phase
         self.boot_ts = self.t0
         self.lifetime_energy_wh = 2_566_837.0
         self.charge_starts = 450
@@ -66,8 +69,17 @@ class SimState:
         gets exercised without waiting for real trouble."""
         name, into, cycle_n = self.phase()
         rng = self.rng
-        grid_v = 230.0 + rng.uniform(-1.5, 1.5)
-        grid_hz = 50.0 + rng.uniform(-0.02, 0.02)
+        # Grid profile: European three-phase 230 V / 50 Hz by default, or a
+        # North American split-phase 240 V / 60 Hz install (nominal sags a
+        # few volts under load, matching recorded Gen 3 telemetry).
+        if self.split_phase:
+            grid_v = 236.0 + rng.uniform(-1.5, 1.5)
+            grid_hz = 60.0 + rng.uniform(-0.03, 0.03)
+            max_amps = 48.0
+        else:
+            grid_v = 230.0 + rng.uniform(-1.5, 1.5)
+            grid_hz = 50.0 + rng.uniform(-0.02, 0.02)
+            max_amps = 16.0
         connected = name in ("connected", "charging", "complete")
         charging = name == "charging"
         # Ramp current up over the first 20s of charging, taper near the end.
@@ -75,7 +87,9 @@ class SimState:
         if charging:
             ramp = min(1.0, into / 20.0)
             taper = 1.0 - max(0.0, (into - 200.0) / 40.0) * 0.6
-            amps = 16.0 * ramp * taper + rng.uniform(-0.2, 0.2)
+            amps = max_amps * ramp * taper + rng.uniform(-0.2, 0.2)
+            if self.split_phase:
+                grid_v -= 6.5 * (amps / max_amps)  # voltage sag under load
         if name == "connected":
             session_s = int(into)
         elif name == "charging":
@@ -85,11 +99,12 @@ class SimState:
         else:
             session_s = 0
         # session energy: integrate the trapezoid roughly — good enough for a sim
+        avg_power_w = 230.0 * 43.0 if self.split_phase else 3 * 230.0 * 14.0
         session_energy = 0.0
         if name == "charging":
-            session_energy = 3 * 230.0 * 14.0 * (into / 3600.0)
+            session_energy = avg_power_w * (into / 3600.0)
         elif name == "complete":
-            session_energy = 3 * 230.0 * 14.0 * (CYCLE[2][1] / 3600.0)
+            session_energy = avg_power_w * (CYCLE[2][1] / 3600.0)
         alerts = []
         if cycle_n >= self.alert_after_cycles and name == "charging" and 60 < into < 120:
             # Real firmware reports numeric alert IDs (e.g. [27]).
@@ -105,13 +120,18 @@ class SimState:
             "grid_v": round(grid_v, 1),
             "grid_hz": round(grid_hz, 3),
             "vehicle_current_a": round(amps, 1),
-            "currentA_a": round(amps if charging else 0.1, 1),
-            "currentB_a": round(amps if charging else 0.1, 1),
-            "currentC_a": round(amps if charging else 0.1, 1),
-            "currentN_a": round(rng.uniform(0.0, 0.4), 1),
-            "voltageA_v": round(grid_v + rng.uniform(-0.5, 0.5), 1),
-            "voltageB_v": round(grid_v + rng.uniform(-0.5, 0.5), 1),
-            "voltageC_v": round(grid_v + rng.uniform(-0.5, 0.5), 1),
+            # Split-phase Gen 3 telemetry is odd and reproduced from a real
+            # install's recording: each leg (and neutral) reads roughly half
+            # the vehicle current, and voltageC sits near half of grid_v.
+            # Summing V×I here would be wrong — that's what --split-phase's
+            # grid_v × vehicle_current power path exists to handle.
+            "currentA_a": round((amps * 0.46 if self.split_phase else amps) if charging else 0.1, 1),
+            "currentB_a": round((amps * 0.54 if self.split_phase else amps) if charging else 0.1, 1),
+            "currentC_a": round((amps * 0.53 if self.split_phase else amps) if charging else 0.1, 1),
+            "currentN_a": round(amps * 0.46 if self.split_phase and charging else rng.uniform(0.0, 0.4), 1),
+            "voltageA_v": round(grid_v + (3.5 if self.split_phase else 0.0) + rng.uniform(-0.5, 0.5), 1),
+            "voltageB_v": round(grid_v + (3.9 if self.split_phase else 0.0) + rng.uniform(-0.5, 0.5), 1),
+            "voltageC_v": round(grid_v / 2.0 if self.split_phase else grid_v + rng.uniform(-0.5, 0.5), 1),
             "relay_coil_v": 11.9,
             "pcba_temp_c": round(18.0 + (8.0 if charging else 0.0) + rng.uniform(-0.4, 0.4), 1),
             "handle_temp_c": round(handle_temp, 1),
@@ -204,10 +224,10 @@ def make_app(state: SimState | None = None) -> web.Application:
 
 
 async def start_simulator(
-    port: int = 0, speedup: float = 1.0, start: float | None = None
+    port: int = 0, speedup: float = 1.0, start: float | None = None, split_phase: bool = False
 ) -> tuple[web.AppRunner, int]:
     """Start the simulator on localhost. Returns (runner, bound_port)."""
-    runner = web.AppRunner(make_app(SimState(speedup=speedup, start=start)))
+    runner = web.AppRunner(make_app(SimState(speedup=speedup, start=start, split_phase=split_phase)))
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", port)
     await site.start()

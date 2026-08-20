@@ -9,8 +9,11 @@ git clone https://github.com/zebraengine/wallmonitor
 cd wallmonitor
 uv sync
 
-# against your real Wall Connector (find its IP in your router, or use
-# the TeslaWallConnector_XXXXXX.local hostname):
+# against your real Wall Connector: find its IP in your router's client
+# list — it registers a DHCP hostname like TeslaWallConnector_XXXXXX
+# (same suffix as its setup Wi-Fi SSID), which some routers make
+# resolvable by name. The device does not answer mDNS, so a bare
+# ".local" name won't work; when in doubt, use the IP:
 uv run python -m wallmonitor --host 192.168.1.50
 
 # North American split-phase install (power = grid_v × vehicle_current):
@@ -18,6 +21,11 @@ uv run python -m wallmonitor --host 192.168.1.50 --split-phase
 
 # no hardware? demo mode runs a built-in simulator:
 uv run python -m wallmonitor --demo
+
+# the simulator honors --split-phase too: a 240 V / 60 Hz North American
+# install (48 A, with the Gen 3's odd split-phase per-leg telemetry)
+# instead of the European 230 V / 50 Hz three-phase default:
+uv run python -m wallmonitor --demo --split-phase
 ```
 
 Then open <http://127.0.0.1:8480>. The UI binds to localhost by default; use
