@@ -29,6 +29,12 @@ class Config:
     db_path: str = "wallmonitor.db"
     demo: bool = False
     split_phase: bool = False
+    # Human name for this charger, shown in the UI header, tab title and
+    # notifications so several instances side by side stay attributable.
+    label: str = ""
+    # --discover [RANGE]: sweep the LAN for chargers and exit. None = not
+    # requested; "auto" = the host's own subnet; otherwise a CIDR.
+    discover: str | None = None
     # Optional LAN webhook: actionable warnings are POSTed here.
     # Local-only by design — point it at something on your own network
     # (Home Assistant, a self-hosted ntfy, node-RED); leave empty to disable.
@@ -82,7 +88,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     """Build the Config: CLI flag beats WM_* env var beats hardcoded default.
 
     One validation rule: --host is required unless --demo runs the built-in
-    simulator instead of real hardware. Note the boolean flags can only
+    simulator instead of real hardware, or --discover is asked to find it. Note the boolean flags can only
     assert True — an env-var-enabled --demo/--split-phase has no --no-*
     override; unset the variable instead."""
     parser = argparse.ArgumentParser(
@@ -124,6 +130,21 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser.add_argument("--wifi-interval", type=float, default=_env("WM_WIFI_INTERVAL", 30.0))
     parser.add_argument("--lifetime-interval", type=float, default=_env("WM_LIFETIME_INTERVAL", 60.0))
     parser.add_argument(
+        "--label",
+        default=_env("WM_LABEL", ""),
+        help="Name for this charger, shown in the UI and notifications — useful when "
+        "running one instance per Wall Connector (env: WM_LABEL)",
+    )
+    parser.add_argument(
+        "--discover",
+        nargs="?",
+        const="auto",
+        default=None,
+        metavar="RANGE",
+        help="Find Wall Connectors on the LAN and exit. Sweeps this host's own subnet, "
+        "or the private CIDR given (e.g. 192.168.2.0/24). Never leaves the LAN.",
+    )
+    parser.add_argument(
         "--split-phase",
         action="store_true",
         default=_env("WM_SPLIT_PHASE", False),
@@ -144,8 +165,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
     )
     args = parser.parse_args(argv)
 
-    if not args.demo and not args.host:
-        parser.error("--host (or WM_WC_HOST) is required unless --demo is set")
+    if not args.demo and not args.host and args.discover is None:
+        parser.error(
+            "--host (or WM_WC_HOST) is required — run `wallmonitor --discover` to find "
+            "your Wall Connector's address, or --demo for the built-in simulator"
+        )
 
     return Config(
         host=args.host,
@@ -154,6 +178,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         db_path=args.db_path,
         demo=bool(args.demo),
         split_phase=bool(args.split_phase),
+        label=args.label,
+        discover=args.discover,
         notify_url=args.notify_url,
         notify_format=args.notify_format,
         vitals_interval_active=args.vitals_active,

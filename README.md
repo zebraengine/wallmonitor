@@ -23,14 +23,18 @@ uvx wallmonitor --demo
 
 Then open <http://127.0.0.1:8480>.
 
-Against your real Wall Connector (find its IP in your router's client list —
-it registers a DHCP hostname like `TeslaWallConnector_XXXXXX`, which some
-routers also make resolvable by name; add `--split-phase` on a North
-American split-phase install):
+Against your real Wall Connector — let the tool find it on your LAN (a
+polite sweep of your own subnet; nothing leaves the network), then run with
+the address it prints (add `--split-phase` on a North American install):
 
 ```bash
+uvx wallmonitor --discover
 uvx wallmonitor --host 192.168.1.50 --split-phase
 ```
+
+On first contact the monitor pins the charger's serial number: if a
+different unit ever answers at that address, it alarms and pauses recording
+rather than blending two chargers' histories.
 
 All history lands in a single `wallmonitor.db` SQLite file — back up that
 one file and you have everything. For every option, and for running it as a

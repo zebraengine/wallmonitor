@@ -36,11 +36,13 @@ class SimState:
     world as of "now", and a test can pin `start` to make it deterministic."""
 
     def __init__(
-        self, speedup: float = 1.0, start: float | None = None, split_phase: bool = False
+        self, speedup: float = 1.0, start: float | None = None, split_phase: bool = False,
+        serial: str = "SIM12345678901",
     ):
         self.t0 = start if start is not None else time.time()
         self.speedup = speedup
         self.split_phase = split_phase
+        self.serial = serial
         self.boot_ts = self.t0
         self.lifetime_energy_wh = 2_566_837.0
         self.charge_starts = 450
@@ -171,7 +173,7 @@ class SimState:
             "firmware_version": "24.36.3+gsimulated00",
             "git_branch": "HEAD",
             "part_number": "1529455-02-D",
-            "serial_number": "SIM12345678901",
+            "serial_number": self.serial,
             "web_service": "h3-hermes-prd.sn.tesla.services",
         }
 
@@ -224,10 +226,12 @@ def make_app(state: SimState | None = None) -> web.Application:
 
 
 async def start_simulator(
-    port: int = 0, speedup: float = 1.0, start: float | None = None, split_phase: bool = False
+    port: int = 0, speedup: float = 1.0, start: float | None = None, split_phase: bool = False,
+    serial: str = "SIM12345678901",
 ) -> tuple[web.AppRunner, int]:
     """Start the simulator on localhost. Returns (runner, bound_port)."""
-    runner = web.AppRunner(make_app(SimState(speedup=speedup, start=start, split_phase=split_phase)))
+    state = SimState(speedup=speedup, start=start, split_phase=split_phase, serial=serial)
+    runner = web.AppRunner(make_app(state))
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", port)
     await site.start()
