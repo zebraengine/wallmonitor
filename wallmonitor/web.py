@@ -32,6 +32,23 @@ def _float_q(request: web.Request, name: str, default: float) -> float:
         return default
 
 
+@web.middleware
+async def _compress_json(request: web.Request, handler):
+    """gzip the JSON API when the client accepts it. A session page is a
+    megabyte of numbers that compresses ~8×; the SSE stream and static
+    files are left alone (streams must not be buffered, and the UI assets
+    are small)."""
+    response = await handler(request)
+    if (
+        isinstance(response, web.Response)
+        and response.body is not None
+        and response.content_type == "application/json"
+        and len(response.body) > 2048
+    ):
+        response.enable_compression()
+    return response
+
+
 def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Application:
     """Assemble the HTTP app: static UI, JSON API, SSE stream, two ingests.
 
@@ -42,7 +59,7 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
     reads come from the DB, live data from the poller's EventBus. poller is
     None only in tests that exercise the API without a device.
     """
-    app = web.Application()
+    app = web.Application(middlewares=[_compress_json])
 
     # Without cache headers browsers cache heuristically, so after an update
     # they may keep running stale UI code until a manual hard refresh.
