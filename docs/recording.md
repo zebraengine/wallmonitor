@@ -77,3 +77,14 @@ the recording pipeline in the order data flows through it.
   raised/cleared, charger reboots (uptime went backwards), charger
   unreachable/recovered, Wi-Fi disconnect/reconnect, internet lost/restored,
   firmware version changes, and monitor start/stop/gap.
+
+## Upgrading from a database recorded before 0.3
+
+The J1772 handshake and relay diagnostics (pilot, proximity, relay
+voltages) used to be read out of each row's raw JSON on every query, which
+made long sessions slow to chart. They are real columns now. The first
+start after upgrading backfills them for every existing row in the
+background — chunked, so live polling only ever waits a moment; a 1.3
+million-row database takes about a minute — and logs `diagnostics
+backfill complete` when done. Until then, queries fall back to the JSON
+for rows not yet reached, so nothing is missing in the meantime.

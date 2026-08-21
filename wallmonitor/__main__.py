@@ -30,6 +30,19 @@ from .web import make_app
 log = logging.getLogger("wallmonitor")
 
 
+async def _backfill(db: Database) -> None:
+    """One-time, in the background: fill diagnostics columns for rows
+    recorded before those columns existed. Chunked, so live polling only
+    ever waits a moment; a settings flag makes later startups a no-op."""
+    def report(done: int, total: int) -> None:
+        if done % 200_000 < 10_000 or done >= total:
+            log.info("diagnostics backfill: %d / %d rows", done, total)
+
+    touched = await asyncio.to_thread(db.backfill_diag_columns, 10_000, report)
+    if touched:
+        log.info("diagnostics backfill complete: %d rows", touched)
+
+
 async def run(argv: list[str] | None = None) -> None:
     """Construct every component, serve until cancelled, unwind in order.
 
@@ -52,6 +65,7 @@ async def run(argv: list[str] | None = None) -> None:
     client = aiohttp.ClientSession()
     poller = Poller(cfg, db, bus, client)
     await poller.start()
+    backfill = asyncio.create_task(_backfill(db), name="wallmonitor-backfill")
 
     app = make_app(db, bus, poller)
     runner = web.AppRunner(app)
@@ -65,6 +79,7 @@ async def run(argv: list[str] | None = None) -> None:
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
+        backfill.cancel()
         await poller.stop()
         await runner.cleanup()
         if sim_runner:

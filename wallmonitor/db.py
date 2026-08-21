@@ -180,7 +180,33 @@ VITALS_COLUMNS = {
     "evse_state": "evse_state",
     "config_status": "config_status",
     "uptime_s": "uptime_s",
+    # J1772 handshake / relay diagnostics. Added as columns later than the
+    # rest (they used to be read out of the raw JSON on every query, which
+    # made long sessions slow to chart); rows from before the column existed
+    # are backfilled by backfill_diag_columns and served via COALESCE until
+    # then.
+    "pilot_high_v": "pilot_high_v",
+    "pilot_low_v": "pilot_low_v",
+    "prox_v": "prox_v",
+    "relay_k1_v": "relay_k1_v",
+    "relay_k2_v": "relay_k2_v",
 }
+
+# Columns added after the table was first shipped: ALTER TABLE'd in on
+# open when missing (CREATE TABLE IF NOT EXISTS can't add them).
+VITALS_LATER_COLUMNS = ("pilot_high_v", "pilot_low_v", "prox_v", "relay_k1_v", "relay_k2_v")
+DIAG_BACKFILL_SETTING = "diag_backfill_done"
+
+
+def _round_rows(rows: list[dict], digits: int = 2) -> list[dict]:
+    """Trim float noise before JSON: bucket averages come out with 15
+    digits, which roughly doubles the payload for no visible difference
+    on a chart. Timestamps keep full precision."""
+    for row in rows:
+        for key, value in row.items():
+            if key != "ts" and isinstance(value, float):
+                row[key] = round(value, digits)
+    return rows
 
 
 class Database:
@@ -204,6 +230,59 @@ class Database:
             )
             self._conn.executescript(SCHEMA)
             self._conn.commit()
+            self._migrate()
+        # Once every row carries the diagnostics columns, range queries stop
+        # mentioning raw entirely — merely referencing the blob column makes
+        # SQLite read it for every row, which is most of what made long
+        # sessions slow to chart.
+        self._diag_backfilled = self.get_setting(DIAG_BACKFILL_SETTING) == "1"
+
+    def _migrate(self) -> None:
+        """Additive column migrations (caller holds the lock)."""
+        have = {row[1] for row in self._conn.execute("PRAGMA table_info(vitals_samples)")}
+        for col in VITALS_LATER_COLUMNS:
+            if col not in have:
+                self._conn.execute(f"ALTER TABLE vitals_samples ADD COLUMN {col} REAL")
+        self._conn.commit()
+
+    def backfill_diag_columns(self, chunk: int = 10_000, progress=None) -> int:
+        """Fill the diagnostics columns for rows recorded before they
+        existed, from each row's raw JSON, in id-ordered chunks so the
+        poller's inserts only ever wait one chunk. Idempotent and
+        resumable; returns rows touched. Runs once — a settings flag
+        records completion."""
+        if self.get_setting(DIAG_BACKFILL_SETTING):
+            return 0
+        touched = 0
+        last = int(self.get_setting("diag_backfill_id") or 0)
+        while True:
+            with self._lock:
+                top = self._conn.execute("SELECT MAX(id) FROM vitals_samples").fetchone()[0] or 0
+                if last >= top:
+                    self._execute("INSERT INTO settings(key, value) VALUES (?, '1') "
+                                  "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                                  (DIAG_BACKFILL_SETTING,))
+                    self._execute("DELETE FROM settings WHERE key = 'diag_backfill_id'")
+                    self._diag_backfilled = True
+                    return touched
+                upto = min(top, last + chunk)
+                cur = self._execute(
+                    """UPDATE vitals_samples SET
+                           pilot_high_v = json_extract(raw, '$.pilot_high_v'),
+                           pilot_low_v  = json_extract(raw, '$.pilot_low_v'),
+                           prox_v       = json_extract(raw, '$.prox_v'),
+                           relay_k1_v   = COALESCE(json_extract(raw, '$.relay_k1_v'),
+                                                   json_extract(raw, '$.relay_coil_v')),
+                           relay_k2_v   = json_extract(raw, '$.relay_k2_v')
+                       WHERE id > ? AND id <= ? AND prox_v IS NULL""",
+                    (last, upto),
+                )
+                touched += cur.rowcount
+                last = upto
+                self._execute("INSERT INTO settings(key, value) VALUES ('diag_backfill_id', ?) "
+                              "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(last),))
+            if progress:
+                progress(last, top)
 
     def close(self) -> None:
         """Close the shared connection. Owner-only: called once at process
@@ -229,6 +308,8 @@ class Database:
         the complete raw JSON. Returns the new row id (the SSE frame carries
         it so clients can de-duplicate)."""
         cols = {col: raw.get(json_key) for col, json_key in VITALS_COLUMNS.items()}
+        if cols["relay_k1_v"] is None:
+            cols["relay_k1_v"] = raw.get("relay_coil_v")  # older firmware's name for it
         with self._lock:
             cur = self._execute(
                 f"""INSERT INTO vitals_samples
@@ -530,13 +611,23 @@ class Database:
         )
         # Handshake diagnostics live only in the raw JSON; json_extract makes
         # them chartable retroactively for every sample ever recorded.
-        diag = """json_extract(raw, '$.pilot_high_v') AS pilot_high_v,
-                  json_extract(raw, '$.pilot_low_v') AS pilot_low_v,
-                  json_extract(raw, '$.prox_v') AS prox_v,
-                  COALESCE(json_extract(raw, '$.relay_k1_v'), json_extract(raw, '$.relay_coil_v')) AS relay_k1_v,
-                  json_extract(raw, '$.relay_k2_v') AS relay_k2_v"""
+        # Diagnostics are columns now; the json_extract fallback only runs
+        # for rows the one-time backfill hasn't reached (COALESCE stops at
+        # the first non-NULL, so backfilled rows never touch the JSON).
+        if self._diag_backfilled:
+            d = {col: col for col in VITALS_LATER_COLUMNS}
+        else:
+            d = {
+                "pilot_high_v": "COALESCE(pilot_high_v, json_extract(raw, '$.pilot_high_v'))",
+                "pilot_low_v": "COALESCE(pilot_low_v, json_extract(raw, '$.pilot_low_v'))",
+                "prox_v": "COALESCE(prox_v, json_extract(raw, '$.prox_v'))",
+                "relay_k1_v": "COALESCE(relay_k1_v, json_extract(raw, '$.relay_k1_v'), "
+                              "json_extract(raw, '$.relay_coil_v'))",
+                "relay_k2_v": "COALESCE(relay_k2_v, json_extract(raw, '$.relay_k2_v'))",
+            }
+        diag = ", ".join(f"{expr} AS {col}" for col, expr in d.items())
         if sample_count <= max_points:
-            return self._rows(
+            return _round_rows(self._rows(
                 f"""SELECT ts, total_power_w, vehicle_current_a, current_a_a, current_b_a, current_c_a,
                           voltage_a_v, voltage_b_v, voltage_c_v, grid_v, grid_hz,
                           {t_pcba} AS pcba_temp_c, {t_handle} AS handle_temp_c, {t_mcu} AS mcu_temp_c,
@@ -545,9 +636,9 @@ class Database:
                           {diag}
                    FROM vitals_samples WHERE ts >= ? AND ts <= ? ORDER BY ts""",
                 (t_from, t_to),
-            )
+            ))
         width = (t_to - t_from) / max_points
-        return self._rows(
+        return _round_rows(self._rows(
             f"""SELECT MIN(ts) AS ts, AVG(total_power_w) AS total_power_w, MAX(total_power_w) AS max_power_w,
                       AVG(vehicle_current_a) AS vehicle_current_a,
                       AVG(current_a_a) AS current_a_a, AVG(current_b_a) AS current_b_a,
@@ -561,15 +652,11 @@ class Database:
                       MAX(vehicle_connected) AS vehicle_connected,
                       MAX(contactor_closed) AS contactor_closed,
                       MAX(evse_state) AS evse_state, MAX(session_id) AS session_id,
-                      AVG(json_extract(raw, '$.pilot_high_v')) AS pilot_high_v,
-                      AVG(json_extract(raw, '$.pilot_low_v')) AS pilot_low_v,
-                      AVG(json_extract(raw, '$.prox_v')) AS prox_v,
-                      AVG(COALESCE(json_extract(raw, '$.relay_k1_v'), json_extract(raw, '$.relay_coil_v'))) AS relay_k1_v,
-                      AVG(json_extract(raw, '$.relay_k2_v')) AS relay_k2_v
+                      {", ".join(f"AVG({expr}) AS {col}" for col, expr in d.items())}
                FROM vitals_samples WHERE ts >= ? AND ts <= ?
                GROUP BY CAST((ts - ?) / ? AS INTEGER) ORDER BY ts""",
             (t_from, t_to, t_from, width),
-        )
+        ))
 
     def lifetime_range(self, t_from: float, t_to: float, max_points: int = 3000) -> list[dict]:
         """Lifetime counter samples in a range (counters are monotonic, so
