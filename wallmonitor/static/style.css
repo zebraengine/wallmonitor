@@ -59,6 +59,9 @@ body {
 .brand { font-weight: 650; font-size: 15px; }
 .chip.device { cursor: default; font-weight: 600; color: var(--text-primary); }
 .chip.device.bad { color: var(--status-critical); border-color: var(--status-critical); }
+.peers { display: flex; align-items: center; gap: 6px; }
+.peers-label { color: var(--text-muted); font-size: 12px; }
+.peers a.chip { text-decoration: none; }
 .tabs { display: flex; gap: 4px; }
 .tabs a {
   color: var(--text-secondary); text-decoration: none;

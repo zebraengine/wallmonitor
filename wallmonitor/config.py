@@ -11,6 +11,7 @@ off exponentially instead of hammering a struggling device.
 from __future__ import annotations
 
 import argparse
+import re
 import os
 from dataclasses import dataclass
 
@@ -32,6 +33,9 @@ class Config:
     # Human name for this charger, shown in the UI header, tab title and
     # notifications so several instances side by side stay attributable.
     label: str = ""
+    # Sibling instances watching other chargers, as (label, url) pairs;
+    # rendered as a switcher in the header so one browser hops between them.
+    peers: tuple[tuple[str, str], ...] = ()
     # --discover [RANGE]: sweep the LAN for chargers and exit. None = not
     # requested; "auto" = the host's own subnet; otherwise a CIDR.
     discover: str | None = None
@@ -82,6 +86,16 @@ def _env(name: str, default):
     if isinstance(default, int):
         return int(val)
     return val
+
+
+def parse_peer(spec: str) -> tuple[str, str]:
+    """'Label=http://host:port' → (label, url). The URL must be absolute
+    http(s); the label is whatever the user wants to see on the switch."""
+    label, sep, url = spec.partition("=")
+    label, url = label.strip(), url.strip()
+    if not sep or not label or not re.match(r"^https?://[^\s/]+", url):
+        raise ValueError(f"--peer expects LABEL=http://host:port, got {spec!r}")
+    return label, url.rstrip("/")
 
 
 def parse_args(argv: list[str] | None = None) -> Config:
@@ -136,6 +150,14 @@ def parse_args(argv: list[str] | None = None) -> Config:
         "running one instance per Wall Connector (env: WM_LABEL)",
     )
     parser.add_argument(
+        "--peer",
+        action="append",
+        default=None,
+        metavar="LABEL=URL",
+        help="Another wallmonitor instance to link from the header, e.g. "
+        "'Garage right=http://192.168.1.10:8481'; repeatable (env: WM_PEERS, comma-separated)",
+    )
+    parser.add_argument(
         "--discover",
         nargs="?",
         const="auto",
@@ -165,6 +187,14 @@ def parse_args(argv: list[str] | None = None) -> Config:
     )
     args = parser.parse_args(argv)
 
+    peer_specs = args.peer if args.peer is not None else [
+        part for part in os.getenv("WM_PEERS", "").split(",") if part.strip()
+    ]
+    try:
+        peers = tuple(parse_peer(spec) for spec in peer_specs)
+    except ValueError as ex:
+        parser.error(str(ex))
+
     if not args.demo and not args.host and args.discover is None:
         parser.error(
             "--host (or WM_WC_HOST) is required — run `wallmonitor --discover` to find "
@@ -179,6 +209,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         demo=bool(args.demo),
         split_phase=bool(args.split_phase),
         label=args.label,
+        peers=peers,
         discover=args.discover,
         notify_url=args.notify_url,
         notify_format=args.notify_format,

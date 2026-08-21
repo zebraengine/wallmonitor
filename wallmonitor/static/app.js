@@ -778,6 +778,20 @@ function renderDeviceChip(poller) {
   document.title = `${poller.label || name} · Wall Connector Monitor`;
 }
 
+// Sibling instances (--peer): one chip per other charger, linking straight
+// to its dashboard, with this page's current view carried along so hopping
+// between chargers keeps you on the same tab.
+function renderPeers(peers) {
+  const nav = $("#peer-switch");
+  nav.textContent = "";
+  if (!peers.length) { nav.hidden = true; return; }
+  nav.hidden = false;
+  nav.append(el("span", { class: "peers-label" }, "also:"));
+  for (const peer of peers) {
+    nav.append(el("a", { class: "chip", href: peer.url + "/" + (location.hash || ""), title: `Open ${peer.label}` }, peer.label));
+  }
+}
+
 function setConnDot(ok, text) {
   const dot = $("#conn-dot"), textEl = $("#conn-text");
   dot.className = "dot " + (ok ? "ok" : "bad");
@@ -790,6 +804,7 @@ async function refreshStatus() {
     live.status = st;
     const poller = st.poller || {};
     renderDeviceChip(poller);
+    renderPeers(poller.peers || []);
     const stale = st.vitals ? (st.server_ts - st.vitals.ts) : null;
     if (poller.offline) setConnDot(false, `charger unreachable (${poller.last_poll_error || "no response"})`);
     else if (poller.serial_mismatch) setConnDot(false, `wrong charger at ${poller.host} — recording paused`);
