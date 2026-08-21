@@ -433,8 +433,9 @@ function lineChart(box, opts) {
         `L${xOf(dataset.points[0][0]).toFixed(1)},${yOf(yt.min).toFixed(1)}Z`;
       root.append(svg("path", { d: areaPath, fill: dataset.color, "fill-opacity": 0.1, stroke: "none" }));
     }
-    const stroke = { d: pathData, fill: "none", stroke: dataset.color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" };
+    const stroke = { d: pathData, fill: "none", stroke: dataset.color, "stroke-width": dataset.width || 2, "stroke-linejoin": "round", "stroke-linecap": "round" };
     if (dataset.dash) stroke["stroke-dasharray"] = dataset.dash;
+    if (dataset.opacity != null) stroke["stroke-opacity"] = dataset.opacity;
     root.append(svg("path", stroke));
   }
 
@@ -1149,7 +1150,7 @@ async function viewLive(root) {
     };
     const series = [
       { name: "Plug handle", color: colors.s2, points: thin(buf.filter((sample) => sample.ts >= xFrom).map((sample) => [sample.ts, sample.tHandle])) },
-      { name: "Projected plateau", color: colors.s5, dash: "6 4", gap: FORECAST_GAP_S, points: tbuf.map((point) => [point.ts, point.steady]) },
+      { name: "Projected plateau (if this current holds)", color: colors.s5, dash: "6 4", gap: FORECAST_GAP_S, points: tbuf.map((point) => [point.ts, point.steady]) },
       { name: "Garage ambient", color: colors.s3, points: thin(abuf.filter((point) => point[0] >= xFrom)) },
     ];
     if (projecting) {
@@ -1357,7 +1358,9 @@ async function viewSessionDetail(root, id) {
   const temp = chartCard("Temperatures",
     `Plug handle, charger circuit board (PCBA), and processor (MCU). At ${HANDLE_TRIP_C}°C on the handle, alert 40 raises ` +
     `and current is halved (observed on this firmware); the ≈${PCBA_THROTTLE_C}°C line is the community-observed PCBA throttle point. ` +
-    `The dashed line is the plateau the forecast predicted at each 30 s tick — watch it converge onto the measured curve as the fit gets data.`);
+    `The dashed line is the plateau the forecast predicted at each 30 s tick — where the handle would settle if that current held, ` +
+    `not where a short top-off will stop. Faint dots are the model-only estimate before the handle has produced trajectory data; ` +
+    `watch the firm line converge onto the measured curve as the fit gets data.`);
   const pilot = chartCard("Pilot & proximity", "J1772 handshake signals — flaky values here often precede charging errors");
   const relay = chartCard("Relay voltages", "Contactor coil drive");
   const eventsWrap = el("div", {});
@@ -1411,16 +1414,34 @@ async function viewSessionDetail(root, id) {
     // would plateau at, at each 30 s tick. Early guesses run high on thin
     // trajectory data and converge as the fit firms up — that convergence
     // is the point of drawing it against the measured curve.
-    const forecastPts = fullForecasts
-      .filter((row) => row.ts >= xFrom && row.ts <= xTo)
-      .map((row) => [row.ts, row.steady_state_c]);
+    // Two series by basis. Before the handle has produced a few minutes of
+    // trajectory, the forecaster answers from the model alone (ambient +
+    // rise at the present current) — the honest asymptote, but it ramps up
+    // from ambient as current ramps and reads like a spike on short
+    // top-offs. Those early ticks are drawn faint; the trajectory-based
+    // ticks are the line to read. The boundary tick is shared so the two
+    // runs join instead of leaving a hole.
+    const inWindow = fullForecasts.filter((row) => row.ts >= xFrom && row.ts <= xTo);
+    const earlyPts = [], firmPts = [];
+    inWindow.forEach((row, idx) => {
+      const firm = row.basis === "trajectory";
+      const point = [row.ts, row.steady_state_c];
+      (firm ? firmPts : earlyPts).push(point);
+      const next = inWindow[idx + 1];
+      if (!firm && next && next.basis === "trajectory" && next.ts - row.ts <= FORECAST_GAP_S) firmPts.push(point);
+    });
     const tempSeries = [
       { name: "Circuit board (PCBA)", color: colors.s1, points: samples.map((sample) => [sample.ts, sample.tPcba]) },
       { name: "Plug handle", color: colors.s2, points: samples.map((sample) => [sample.ts, sample.tHandle]) },
       { name: "Processor (MCU)", color: colors.s3, points: samples.map((sample) => [sample.ts, sample.tMcu]) },
     ];
-    if (forecastPts.length) {
-      tempSeries.push({ name: "Predicted plateau", color: colors.s5, dash: "6 4", gap: FORECAST_GAP_S, points: forecastPts });
+    if (earlyPts.length) {
+      tempSeries.push({ name: "Early estimate (model only, no trajectory yet)", color: colors.s5, dash: "2 4",
+        width: 1.5, opacity: 0.45, gap: FORECAST_GAP_S, points: earlyPts });
+    }
+    if (firmPts.length) {
+      tempSeries.push({ name: "Predicted plateau (if this current holds)", color: colors.s5, dash: "6 4",
+        gap: FORECAST_GAP_S, points: firmPts });
     }
     lineChart(temp.box, {
       series: tempSeries, unit: "°C", digits: 1, xFrom, xTo, height: 190,
