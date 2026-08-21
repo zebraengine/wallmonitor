@@ -36,6 +36,9 @@ from .db import Database
 
 log = logging.getLogger("wallmonitor.poller")
 
+IDENTITY_ALERT = "Different charger at this address"
+SERIAL_SETTING = "device_serial"
+
 
 class EventBus:
     """Fan-out of live updates to SSE subscribers."""
@@ -105,6 +108,12 @@ class Poller:
         self._verify_resumed = False
         # per-endpoint scheduling state: next due time and current backoff interval
         self._due: dict[str, float] = {"vitals": 0.0, "wifi": 0.0, "lifetime": 0.0, "version": 0.0}
+        # Device identity. The serial pinned on first contact is the charger
+        # this database belongs to; until this run has confirmed the device
+        # at --host carries it, nothing is recorded (see _poll).
+        self.device_serial: str | None = None
+        self.serial_mismatch: str | None = None
+        self._identity_checked = False
         self._fail_streak: dict[str, int] = dict.fromkeys(self._due, 0)
         # device state tracking
         self._prev_vitals: dict | None = None
@@ -154,11 +163,15 @@ class Poller:
         # still connected once we get our first sample; remember it for now.
         self._session_id = self.db.open_session_id()
         self._verify_resumed = self._session_id is not None
+        self.device_serial = self.db.get_setting(SERIAL_SETTING)
         for alert in self.db.active_alerts():
             if alert["source"] == "device":
                 self._active_alerts.add(alert["alert"])
             elif alert["alert"] == thermal.DERATE_ALERT:
                 self._derate_active = True
+            elif alert["alert"] == IDENTITY_ALERT:
+                # Re-latch so the first matching serial this run clears it.
+                self.serial_mismatch = "?"
 
     async def stop(self) -> None:
         """Signal the loop, wait for it to finish, record monitor_stop."""
@@ -186,6 +199,10 @@ class Poller:
             due_now = [ep for ep, due_ts in self._due.items() if now >= due_ts]
             if due_now:
                 endpoint = min(due_now, key=lambda ep: self._due[ep])
+                # Identity before data: until this run has read the serial,
+                # the only endpoint worth polling is version.
+                if not self._identity_checked:
+                    endpoint = "version"
                 await self._poll(endpoint, handlers[endpoint])
             next_due = min(self._due.values())
             delay = max(0.05, min(next_due - time.time(), 1.0))
@@ -236,6 +253,12 @@ class Poller:
             # active by a previous run that never recovered before exiting.
             await asyncio.to_thread(self.db.clear_alert, ts, "Wall Connector unreachable", "monitor")
         self._had_success = True
+        if endpoint != "version" and (not self._identity_checked or self.serial_mismatch):
+            # Unverified or wrong device: poll (so recovery is noticed) but
+            # record nothing — blending another charger's telemetry into
+            # this database's per-install history is the one unrecoverable
+            # failure, so it is the one we refuse outright.
+            return
         try:
             await handler(ts, raw)
         except Exception:
@@ -249,13 +272,17 @@ class Poller:
         dropped packet doesn't page anyone."""
         ts = time.time()
         streak = self._fail_streak[endpoint] = self._fail_streak[endpoint] + 1
-        base = self._base_interval(endpoint)
+        # Until identity is verified the version probe carries the run, so it
+        # retries on the vitals cadence (not its own six-hour one) and its
+        # failures are what count as "unreachable".
+        liveness = "vitals" if self._identity_checked else "version"
+        base = self._base_interval(endpoint if self._identity_checked else "vitals")
         backoff = min(base * (self.cfg.backoff_factor ** min(streak, 8)), self.cfg.backoff_max)
         self._due[endpoint] = ts + backoff
         self.last_poll_error = f"{type(ex).__name__}: {ex}"
         log.warning("poll %s failed (streak %d, retry in %.0fs): %s", endpoint, streak, backoff, ex)
-        # Declare the device offline after 3 consecutive vitals failures.
-        if endpoint == "vitals" and streak == 3 and not self._offline:
+        # Declare the device offline after 3 consecutive liveness failures.
+        if endpoint == liveness and streak == 3 and not self._offline:
             self._offline = True
             await asyncio.to_thread(self.db.raise_alert, ts, "Wall Connector unreachable", "monitor")
             await asyncio.to_thread(self.db.add_event, ts, "poll_error", {"endpoint": endpoint, "error": str(ex)})
@@ -413,8 +440,12 @@ class Poller:
         self.bus.publish({"type": "lifetime", "ts": ts, "data": raw})
 
     async def _handle_version(self, ts: float, raw: dict) -> None:
-        """Store version info only when it changed (it's polled every 6 h
-        but almost never differs), and event on firmware changes."""
+        """Verify device identity, then store version info only when it
+        changed (it's polled every 6 h but almost never differs), and event
+        on firmware changes."""
+        await self._check_identity(ts, raw.get("serial_number"))
+        if self.serial_mismatch:
+            return
         latest = await asyncio.to_thread(self.db.latest_version)
         if latest is not None and latest.get("firmware_version") != raw.get("firmware_version"):
             await self._event(
@@ -424,6 +455,44 @@ class Poller:
             )
         if latest is None or json.loads(latest["raw"]) != raw:
             await asyncio.to_thread(self.db.insert_version, ts, raw)
+
+    async def _check_identity(self, ts: float, serial: str | None) -> None:
+        """Pin the serial on first contact; afterwards insist on it.
+
+        The database's thermal model, degradation trend and session history
+        describe one physical charger. If a different one answers at --host
+        (DHCP reshuffle, a second unit, a typo) we alarm and stop recording
+        until the right device is back, rather than quietly fit a chimera."""
+        self._identity_checked = True
+        if not serial:
+            return  # firmware that doesn't report one: nothing to pin against
+        if self.device_serial is None:
+            self.device_serial = serial
+            await asyncio.to_thread(self.db.set_setting, SERIAL_SETTING, serial)
+            await self._event(ts, "device_pinned", {"serial": serial, "host": self.cfg.host})
+            return
+        if serial != self.device_serial:
+            if self.serial_mismatch != serial:
+                self.serial_mismatch = serial
+                log.error("serial mismatch at %s: expected %s, found %s — recording suspended",
+                          self.cfg.host, self.device_serial, serial)
+                await asyncio.to_thread(self.db.raise_alert, ts, IDENTITY_ALERT, "monitor")
+                await self._event(ts, "device_mismatch",
+                                  {"expected": self.device_serial, "found": serial, "host": self.cfg.host})
+                await self._notify(
+                    "device_mismatch", IDENTITY_ALERT,
+                    f"{self.cfg.host} now answers as serial …{serial[-6:]}, but this database "
+                    f"belongs to …{self.device_serial[-6:]}. Recording is paused until the "
+                    "right charger is back at this address (or --host is corrected).",
+                    {"expected": self.device_serial, "found": serial},
+                )
+            # Re-check soon rather than in six hours.
+            self._due["version"] = ts + max(30.0, self.cfg.vitals_interval_idle * 6)
+            return
+        if self.serial_mismatch:
+            self.serial_mismatch = None
+            await asyncio.to_thread(self.db.clear_alert, ts, IDENTITY_ALERT, "monitor")
+            await self._event(ts, "device_restored", {"serial": serial, "host": self.cfg.host})
 
     async def recheck_thermal_drift(self, ts: float) -> None:
         """Refit history and raise/clear the degradation alert.
@@ -580,6 +649,8 @@ class Poller:
         custom receivers); "ntfy" posts plain text with ntfy's publish
         headers so notify_url can be a self-hosted ntfy topic directly.
         """
+        if self.cfg.label:
+            title = f"[{self.cfg.label}] {title}"
         url = self.cfg.notify_url
         if not url:
             return
@@ -616,6 +687,9 @@ class Poller:
         the footer's "watching …" line)."""
         return {
             "host": self.cfg.host,
+            "label": self.cfg.label,
+            "device_serial": self.device_serial,
+            "serial_mismatch": self.serial_mismatch,
             "offline": self._offline,
             "last_poll_ok_ts": self.last_poll_ok_ts,
             "last_poll_error": self.last_poll_error,

@@ -9,11 +9,9 @@ git clone https://github.com/zebraengine/wallmonitor
 cd wallmonitor
 uv sync
 
-# against your real Wall Connector: find its IP in your router's client
-# list — it registers a DHCP hostname like TeslaWallConnector_XXXXXX
-# (same suffix as its setup Wi-Fi SSID), which some routers make
-# resolvable by name. The device does not answer mDNS, so a bare
-# ".local" name won't work; when in doubt, use the IP:
+# find your Wall Connector on the LAN (see "Finding your charger" below)…
+uv run python -m wallmonitor --discover
+# …then watch it:
 uv run python -m wallmonitor --host 192.168.1.50
 
 # North American split-phase install (power = grid_v × vehicle_current):
@@ -44,6 +42,8 @@ is the charger's microcontroller.
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
 | `--host` | `WM_WC_HOST` | — | Wall Connector IP/hostname (required unless `--demo`) |
+| `--discover [RANGE]` | — | — | Sweep the LAN for Wall Connectors and exit (own subnet, or a private CIDR) |
+| `--label` | `WM_LABEL` | — | Name for this charger, shown in the header, tab title and notifications |
 | `--port` | `WM_PORT` | `8480` | Web UI port |
 | `--bind` | `WM_BIND` | `127.0.0.1` | Web UI bind address |
 | `--db` | `WM_DB` | `wallmonitor.db` | SQLite path |
@@ -57,6 +57,64 @@ is the charger's microcontroller.
 | `--demo` | `WM_DEMO` | off | Run against the built-in simulator |
 
 A hard floor of 1 s per endpoint is enforced regardless of flags.
+
+## Finding your charger
+
+The Gen 3 announces nothing on the network — no mDNS, no SSDP — and its
+DHCP hostname (`TeslaWallConnector_XXXXXX`, same suffix as its setup Wi-Fi
+SSID) lives only inside your router. So the tool finds it actively:
+
+```bash
+uv run python -m wallmonitor --discover              # this host's own /24
+uv run python -m wallmonitor --discover 192.168.2.0/24   # another subnet or VLAN
+```
+
+It sweeps port 80 across the range with short timeouts, then sends each
+responder exactly one tiny `GET /api/1/version` and keeps only answers
+carrying the Wall Connector's signature (firmware, part number and serial
+together) — no other device produces that, so there are no false
+positives. A /24 takes a second or two. Guardrails: only private (RFC 1918)
+ranges are ever swept, nothing wider than a /16 is accepted, and addresses
+in the neighbour cache with a Tesla-assigned MAC prefix are probed first.
+
+If the charger sits on a different subnet or VLAN from the machine running
+the monitor, pass that range explicitly — the default sweep only covers the
+host's own subnet. Nothing found at all usually means the charger isn't on
+Wi-Fi yet: commission it with the Tesla app first.
+
+## Device identity
+
+The database's thermal model, degradation trend and session history
+describe one physical charger, so the monitor treats the **serial number**
+as the device's identity — not its IP, which is just a DHCP lease. On first
+contact it pins the serial it sees (logged as a `device_pinned` event); on
+every start and every six hours after, it checks that the device at
+`--host` still carries it, *before* recording anything.
+
+If a different serial answers — a DHCP reshuffle swapped two devices, a
+second unit was installed, a typo — the monitor raises the alert
+**Different charger at this address**, notifies, and pauses recording until
+the right charger is back (or `--host` is corrected). Blending another
+charger's telemetry into a per-install history is the one unrecoverable
+mistake, so it is the one refused outright. Moving the monitor to a new
+charger on purpose means starting a new database (`--db`).
+
+## More than one Wall Connector
+
+Run one instance per charger, each with its own database, port and label:
+
+```bash
+uv run python -m wallmonitor --host 192.168.1.50 --label "Garage left"  --db left.db  --port 8480
+uv run python -m wallmonitor --host 192.168.1.51 --label "Garage right" --db right.db --port 8481
+```
+
+The label shows in the header, the browser tab title and every
+notification, so two dashboards side by side (and two phones' worth of
+alerts) stay attributable. Each instance keeps its own per-install thermal
+model, which is exactly what you want: two chargers in two spots have two
+thermal environments. `--discover` prints a ready-made pair of commands
+when it finds more than one device. A single-process, cross-device view is
+tracked as future work in issue #10.
 
 ## Run as a service (Ubuntu / systemd)
 

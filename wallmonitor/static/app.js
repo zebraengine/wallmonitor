@@ -763,6 +763,21 @@ function connectSSE() {
   es.onerror = () => setConnDot(false, "stream reconnecting…");
 }
 
+// Device identity in the header: the --label if one was given, else the
+// serial tail, so several instances side by side stay attributable — and
+// the tab title carries it too, for the same reason.
+function renderDeviceChip(poller) {
+  const chip = $("#device-chip");
+  const serial = poller.device_serial || "";
+  const name = poller.label || (serial ? `serial …${serial.slice(-6)}` : "");
+  if (!name) { chip.hidden = true; document.title = "Wall Connector Monitor"; return; }
+  chip.hidden = false;
+  chip.textContent = name;
+  chip.title = serial ? `Pinned to serial ${serial}` : "Which charger this instance watches";
+  chip.classList.toggle("bad", Boolean(poller.serial_mismatch));
+  document.title = `${poller.label || name} · Wall Connector Monitor`;
+}
+
 function setConnDot(ok, text) {
   const dot = $("#conn-dot"), textEl = $("#conn-text");
   dot.className = "dot " + (ok ? "ok" : "bad");
@@ -774,8 +789,10 @@ async function refreshStatus() {
     const st = await getJSON("/api/status");
     live.status = st;
     const poller = st.poller || {};
+    renderDeviceChip(poller);
     const stale = st.vitals ? (st.server_ts - st.vitals.ts) : null;
     if (poller.offline) setConnDot(false, `charger unreachable (${poller.last_poll_error || "no response"})`);
+    else if (poller.serial_mismatch) setConnDot(false, `wrong charger at ${poller.host} — recording paused`);
     else if (st.vitals) setConnDot(true, `charger online — last sample ${stale < 2 ? "now" : fmtDur(stale) + " ago"}`);
     else setConnDot(false, "no data yet");
     renderBanner(st.active_alerts || []);

@@ -57,6 +57,8 @@ body {
   position: sticky; top: 0; z-index: 20;
 }
 .brand { font-weight: 650; font-size: 15px; }
+.chip.device { cursor: default; font-weight: 600; color: var(--text-primary); }
+.chip.device.bad { color: var(--status-critical); border-color: var(--status-critical); }
 .tabs { display: flex; gap: 4px; }
 .tabs a {
   color: var(--text-secondary); text-decoration: none;

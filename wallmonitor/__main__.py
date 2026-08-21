@@ -22,6 +22,7 @@ from aiohttp import web
 
 from .config import parse_args
 from .db import Database
+from .discover import run_discovery
 from .poller import EventBus, Poller
 from .simulator import start_simulator
 from .web import make_app
@@ -36,6 +37,8 @@ async def run(argv: list[str] | None = None) -> None:
     then the web runner (readers), then the shared HTTP client, and close
     the database last so nothing can touch a closed connection."""
     cfg = parse_args(argv)
+    if cfg.discover is not None:
+        raise SystemExit(await run_discovery(cfg.discover, split_phase_hint=cfg.split_phase))
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
     sim_runner = None
