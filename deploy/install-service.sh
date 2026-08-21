@@ -7,6 +7,14 @@
 #   sudo ./install-service.sh --host 192.168.1.50 --bind 0.0.0.0 --port 8480
 #   sudo ./install-service.sh --uninstall
 #
+# More than one Wall Connector: give each its own --name. That yields a
+# separate unit (wallmonitor-<name>), a separate database (<name>.db) and
+# the label shown in that instance's UI and notifications; link the
+# instances to each other with --peer so the header can switch between them:
+#   sudo ./install-service.sh --name left  --host 192.168.1.50 --port 8480 --peer "right=http://192.168.1.10:8481"
+#   sudo ./install-service.sh --name right --host 192.168.1.51 --port 8481 --peer "left=http://192.168.1.10:8480"
+#   sudo ./install-service.sh --name right --uninstall
+#
 # The service runs as the invoking (non-root) user, restarts automatically on
 # failure, and starts on boot once the network is up. The database lands in
 # the monitor directory (wallmonitor.db) unless --db points elsewhere.
@@ -14,7 +22,6 @@
 set -euo pipefail
 
 SERVICE_NAME="wallmonitor"
-UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MONITOR_DIR="$(dirname "$SCRIPT_DIR")"
 
@@ -28,6 +35,9 @@ NOTIFY_FORMAT=""
 DEMO="0"
 RUN_USER="${SUDO_USER:-$(id -un)}"
 UNINSTALL="0"
+NAME=""
+LABEL=""
+PEERS=()
 
 usage() { grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
@@ -42,11 +52,25 @@ while [[ $# -gt 0 ]]; do
     --notify-format) NOTIFY_FORMAT="$2"; shift 2 ;;
     --demo) DEMO="1"; shift ;;
     --user) RUN_USER="$2"; shift 2 ;;
+    --name) NAME="$2"; shift 2 ;;
+    --label) LABEL="$2"; shift 2 ;;
+    --peer) PEERS+=("$2"); shift 2 ;;
     --uninstall) UNINSTALL="1"; shift ;;
     -h|--help) usage ;;
     *) echo "unknown argument: $1" >&2; usage 1 ;;
   esac
 done
+
+if [[ -n "$NAME" ]]; then
+  if [[ ! "$NAME" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo "error: --name may contain only letters, digits, '-' and '_' (got: ${NAME})" >&2
+    exit 1
+  fi
+  SERVICE_NAME="wallmonitor-${NAME}"
+  [[ -z "$LABEL" ]] && LABEL="$NAME"
+  [[ -z "$DB_PATH" ]] && DB_PATH="${MONITOR_DIR}/${NAME}.db"
+fi
+UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 
 if [[ "$(uname -s)" != "Linux" ]] || ! command -v systemctl >/dev/null 2>&1; then
   echo "error: this installer targets Linux with systemd (for macOS, ask for a launchd plist)" >&2
@@ -94,7 +118,7 @@ fi
 
 {
   echo "[Unit]"
-  echo "Description=Tesla Wall Connector monitor (wallmonitor)"
+  echo "Description=Tesla Wall Connector monitor (${SERVICE_NAME})"
   echo "Wants=network-online.target"
   echo "After=network-online.target"
   echo ""
@@ -110,6 +134,10 @@ fi
   [[ -n "$NOTIFY_URL" ]] && echo "Environment=WM_NOTIFY_URL=${NOTIFY_URL}"
   [[ -n "$NOTIFY_FORMAT" ]] && echo "Environment=WM_NOTIFY_FORMAT=${NOTIFY_FORMAT}"
   [[ "$DEMO" == "1" ]] && echo "Environment=WM_DEMO=1"
+  [[ -n "$LABEL" ]] && echo "Environment=WM_LABEL=${LABEL}"
+  if [[ ${#PEERS[@]} -gt 0 ]]; then
+    echo "Environment=WM_PEERS=$(IFS=,; echo "${PEERS[*]}")"
+  fi
   [[ -n "$CAP_LINE" ]] && echo "$CAP_LINE"
   echo "ExecStart=${UV_BIN} run --project ${MONITOR_DIR} python -m wallmonitor"
   echo "Restart=always"
@@ -126,7 +154,7 @@ echo ""
 echo "installed and started. Useful commands:"
 echo "  systemctl status ${SERVICE_NAME}      # is it running"
 echo "  journalctl -u ${SERVICE_NAME} -f      # follow logs"
-echo "  sudo $0 --uninstall                   # remove the service"
+echo "  sudo $0 ${NAME:+--name ${NAME} }--uninstall   # remove the service"
 if [[ "$DEMO" == "1" ]]; then
   echo "UI: http://$(hostname -I 2>/dev/null | awk '{print $1}'):${PORT} (demo mode)"
 else

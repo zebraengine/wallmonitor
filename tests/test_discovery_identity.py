@@ -185,3 +185,36 @@ async def test_label_prefixes_notification_titles(db, unused_tcp_port):
     finally:
         await runner.cleanup()
     assert received and received[0][0] == "[Garage left] Charger unreachable"
+
+
+# ---------- peers (multi-instance switcher) ----------
+
+
+def test_peer_flag_and_env_parse(monkeypatch):
+    from wallmonitor.config import parse_args, parse_peer
+
+    assert parse_peer("Garage right=http://192.168.1.10:8481/") == ("Garage right", "http://192.168.1.10:8481")
+    with pytest.raises(ValueError):
+        parse_peer("no-url-here")
+    with pytest.raises(ValueError):
+        parse_peer("left=ftp://x")
+
+    cfg = parse_args(["--demo", "--peer", "left=http://a:8480", "--peer", "right=http://b:8481"])
+    assert cfg.peers == (("left", "http://a:8480"), ("right", "http://b:8481"))
+
+    monkeypatch.setenv("WM_PEERS", "one=http://c:1, two=http://d:2")
+    cfg = parse_args(["--demo"])
+    assert cfg.peers == (("one", "http://c:1"), ("two", "http://d:2"))
+
+    with pytest.raises(SystemExit):
+        parse_args(["--demo", "--peer", "broken"])
+
+
+async def test_status_carries_label_and_peers(db, unused_tcp_port):
+    cfg = Config(host=f"127.0.0.1:{unused_tcp_port}", label="Garage left",
+                 peers=(("Garage right", "http://192.168.1.10:8481"),))
+    async with aiohttp.ClientSession() as client:
+        poller = Poller(cfg, db, EventBus(), client)
+        status = poller.status()
+    assert status["label"] == "Garage left"
+    assert status["peers"] == [{"label": "Garage right", "url": "http://192.168.1.10:8481"}]

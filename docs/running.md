@@ -44,6 +44,7 @@ is the charger's microcontroller.
 | `--host` | `WM_WC_HOST` | — | Wall Connector IP/hostname (required unless `--demo`) |
 | `--discover [RANGE]` | — | — | Sweep the LAN for Wall Connectors and exit (own subnet, or a private CIDR) |
 | `--label` | `WM_LABEL` | — | Name for this charger, shown in the header, tab title and notifications |
+| `--peer LABEL=URL` | `WM_PEERS` | — | Link another instance from the header switcher; repeatable (env: comma-separated) |
 | `--port` | `WM_PORT` | `8480` | Web UI port |
 | `--bind` | `WM_BIND` | `127.0.0.1` | Web UI bind address |
 | `--db` | `WM_DB` | `wallmonitor.db` | SQLite path |
@@ -79,8 +80,13 @@ in the neighbour cache with a Tesla-assigned MAC prefix are probed first.
 
 If the charger sits on a different subnet or VLAN from the machine running
 the monitor, pass that range explicitly — the default sweep only covers the
-host's own subnet. Nothing found at all usually means the charger isn't on
-Wi-Fi yet: commission it with the Tesla app first.
+host's own subnet. Discovery (and monitoring) is plain routed HTTP, so it
+works across VLANs wherever the router forwards between them — but the
+firewall must allow TCP port 80 from the monitor's network to the charger's.
+IoT-isolation setups often block that by default; if an explicit range
+still finds nothing, that rule is the first thing to check. Nothing found
+on a flat network usually means the charger isn't on Wi-Fi yet: commission
+it with the Tesla app first.
 
 ## Device identity
 
@@ -101,20 +107,37 @@ charger on purpose means starting a new database (`--db`).
 
 ## More than one Wall Connector
 
-Run one instance per charger, each with its own database, port and label:
+Run one instance per charger, each with its own database, port and label,
+and point them at each other with `--peer` so the header carries a switch:
 
 ```bash
-uv run python -m wallmonitor --host 192.168.1.50 --label "Garage left"  --db left.db  --port 8480
-uv run python -m wallmonitor --host 192.168.1.51 --label "Garage right" --db right.db --port 8481
+uv run python -m wallmonitor --host 192.168.1.50 --label "Garage left"  --db left.db  --port 8480 \
+    --peer "Garage right=http://192.168.1.10:8481"
+uv run python -m wallmonitor --host 192.168.1.51 --label "Garage right" --db right.db --port 8481 \
+    --peer "Garage left=http://192.168.1.10:8480"
 ```
 
 The label shows in the header, the browser tab title and every
-notification, so two dashboards side by side (and two phones' worth of
-alerts) stay attributable. Each instance keeps its own per-install thermal
-model, which is exactly what you want: two chargers in two spots have two
-thermal environments. `--discover` prints a ready-made pair of commands
-when it finds more than one device. A single-process, cross-device view is
-tracked as future work in issue #10.
+notification, so two dashboards (and two phones' worth of alerts) stay
+attributable; the peer chips hop to the other charger's dashboard keeping
+the same tab open. `--peer` is repeatable (or `WM_PEERS` as a comma-separated
+list). Each instance keeps its own per-install thermal model, which is
+exactly what you want: two chargers in two spots have two thermal
+environments. `--discover` prints a ready-made command per device when it
+finds more than one.
+
+As services, `deploy/install-service.sh --name <name>` does the bookkeeping:
+a unit per charger (`wallmonitor-<name>`), its own database (`<name>.db`),
+the label, and any `--peer` links:
+
+```bash
+sudo ./deploy/install-service.sh --name left  --host 192.168.1.50 --port 8480 --split-phase \
+    --peer "right=http://192.168.1.10:8481"
+sudo ./deploy/install-service.sh --name right --host 192.168.1.51 --port 8481 --split-phase \
+    --peer "left=http://192.168.1.10:8480"
+```
+
+A single-process, cross-device view is tracked as future work in issue #10.
 
 ## Run as a service (Ubuntu / systemd)
 
@@ -130,7 +153,8 @@ sudo ./deploy/install-service.sh --host 192.168.1.50 --split-phase
 
 The service runs as your (non-root) user with `--bind 0.0.0.0` by default so
 other machines your firewall permits can reach the UI. Options mirror the app
-flags (`--port`, `--bind`, `--db`, `--demo`, `--user`); `--uninstall` removes
+flags (`--port`, `--bind`, `--db`, `--demo`, `--user`, and `--name`/`--label`/`--peer`
+for multi-charger installs); `--uninstall` removes
 the service and leaves code and database untouched. Requires
 [uv](https://docs.astral.sh/uv/) installed for the service user.
 
