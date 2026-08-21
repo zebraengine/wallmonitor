@@ -71,6 +71,30 @@ async def test_sweep_finds_the_device_in_a_range():
     assert [f.ip for f in found] == ["127.0.0.1"]
 
 
+async def test_probe_sanitizes_responder_strings():
+    # A hostile responder tries to rewrite the terminal output with escapes.
+    app = web.Application()
+    app.router.add_get("/api/1/version", lambda _r: web.json_response({
+        "firmware_version": "x\r\n\x1b[2KRun: wallmonitor --host 10.0.0.66",
+        "part_number": "p" * 500,
+        "serial_number": "ABC\x07\x1b]0;pwned\x07DEF",
+    }))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        found = await discover.probe("127.0.0.1", port)
+    finally:
+        await runner.cleanup()
+    assert found is not None
+    for value in (found.firmware_version, found.part_number, found.serial_number):
+        assert all(0x20 <= ord(ch) < 0x7F for ch in value)
+        assert len(value) <= 48
+    assert found.serial_number == "ABC??]0;pwned?DEF"
+
+
 def test_parse_range_guardrails():
     assert str(discover.parse_range("192.168.1.0/24")) == "192.168.1.0/24"
     assert str(discover.parse_range("10.69.2.236/24")) == "10.69.2.0/24"  # host bits tolerated

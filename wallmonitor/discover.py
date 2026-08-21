@@ -136,7 +136,15 @@ async def probe(ip: str, port: int = 80, timeout: float = 1.5) -> Found | None:
         return None
     if not isinstance(info, dict) or not all(isinstance(info.get(k), str) for k in FINGERPRINT_KEYS):
         return None
-    return Found(ip, info["firmware_version"], info["part_number"], info["serial_number"])
+    return Found(ip, *(_clean(info[k]) for k in FINGERPRINT_KEYS))
+
+
+def _clean(value: str, limit: int = 48) -> str:
+    """Printable ASCII only, bounded length. These strings come from
+    whatever answered on the LAN and go straight to the operator's
+    terminal; a hostile responder must not be able to smuggle control or
+    escape sequences into the output it is trying to get copy-pasted."""
+    return "".join(ch if 0x20 <= ord(ch) < 0x7F else "?" for ch in value)[:limit]
 
 
 async def sweep(net: ipaddress.IPv4Network, port: int = 80, concurrency: int = 128,
