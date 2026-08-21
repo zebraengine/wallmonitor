@@ -161,6 +161,10 @@ function alertDisplay(alertStr, source) {
 // 255 (0xFF) is the device's "sensor read invalid" sentinel for temperatures.
 const realTemp = (value) => (value != null && value >= 255 ? null : value);
 
+// Forecast ticks arrive every 30 s while charging; a break longer than this
+// means charging stopped, and the dashed forecast line must not bridge it.
+const FORECAST_GAP_S = 300;
+
 // Community-observed (not Tesla-published) circuit-board temperature at which
 // the Gen 3 begins throttling charge current. Shown as a reference line so
 // headroom is visible; ambient-driven foldback in hot installs is the usual
@@ -351,7 +355,8 @@ function scatterChart(box, opts) {
 // unit?, digits?, height?, area? (single series only), zeroBase?, xFrom?,
 // xTo?, refLines?: [{value, label, below?}]}) — time-series lines with a
 // shared crosshair tooltip and auto legend (≥ 2 series). Null/non-finite
-// values are dropped per series (the path connects across gaps). Every call
+// values are dropped per series (the path connects across them unless the
+// series sets `gap`, seconds, beyond which the line breaks). Every call
 // is a full teardown + redraw; there is no incremental update path, which is
 // what makes 2 s live refreshes safe to reason about.
 function lineChart(box, opts) {
@@ -415,8 +420,14 @@ function lineChart(box, opts) {
 
   for (const dataset of series) {
     if (!dataset.points.length) continue;
-    const pathData = dataset.points.map((point, idx) =>
-      `${idx ? "L" : "M"}${xOf(point[0]).toFixed(1)},${yOf(point[1]).toFixed(1)}`).join("");
+    // A series with `gap` (seconds) is drawn as separate runs wherever two
+    // consecutive points are further apart than that — the forecast only
+    // exists while charging, and bridging a multi-hour idle stretch with
+    // one straight segment invents a slope nobody predicted.
+    const pathData = dataset.points.map((point, idx) => {
+      const broken = idx && dataset.gap && point[0] - dataset.points[idx - 1][0] > dataset.gap;
+      return `${idx && !broken ? "L" : "M"}${xOf(point[0]).toFixed(1)},${yOf(point[1]).toFixed(1)}`;
+    }).join("");
     if (opts.area && series.length === 1) {
       const areaPath = pathData + `L${xOf(dataset.points[dataset.points.length - 1][0]).toFixed(1)},${yOf(yt.min).toFixed(1)}` +
         `L${xOf(dataset.points[0][0]).toFixed(1)},${yOf(yt.min).toFixed(1)}Z`;
@@ -1138,7 +1149,7 @@ async function viewLive(root) {
     };
     const series = [
       { name: "Plug handle", color: colors.s2, points: thin(buf.filter((sample) => sample.ts >= xFrom).map((sample) => [sample.ts, sample.tHandle])) },
-      { name: "Projected plateau", color: colors.s5, dash: "6 4", points: tbuf.map((point) => [point.ts, point.steady]) },
+      { name: "Projected plateau", color: colors.s5, dash: "6 4", gap: FORECAST_GAP_S, points: tbuf.map((point) => [point.ts, point.steady]) },
       { name: "Garage ambient", color: colors.s3, points: thin(abuf.filter((point) => point[0] >= xFrom)) },
     ];
     if (projecting) {
@@ -1409,7 +1420,7 @@ async function viewSessionDetail(root, id) {
       { name: "Processor (MCU)", color: colors.s3, points: samples.map((sample) => [sample.ts, sample.tMcu]) },
     ];
     if (forecastPts.length) {
-      tempSeries.push({ name: "Predicted plateau", color: colors.s5, dash: "6 4", points: forecastPts });
+      tempSeries.push({ name: "Predicted plateau", color: colors.s5, dash: "6 4", gap: FORECAST_GAP_S, points: forecastPts });
     }
     lineChart(temp.box, {
       series: tempSeries, unit: "°C", digits: 1, xFrom, xTo, height: 190,
