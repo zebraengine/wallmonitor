@@ -36,18 +36,28 @@ On first contact the monitor pins the charger's serial number: if a
 different unit ever answers at that address, it alarms and pauses recording
 rather than blending two chargers' histories.
 
+More than one Wall Connector? Run one instance per charger — `--label` names
+each in the header and notifications, `--peer` links them so the header hops
+between dashboards, and the service installer's `--name` does it all per
+charger in one command. See [More than one Wall Connector](https://github.com/zebraengine/wallmonitor/blob/main/docs/running.md#more-than-one-wall-connector).
+
 All history lands in a single `wallmonitor.db` SQLite file — back up that
 one file and you have everything. For every option, and for running it as a
 systemd service on an always-on box, see [Running wallmonitor](https://github.com/zebraengine/wallmonitor/blob/main/docs/running.md).
 
 ## At a glance
 
+- Zero-config setup — `--discover` finds the charger on your LAN; the
+  serial is pinned on first contact so a swapped or second unit can never
+  blend into your history
 - Full-fidelity recording — every response stored with its complete raw JSON
 - Live dashboard (SSE) with rolling charts, an active-alert banner, and a
   live derate-forecast chart: measured handle temperature against the
   model's projected plateau and the trip threshold, projection drawn
   forward so the predicted trip intercept is visible on the chart
-- Session review: energy, peak/average power, per-phase telemetry, drillable charts
+- Session review: energy, peak/average power, per-phase telemetry, drillable
+  charts, and forecast hindsight — what the model predicted at each tick
+  against what the handle actually did
 - Event timeline with range presets, category filters, and paging
 - Alert decoding and EVSE-state labels, each marked verified vs community-reported
 - Wi-Fi health history and connectivity events
@@ -63,6 +73,8 @@ systemd service on an always-on box, see [Running wallmonitor](https://github.co
   webhook/self-hosted ntfy for phones, with a systemd + Docker deploy recipe
 - Resilience: seamless restarts, downtime recorded as explicit gap events,
   sensor-glitch quarantine
+- Several chargers: one labeled instance each, linked by a header switcher;
+  per-install thermal models stay separate by construction
 
 ## Works out of the box — everything else is additive
 
@@ -77,7 +89,7 @@ plain LAN webhook, a REST call) rather than being wired into the core.
 
 | Page | What's in it |
 |---|---|
-| [Running wallmonitor](https://github.com/zebraengine/wallmonitor/blob/main/docs/running.md) | Every option, systemd service install, tests |
+| [Running wallmonitor](https://github.com/zebraengine/wallmonitor/blob/main/docs/running.md) | Every option, finding your charger, device identity, multiple chargers, systemd service install |
 | [What gets recorded](https://github.com/zebraengine/wallmonitor/blob/main/docs/recording.md) | Recording fidelity, sessions, events, alert/EVSE label verification, resilience |
 | [Thermal model](https://github.com/zebraengine/wallmonitor/blob/main/docs/thermal-model.md) | The derate forecast and the degradation watch, in full detail |
 | [Amp control](https://github.com/zebraengine/wallmonitor/blob/main/docs/amp-control.md) | Automatic derate prevention over BLE: design, guards, backtesting |
