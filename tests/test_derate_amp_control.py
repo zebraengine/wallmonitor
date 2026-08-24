@@ -55,6 +55,7 @@ def _thermal(
     # Default plateau sits far below the trip so the confidence guard stays
     # dormant unless a test deliberately puts it in play.
     steady_state_c: float | None = 55.0,
+    steady_state_se_c: float | None = None,
     fit_rmse_c: float | None = 0.3,
     trip_c: float = 65.0,
 ):
@@ -70,6 +71,7 @@ def _thermal(
             "minutes_to_trip": mtt,
             "suggested_max_a": suggested,
             "steady_state_c": steady_state_c,
+            "steady_state_se_c": steady_state_se_c,
         },
     }
 
@@ -430,3 +432,42 @@ def test_event_for_restore_steps_from_the_active_cap_not_live_current():
     kind, detail = dac.event_for(dac.Action("restore", 34.0), "clear streak met", thermal, prev)
     assert kind == "amp_restored"
     assert detail["from_a"] == 32.0 and detail["to_a"] == 34.0
+
+
+def test_confidence_guard_prefers_projection_se_over_fit_rmse():
+    # Same 0.4C gap, but the projection itself is wide (SE 0.8): 0.5 sigma.
+    # Under the old fit_rmse denominator (0.1) this would read 4 sigma and
+    # the guard would sleep through exactly the case it exists for.
+    cfg = _cfg(confirm_ticks=1, forecast_confidence_k=2.0, restore_step_a=2.0)
+    state = dac.State(last_session_state="charging")
+    wide = _thermal(will_trip=False, mtt=None, suggested=None, steady_state_c=64.6,
+                    steady_state_se_c=0.8, fit_rmse_c=0.1, current_a=45.0)
+    action, state, reason = dac.decide(wide, state, cfg)
+    assert action.kind == "cap" and action.value == 43.0
+    assert "proj se" in reason and "too uncertain" in reason
+
+
+def test_confidence_guard_trusts_a_tight_projection_near_the_trip():
+    # 0.5C gap over a tight per-projection SE (0.12) is >4 sigma: the
+    # forecast has earned trust even this close to the limit. The old
+    # constant denominator (0.31) would have called this 1.6 sigma and
+    # stepped down, costing charge rate for no reason.
+    cfg = _cfg(confirm_ticks=1, forecast_confidence_k=2.0)
+    state = dac.State(capped=True, cap_value=45.0, last_session_state="charging")
+    tight = _thermal(will_trip=False, mtt=None, suggested=None, steady_state_c=64.5,
+                     steady_state_se_c=0.12, fit_rmse_c=0.31, handle_c=50.0)
+    action, state, reason = dac.decide(tight, state, cfg)
+    assert action.kind == "cap" and action.value == 47.0  # normal restore step-up
+    assert "stepping up" in reason
+
+
+def test_confidence_guard_falls_back_to_fit_rmse_without_se():
+    # Older server: no steady_state_se_c in the payload. The guard keeps
+    # its previous behavior against fit_rmse_c.
+    cfg = _cfg(confirm_ticks=1, forecast_confidence_k=2.0, restore_step_a=2.0)
+    state = dac.State(last_session_state="charging")
+    legacy = _thermal(will_trip=False, mtt=None, suggested=None, steady_state_c=64.6,
+                      steady_state_se_c=None, fit_rmse_c=0.31, current_a=45.0)
+    action, state, reason = dac.decide(legacy, state, cfg)
+    assert action.kind == "cap" and action.value == 43.0
+    assert "fit rmse" in reason

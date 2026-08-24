@@ -1341,3 +1341,26 @@ async def test_session_detail_includes_forecast_history(db):
     plateaus = [row["steady_state_c"] for row in detail["forecasts"]]
     assert plateaus == [70.0, 58.0, 54.0]
     assert all(row["session_id"] == sid for row in detail["forecasts"])
+
+
+def test_project_t_inf_se_wide_early_tight_late():
+    # Synthetic exponential toward 62C from 30C, tau 11 min, 0.05C noise
+    # (deterministic): the projection's standard error must be far larger
+    # from the first quarter of the ramp than from a window that has seen
+    # the bend, and the flat-window fallback reports no SE at all.
+    import math as m
+    tau_s = 11 * 60.0
+    curve = [(t, 62.0 - 32.0 * m.exp(-t / tau_s) + 0.05 * m.sin(t)) for t in range(0, 2400, 10)]
+    early = curve[:18]      # first 3 minutes
+    late = curve[:180]      # 30 minutes, bend well captured
+    t_early, se_early = thermal._project_t_inf(early, 11.0)
+    t_late, se_late = thermal._project_t_inf(late, 11.0)
+    assert se_early is not None and se_late is not None
+    assert se_early > 3 * se_late
+    assert abs(t_late - 62.0) < 0.5
+    # A noiseless flat window regresses to SSE = 0, so the raw SE is 0.0 —
+    # numerically true and physically overconfident, which is why predict()
+    # floors the published steady_state_se_c at the sensor's 0.1C step.
+    flat = [(t, 62.0) for t in range(0, 300, 10)]
+    t_flat, se_flat = thermal._project_t_inf(flat, 11.0)
+    assert t_flat == 62.0 and se_flat == 0.0

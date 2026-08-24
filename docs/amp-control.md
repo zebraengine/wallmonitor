@@ -59,18 +59,26 @@ session always starts fresh.
 
 One more guard covers a subtler failure: **`will_trip: false` is a point
 estimate, not a certainty.** It means the *projected* plateau landed under
-the trip point, and that projection carries the model's own fit error. When
-the two are within `--forecast-confidence-k` times `fit_rmse_c` of each
-other (default 2), that verdict is a coin flip dressed up as a decision, so
-the daemon steps down instead of trusting it. Live testing produced exactly
-this: a projected 64.6 °C plateau against a 65.0 °C trip with ~0.31 °C fit
-RMSE — a 1.3-sigma call that nothing in the logic had authority to act on,
-since only `will_trip: true` could trigger a cap. Note this is deliberately
+the trip point, and every projection carries uncertainty. The forecast
+reports its own: `steady_state_se_c`, the standard error of the projected
+plateau, computed per 30 s tick from the same regression that produces the
+plateau (floored at the handle sensor's 0.1 °C resolution). Early in a
+trajectory window, before much curvature is visible, it is honestly wide —
+measured on a real 43 A stretch: 0.8 °C at 24 seconds in, 0.11 °C by three
+minutes, ~0.04 °C near the plateau. When plateau and trip point are within
+`--forecast-confidence-k` times that error (default 2), the "no trip"
+verdict is a coin flip dressed up as a decision, so the daemon steps down
+instead of trusting it; when the projection is tight, the guard trusts it
+even close to the limit. (`fit_rmse_c`, the historical model-adequacy
+constant the guard originally used, remains the fallback for servers that
+don't report a per-projection error.) Live testing motivated this: a
+projected 64.6 °C plateau against a 65.0 °C trip — a coin-flip call that
+nothing in the logic had authority to act on. Note this is deliberately
 *not* a "handle is within X degrees of the trip" rule: the same session
 settled into a genuinely stable 63.8 °C plateau that such a rule would have
 banned outright. Proximity to the trip is not the danger; proximity plus an
-untrustworthy forecast is. As fits improve and `fit_rmse_c` shrinks, the
-guard narrows on its own and permits more aggressive operation.
+untrustworthy forecast is. As a window matures its SE shrinks, and the
+guard relaxes tick by tick on its own.
 
 A cap fully lifts three ways: the trajectory forecast reports the risk has
 passed *and* the handle has real thermal margin (stepped up gradually, see

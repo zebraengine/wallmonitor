@@ -81,8 +81,11 @@ sessions run back-to-back with no idle gap to read ambient from, the
 forecast bridges with ambient inferred from the newest steady run still in
 the buffer instead of going dark.
 
-Every 30 s tick is recorded, so the session page can show in hindsight what
-was predicted against what the handle did. The line is labelled *predicted
+Each trajectory projection also reports its own standard error
+(`steady_state_se_c`) — wide early in a window, tight near the plateau —
+which is what the [amp controller](amp-control.md)'s confidence guard
+weighs margins against. Every 30 s tick is recorded, so the session page
+can show in hindsight what was predicted against what the handle did. The line is labelled *predicted
 plateau (if this current holds)* for a reason: it is the asymptote at the
 present current, not where a six-minute top-off will stop — see the faint
 model-only ticks before trajectory data exists.
