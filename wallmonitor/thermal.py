@@ -730,14 +730,25 @@ def suggest_max_current(ambient_c: float, params: ThermalParams) -> float | None
     return float(amps)
 
 
-def _project_t_inf(window: list[tuple[float, float]], tau_min: float) -> float:
-    """Steady state projected from a steady-current window's trajectory.
+def _project_t_inf(window: list[tuple[float, float]], tau_min: float) -> tuple[float, float | None]:
+    """Steady state projected from a steady-current window's trajectory,
+    with the standard error of that projection.
 
     With tau known, T(t) = T_inf - C*exp(-t/tau) is linear in (T_inf, C), so
     an ordinary least-squares line on x = exp(-t/tau) gives an unbiased T_inf
     (a straight-line slope would read the window's average rate and overshoot
     during a fast ramp). No ambient input needed. A flat window (variance ~0,
     i.e. already converged) reads as the latest temperature.
+
+    T_inf is the fitted line's intercept at decay = 0 (t -> infinity), so its
+    standard error comes from the OLS intercept formula:
+    SE = s * sqrt(1/n + mean_x^2 / Sxx) with s^2 = SSE / (n - 2). Early in a
+    window, before much curvature is visible, mean_x is near 1 and Sxx is
+    tiny — the extrapolation is honest about being wild; near the plateau
+    it tightens. That is the per-projection uncertainty the amp controller's
+    confidence guard wants (issue #4) — fit_rmse_c is a model-adequacy score
+    across historical sessions and carries none of this variation. SE is
+    None when it cannot be computed (flat window, n <= 2).
     """
     count = len(window)
     decays = [math.exp(-(ts - window[0][0]) / (tau_min * 60.0)) for ts, _ in window]
@@ -748,7 +759,18 @@ def _project_t_inf(window: list[tuple[float, float]], tau_min: float) -> float:
         (decay - mean_decay) * (temp - mean_temp)
         for decay, (_, temp) in zip(decays, window)
     )
-    return mean_temp - (cov / var) * mean_decay if var > 1e-9 else window[-1][1]
+    if var <= 1e-9:
+        return window[-1][1], None
+    slope = cov / var
+    t_inf = mean_temp - slope * mean_decay
+    if count <= 2:
+        return t_inf, None
+    sse = sum(
+        (temp - (t_inf + slope * decay)) ** 2
+        for decay, (_, temp) in zip(decays, window)
+    )
+    se = math.sqrt(sse / (count - 2)) * math.sqrt(1.0 / count + mean_decay**2 / var)
+    return t_inf, se
 
 
 def _recent_steady_ambient(recent: list[dict], params: ThermalParams) -> float | None:
@@ -778,7 +800,7 @@ def _recent_steady_ambient(recent: list[dict], params: ThermalParams) -> float |
         if len(run) < TRAJECTORY_MIN_SAMPLES or run[-1]["ts"] - run[0]["ts"] < TRAJECTORY_MIN_SPAN_S:
             continue
         window = [(sample["ts"], sample["handle_temp_c"]) for sample in run]
-        t_inf = _project_t_inf(window, params.tau_min)
+        t_inf, _se = _project_t_inf(window, params.tau_min)
         run_current = median(sample["vehicle_current_a"] for sample in run)
         ambient = t_inf - params.rise_ref_c * (run_current / REF_CURRENT_A) ** 2
         if -30.0 <= ambient <= TRIP_HANDLE_C:
@@ -828,8 +850,14 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
         window.reverse()
         forecast: dict = {}
         if len(window) >= TRAJECTORY_MIN_SAMPLES and window[-1][0] - window[0][0] >= TRAJECTORY_MIN_SPAN_S:
-            t_inf = _project_t_inf(window, tau_min)
+            t_inf, t_inf_se = _project_t_inf(window, tau_min)
             forecast["basis"] = "trajectory"
+            # This projection's own uncertainty — what the amp controller's
+            # confidence guard compares the margin against. Floored at the
+            # handle sensor's 0.1 C quantization: a perfectly smooth window
+            # can drive the raw SE below the sensor's resolution, and a
+            # guard fed that would claim more confidence than the data has.
+            forecast["steady_state_se_c"] = round(max(t_inf_se, 0.1), 2) if t_inf_se is not None else None
         else:
             # Too early at this current for a slope: model from ambient and
             # the present current scaled by I^2. Ambient comes from the LAN

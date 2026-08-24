@@ -67,11 +67,13 @@ window before needing to cap again resets the backoff — real recovery still
 gets a clean slate.
 
 Finally, ``will_trip: false`` is a point estimate, not a certainty — it means
-the *projected* plateau landed under the trip point, and that projection
-carries the model's own fit error. When the two are within
-``--forecast-confidence-k`` times ``fit_rmse_c`` of each other, that verdict
-is a coin flip dressed up as a decision, so the daemon steps down instead of
-trusting it. Observed live 2026-08-04: a projected 64.6 C plateau against a
+the *projected* plateau landed under the trip point, and every projection
+carries uncertainty. When plateau and trip point are within
+``--forecast-confidence-k`` times the projection's own standard error
+(``steady_state_se_c``, computed by the server per 30 s tick — wide early in
+a trajectory window, tight near the plateau; ``fit_rmse_c`` is the fallback
+for servers that don't report it), that verdict is a coin flip dressed up as
+a decision, so the daemon steps down instead of trusting it. Observed live 2026-08-04: a projected 64.6 C plateau against a
 65.0 C trip with ~0.31 C fit RMSE — a 1.3-sigma call that nothing in the
 logic had authority to act on, since only ``will_trip: true`` could trigger a
 cap. It held that time, but by luck rather than by design. Note this is
@@ -158,6 +160,7 @@ def decide(thermal: dict, state: State, cfg: Config) -> tuple[Action, State, str
     now_ts = thermal.get("ts")
     current_a = thermal.get("current_a")
     steady_state_c = forecast.get("steady_state_c")
+    steady_state_se_c = forecast.get("steady_state_se_c")
     model = thermal.get("model") or {}
     fit_rmse_c = model.get("fit_rmse_c")
     trip_c = model.get("trip_c", TRIP_HANDLE_C)
@@ -261,18 +264,30 @@ def decide(thermal: dict, state: State, cfg: Config) -> tuple[Action, State, str
     # the trip is not the danger; proximity plus an untrustworthy forecast
     # is. As fits improve and fit_rmse_c shrinks, this guard narrows on its
     # own and permits more aggressive operation.
+    # The denominator is this projection's own standard error when the
+    # server reports one (issue #4): early in a trajectory window the
+    # extrapolation is wild and the SE says so; near the plateau it
+    # tightens, and the guard relaxes with it. fit_rmse_c — a single
+    # model-adequacy constant across historical sessions — remains the
+    # fallback for older servers or windows too short for a meaningful SE.
     plateau_c = gap_c = sigma = None
+    sigma_src = None
     if (
         basis == "trajectory"
         and will_trip is False
         and isinstance(steady_state_c, (int, float))
-        and isinstance(fit_rmse_c, (int, float))
         and isinstance(trip_c, (int, float))
-        and fit_rmse_c > 0
     ):
-        plateau_c = float(steady_state_c)
-        gap_c = float(trip_c) - plateau_c
-        sigma = gap_c / float(fit_rmse_c)
+        if isinstance(steady_state_se_c, (int, float)) and steady_state_se_c > 0:
+            denom, sigma_src = float(steady_state_se_c), "proj se"
+        elif isinstance(fit_rmse_c, (int, float)) and fit_rmse_c > 0:
+            denom, sigma_src = float(fit_rmse_c), "fit rmse"
+        else:
+            denom = None
+        if denom is not None:
+            plateau_c = float(steady_state_c)
+            gap_c = float(trip_c) - plateau_c
+            sigma = gap_c / denom
 
     if sigma is not None and gap_c is not None and plateau_c is not None and sigma < cfg.forecast_confidence_k:
         streak = state.trip_streak + 1
@@ -283,7 +298,7 @@ def decide(thermal: dict, state: State, cfg: Config) -> tuple[Action, State, str
                 next_state,
                 (
                     f"plateau {plateau_c:.1f}C is only {gap_c:.1f}C under trip "
-                    f"({sigma:.1f} sigma, need {cfg.forecast_confidence_k:g}): "
+                    f"({sigma:.1f} sigma vs {sigma_src}, need {cfg.forecast_confidence_k:g}): "
                     f"{streak}/{cfg.confirm_ticks} confirming polls"
                 ),
             )
@@ -304,7 +319,7 @@ def decide(thermal: dict, state: State, cfg: Config) -> tuple[Action, State, str
             Action("cap", target),
             final_state,
             (
-                f"plateau {plateau_c:.1f}C only {gap_c:.1f}C under trip ({sigma:.1f} sigma): "
+                f"plateau {plateau_c:.1f}C only {gap_c:.1f}C under trip ({sigma:.1f} sigma vs {sigma_src}): "
                 f"forecast too uncertain to trust, stepping down to {target:g}A"
             ),
         )
