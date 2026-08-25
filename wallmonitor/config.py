@@ -33,6 +33,12 @@ class Config:
     # Human name for this charger, shown in the UI header, tab title and
     # notifications so several instances side by side stay attributable.
     label: str = ""
+    # Optional retention: rows older than this many days keep every extracted
+    # column forever but have their raw JSON blob trimmed to "". 0 = never
+    # trim (the default — full re-interpretability retained indefinitely).
+    retain_raw_days: float = 0.0
+    # One-shot: VACUUM the database to reclaim trimmed space, print sizes, exit.
+    compact: bool = False
     # Sibling instances watching other chargers, as (label, url) pairs;
     # rendered as a switcher in the header so one browser hops between them.
     peers: tuple[tuple[str, str], ...] = ()
@@ -150,6 +156,20 @@ def parse_args(argv: list[str] | None = None) -> Config:
         "running one instance per Wall Connector (env: WM_LABEL)",
     )
     parser.add_argument(
+        "--retain-raw-days",
+        type=float,
+        default=_env("WM_RETAIN_RAW_DAYS", 0.0),
+        help="Trim the raw JSON blob from samples older than this many days (columns are "
+        "kept forever; 0 disables — the default). Minimum 7. (env: WM_RETAIN_RAW_DAYS)",
+    )
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        default=False,
+        help="VACUUM the database to reclaim space freed by retention, print sizes, and exit. "
+        "Run it while the monitor service is stopped.",
+    )
+    parser.add_argument(
         "--peer",
         action="append",
         default=None,
@@ -195,7 +215,10 @@ def parse_args(argv: list[str] | None = None) -> Config:
     except ValueError as ex:
         parser.error(str(ex))
 
-    if not args.demo and not args.host and args.discover is None:
+    if args.retain_raw_days and args.retain_raw_days < 7:
+        parser.error("--retain-raw-days must be at least 7 (or 0 to disable)")
+
+    if not args.demo and not args.host and args.discover is None and not args.compact:
         parser.error(
             "--host (or WM_WC_HOST) is required — run `wallmonitor --discover` to find "
             "your Wall Connector's address, or --demo for the built-in simulator"
@@ -209,6 +232,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         demo=bool(args.demo),
         split_phase=bool(args.split_phase),
         label=args.label,
+        retain_raw_days=float(args.retain_raw_days),
+        compact=bool(args.compact),
         peers=peers,
         discover=args.discover,
         notify_url=args.notify_url,

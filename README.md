@@ -51,6 +51,7 @@ systemd service on an always-on box, see [Running wallmonitor](https://github.co
   serial is pinned on first contact so a swapped or second unit can never
   blend into your history
 - Full-fidelity recording — every response stored with its complete raw JSON
+  (optional retention trims old raw blobs so the database stays near-flat)
 - Live dashboard (SSE) with rolling charts, an active-alert banner, and a
   live derate-forecast chart: measured handle temperature against the
   model's projected plateau and the trip threshold, projection drawn

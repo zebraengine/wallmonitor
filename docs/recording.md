@@ -7,6 +7,9 @@ around gaps, glitches, and unverified labels. The numbered points below are
 the recording pipeline in the order data flows through it.
 
 1. **Records everything the charger reports, at the highest safe fidelity.**
+   (With the optional `--retain-raw-days` policy, samples older than the
+   window keep every extracted column but drop the raw JSON blob — see
+   [Retention](running.md#retention).)
    Vitals every 2 s while a vehicle is attached (5 s idle), Wi-Fi status every
    30 s, lifetime counters every 60 s, firmware info every 6 h. Requests are
    strictly sequential and back off exponentially on failures, so the charger's
