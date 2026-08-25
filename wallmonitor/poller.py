@@ -689,6 +689,7 @@ class Poller:
             "host": self.cfg.host,
             "label": self.cfg.label,
             "peers": [{"label": label, "url": url} for label, url in self.cfg.peers],
+            "retain_raw_days": self.cfg.retain_raw_days,
             "device_serial": self.device_serial,
             "serial_mismatch": self.serial_mismatch,
             "offline": self._offline,

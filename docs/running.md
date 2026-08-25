@@ -45,6 +45,8 @@ is the charger's microcontroller.
 | `--discover [RANGE]` | — | — | Sweep the LAN for Wall Connectors and exit (own subnet, or a private CIDR) |
 | `--label` | `WM_LABEL` | — | Name for this charger, shown in the header, tab title and notifications |
 | `--peer LABEL=URL` | `WM_PEERS` | — | Link another instance from the header switcher; repeatable (env: comma-separated) |
+| `--retain-raw-days` | `WM_RETAIN_RAW_DAYS` | `0` (off) | Trim raw JSON from samples older than N days (min 7); columns stay forever |
+| `--compact` | — | — | One-shot VACUUM to reclaim trimmed space; run with the service stopped |
 | `--port` | `WM_PORT` | `8480` | Web UI port |
 | `--bind` | `WM_BIND` | `127.0.0.1` | Web UI bind address |
 | `--db` | `WM_DB` | `wallmonitor.db` | SQLite path |
@@ -138,6 +140,30 @@ sudo ./deploy/install-service.sh --name right --host 192.168.1.51 --port 8481 --
 ```
 
 A single-process, cross-device view is tracked as future work in issue #10.
+
+## Retention
+
+By default nothing is ever deleted: every sample keeps its complete raw
+JSON forever, and the database grows by roughly a gigabyte a month on a
+busy install (about 85 % of that is the raw blobs on vitals samples).
+
+`--retain-raw-days N` caps that. Samples older than N days keep **every
+extracted column** — charts, session pages, the thermal model, and the
+degradation watch see identical history — but their raw JSON blob is
+blanked by a daily background pass (chunked, so live polling never waits
+more than a moment; vitals wait until the diagnostics backfill has
+finished). What is given up is *re-interpretability*: extracting a field
+that was never a column, the way the diagnostics columns themselves were
+backfilled from raw, becomes impossible for trimmed rows. Forecast
+snapshots and version info are never trimmed.
+
+Freed pages are reused by new inserts, so the file stops growing rather
+than shrinking. To hand the space back to the filesystem once, stop the
+service and run:
+
+```bash
+uv run python -m wallmonitor --compact --db /path/to/wallmonitor.db
+```
 
 ## Run as a service (Ubuntu / systemd)
 

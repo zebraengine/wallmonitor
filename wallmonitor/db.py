@@ -221,6 +221,7 @@ class Database:
         telemetry). The schema is pure CREATE IF NOT EXISTS, re-run on
         every startup: "migrations" are additive statements appended here.
         """
+        self.path = path
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
@@ -244,6 +245,73 @@ class Database:
             if col not in have:
                 self._conn.execute(f"ALTER TABLE vitals_samples ADD COLUMN {col} REAL")
         self._conn.commit()
+
+    # Tables whose raw JSON blob is trimmed by the retention policy. The
+    # extracted columns stay forever; forecast_samples and version_info are
+    # exempt (tiny, and their raw payloads carry fields with no column).
+    RAW_TRIM_TABLES = ("vitals_samples", "wifi_samples", "lifetime_samples", "ambient_samples")
+
+    def trim_raw(self, cutoff_ts: float, chunk: int = 10_000) -> dict[str, int]:
+        """Retention: blank the raw JSON on samples older than cutoff_ts.
+
+        Columns are untouched, so charts, fits and the degradation watch see
+        exactly the same history — what is given up is re-interpreting old
+        rows for fields that were never extracted. Vitals are only trimmed
+        once the diagnostics backfill has finished (its json_extract source
+        is the raw blob). A per-table timestamp cursor in settings makes the
+        daily run scan only rows that newly aged past the cutoff, and the
+        chunked updates hold the write lock briefly each. Freed pages are
+        reused by new inserts, so the file stops growing; a one-shot VACUUM
+        (--compact) reclaims the space for the filesystem.
+        """
+        counts: dict[str, int] = {}
+        for table in self.RAW_TRIM_TABLES:
+            if table == "vitals_samples" and self.get_setting(DIAG_BACKFILL_SETTING) != "1":
+                continue
+            cursor_key = f"raw_trim_ts:{table}"
+            start_ts = float(self.get_setting(cursor_key) or 0.0)
+            trimmed = 0
+            while True:
+                with self._lock:
+                    rows = self._conn.execute(
+                        f"SELECT id, ts FROM {table} WHERE ts >= ? AND ts < ? "
+                        "ORDER BY ts LIMIT ?",
+                        (start_ts, cutoff_ts, chunk),
+                    ).fetchall()
+                    if not rows:
+                        break
+                    ids = [row[0] for row in rows]
+                    placeholders = ",".join("?" for _ in ids)
+                    cur = self._execute(
+                        f"UPDATE {table} SET raw = '' WHERE id IN ({placeholders}) AND raw != ''",
+                        tuple(ids),
+                    )
+                    trimmed += cur.rowcount
+                    start_ts = rows[-1][1]
+                    self._execute(
+                        "INSERT INTO settings(key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (cursor_key, repr(start_ts)),
+                    )
+                if len(rows) < chunk:
+                    break
+            counts[table] = trimmed
+        return counts
+
+    def vacuum(self) -> tuple[int, int]:
+        """VACUUM, returning (bytes_before, bytes_after). Exclusive — run
+        while nothing else is writing (the --compact command exists so this
+        never happens implicitly under a live poller)."""
+        import os
+
+        with self._lock:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        before = os.path.getsize(self.path)
+        with self._lock:
+            self._conn.execute("VACUUM")
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        after = os.path.getsize(self.path)
+        return before, after
 
     def backfill_diag_columns(self, chunk: int = 10_000, progress=None) -> int:
         """Fill the diagnostics columns for rows recorded before they
@@ -274,7 +342,7 @@ class Database:
                            relay_k1_v   = COALESCE(json_extract(raw, '$.relay_k1_v'),
                                                    json_extract(raw, '$.relay_coil_v')),
                            relay_k2_v   = json_extract(raw, '$.relay_k2_v')
-                       WHERE id > ? AND id <= ? AND prox_v IS NULL""",
+                       WHERE id > ? AND id <= ? AND prox_v IS NULL AND raw != ''""",
                     (last, upto),
                 )
                 touched += cur.rowcount
@@ -617,13 +685,18 @@ class Database:
         if self._diag_backfilled:
             d = {col: col for col in VITALS_LATER_COLUMNS}
         else:
+            # CASE-guarded: a retention-trimmed row has raw = '' and
+            # json_extract('') is a hard error, not NULL — and SQLite does
+            # not promise to short-circuit COALESCE past it even when the
+            # column is populated.
+            j = "CASE WHEN raw = '' THEN NULL ELSE json_extract(raw, '{key}') END"
             d = {
-                "pilot_high_v": "COALESCE(pilot_high_v, json_extract(raw, '$.pilot_high_v'))",
-                "pilot_low_v": "COALESCE(pilot_low_v, json_extract(raw, '$.pilot_low_v'))",
-                "prox_v": "COALESCE(prox_v, json_extract(raw, '$.prox_v'))",
-                "relay_k1_v": "COALESCE(relay_k1_v, json_extract(raw, '$.relay_k1_v'), "
-                              "json_extract(raw, '$.relay_coil_v'))",
-                "relay_k2_v": "COALESCE(relay_k2_v, json_extract(raw, '$.relay_k2_v'))",
+                "pilot_high_v": f"COALESCE(pilot_high_v, {j.format(key='$.pilot_high_v')})",
+                "pilot_low_v": f"COALESCE(pilot_low_v, {j.format(key='$.pilot_low_v')})",
+                "prox_v": f"COALESCE(prox_v, {j.format(key='$.prox_v')})",
+                "relay_k1_v": f"COALESCE(relay_k1_v, {j.format(key='$.relay_k1_v')}, "
+                              f"{j.format(key='$.relay_coil_v')})",
+                "relay_k2_v": f"COALESCE(relay_k2_v, {j.format(key='$.relay_k2_v')})",
             }
         diag = ", ".join(f"{expr} AS {col}" for col, expr in d.items())
         if sample_count <= max_points:
