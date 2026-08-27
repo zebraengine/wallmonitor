@@ -1060,7 +1060,8 @@ async function viewLive(root) {
       const ambLabel = data.ambient_source === "measured"
         ? "Garage ambient (sensor)"
         : data.ambient_source === "measured_car"
-          ? "Garage ambient (car sensor)" : "Ambient at the charger ≈";
+          ? "Garage ambient (car sensor)"
+          : `Ambient at the charger ≈ (from the idle handle, ±${fmtNum(data.ambient_se_c || 1.5, 1)} °C)`;
       if (forecast.will_trip) {
         chip = chipFor("warning", "hot enough to derate");
         lines.push(`${ambLabel} ${amb}. A full-rate (${fmtNum(model.ref_current_a, 0)} A) charge started now ` +
@@ -1118,11 +1119,22 @@ async function viewLive(root) {
         (dev.tau_frac < -0.3 ? `, and with a τ this fast only charges of ≥ ${fmtNum(1.8 * dev.default_tau_min, 0)} min ` +
           "at steady current teach the model." : ".");
     }
+    // The handle-proxy ambient rests on the idle-offset model; say whose
+    // it is. Calibrated from this install's own sensor history, or the
+    // built-in seed from one install — and, without a sensor, how far a
+    // proxy read may sit from the truth.
+    const io = model.idle_offset;
+    const idleNote = !io ? "" : io.source === "calibrated"
+      ? ` Idle-offset model calibrated to this install (${fmtNum(io.ref_c, 2)} °C at ${fmtNum(io.ambient_ref_c, 0)} °C from ` +
+        `${io.segments} idle segments over ${io.days} days, ±${fmtNum(io.ambient_se_c, 1)} °C).`
+      : ` Idle-offset model is the built-in seed from one install (±${fmtNum(io.ambient_se_c, 1)} °C on handle-derived ambient); ` +
+        "a stationary sensor posting to /api/ambient calibrates it here automatically.";
     const modelNote = `Model: τ ≈ ${fmtNum(model.tau_min, 1)} min, +${fmtNum(model.rise_ref_c, 0)} °C at ${fmtNum(model.ref_current_a, 0)} A — ` +
       (model.fitted ? `fitted from ${model.tau_fits} recorded session ramp${model.tau_fits === 1 ? "" : "s"}.` + priorNote
                 : "defaults from one verified install, used until this charger has fits of its own; refits automatically as sessions accumulate.") +
       (drift && !drift.drifting && !drift.lead ? ` Heat rise stable across the last ${drift.recent_n + drift.baseline_n} fitted sessions` +
-        `${drift.off_current_n ? ` (${drift.off_current_n} off-current session${drift.off_current_n === 1 ? "" : "s"} excluded)` : ""}.` : "");
+        `${drift.off_current_n ? ` (${drift.off_current_n} off-current session${drift.off_current_n === 1 ? "" : "s"} excluded)` : ""}.` : "") +
+      idleNote;
     thermalCard.append(el("div", { class: "chart-card" },
       el("div", { class: "chart-title" }, "Thermal derate forecast", chip ? " " : null, chip),
       ...lines.map((text) => el("div", { class: "note" }, text)),
@@ -1683,9 +1695,10 @@ async function viewAlerts(root, rangeKey = "7d") {
   const now = Date.now() / 1000;
   const from = now - rangeSeconds(rangeKey);
   root.append(el("h2", {}, "Alerts"));
-  const [data, thermalData] = await Promise.all([
+  const [data, thermalData, calEvents] = await Promise.all([
     getJSON(`/api/alerts?from=${from}&to=${now}`),
     getJSON("/api/thermal").catch(() => null),
+    getJSON(`/api/events?from=${now - 120 * 86400}&to=${now}&kinds=idle_offset_calibrated`).catch(() => null),
     loadAlertCodes(),
   ]);
 
@@ -1724,9 +1737,13 @@ async function viewAlerts(root, rangeKey = "7d") {
       `Fitted steady-state rise above ambient, normalized to ${fmtNum(thermalData.model.ref_current_a, 0)} A. ` +
       "A sustained climb at the same current means added resistance in the current path — inspect before it becomes heat.");
     root.append(rise.card);
+    // An adopted idle-offset calibration reinterprets every proxy-tier fit
+    // at once; mark it, so a step here carries its explanation instead of
+    // reading as the connector changing.
+    const calMarks = ((calEvents && calEvents.events) || []).map((ev) => ({ ts: ev.ts, label: "idle-offset recalibrated" }));
     lineChart(rise.box, {
       series: [{ name: "Rise (°C)", color: colors.s1, points: fits.map((fit) => [fit.start_ts, fit.rise_ref_c]) }],
-      unit: "°C", digits: 1, height: 180,
+      unit: "°C", digits: 1, height: 180, vlines: calMarks,
     });
     if (drift) {
       // The verdict carries its own uncertainty — a delta from a handful of

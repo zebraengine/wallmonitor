@@ -50,9 +50,10 @@ one ambient_source tier or re-anchor the verified baseline
 from __future__ import annotations
 
 import argparse
-import math
+import json
 import sqlite3
-from datetime import datetime
+
+from wallmonitor import calibration, thermal
 
 
 def _rows(conn: sqlite3.Connection, sql: str, params: tuple) -> list[dict]:
@@ -61,37 +62,9 @@ def _rows(conn: sqlite3.Connection, sql: str, params: tuple) -> list[dict]:
     return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
-def _interp(series: list[tuple[float, float]], ts: float, max_gap: float = 300.0) -> float | None:
-    """Linear interpolation with a gap guard: None when the bracketing
-    samples are too far apart to trust the line between them."""
-    if not series or ts < series[0][0] or ts > series[-1][0]:
-        return None
-    lo, hi = 0, len(series) - 1
-    while hi - lo > 1:
-        mid = (lo + hi) // 2
-        if series[mid][0] <= ts:
-            lo = mid
-        else:
-            hi = mid
-    (t0, v0), (t1, v1) = series[lo], series[hi]
-    if t1 - t0 > max_gap:
-        return None
-    if t1 == t0:
-        return v0
-    return v0 + (ts - t0) / (t1 - t0) * (v1 - v0)
-
-
-def _mean_sd(vals: list[float]) -> tuple[float, float]:
-    mu = sum(vals) / len(vals)
-    if len(vals) < 2:
-        return mu, float("nan")
-    return mu, math.sqrt(sum((v - mu) ** 2 for v in vals) / (len(vals) - 1))
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument("--db", required=True, help="path to a wallmonitor.db (read-only; use a copy)")
-    parser.add_argument("--source", default="ecowitt", help="ambient source tag (default %(default)s)")
     parser.add_argument("--lookback-days", type=float, default=30.0)
     parser.add_argument("--settle-hours", type=float, default=1.0,
                         help="idle time required after charging before samples count")
@@ -101,131 +74,66 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-seg-samples", type=int, default=10)
     args = parser.parse_args(argv)
 
+    # The estimator itself lives in the package (wallmonitor.calibration) and
+    # is what the running monitor refits from daily; this script is the same
+    # code over the same SQL, for a copy of a database on any machine.
     conn = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
     now = _rows(conn, "SELECT MAX(ts) AS t FROM vitals_samples", ())[0]["t"]
     t_from = now - args.lookback_days * 86400.0
-
-    amb = [
-        (r["ts"], r["temp_c"])
-        for r in _rows(
-            conn,
-            "SELECT ts, temp_c FROM ambient_samples "
-            "WHERE ts >= ? AND source = ? AND temp_c IS NOT NULL ORDER BY ts",
-            (t_from, args.source),
-        )
-    ]
+    amb = [(r["ts"], r["temp_c"]) for r in _rows(conn, calibration.AMBIENT_SQL,
+                                                  (t_from, now + 1, calibration.CAR_SOURCE))]
     if len(amb) < 100:
-        print(f"only {len(amb)} '{args.source}' ambient samples in range — nothing to calibrate against")
+        print(f"only {len(amb)} stationary ambient samples in range — nothing to calibrate against")
+        return 1
+    vit = _rows(conn, calibration.VITALS_SQL, (t_from, now + 1))
+    cal = calibration.estimate(vit, amb, settle_s=args.settle_hours * 3600.0, max_drift_c=args.max_drift_c,
+                               min_seg_span_s=args.min_seg_span_s, min_seg_samples=args.min_seg_samples)
+    if cal is None:
+        print("too few settled, quasi-static idle segments for inference — widen the lookback, "
+              "or check that the sensor overlaps idle periods")
         return 1
 
-    vit = _rows(
-        conn,
-        "SELECT ts, total_power_w, contactor_closed, vehicle_current_a, "
-        "CASE WHEN handle_temp_c >= 255 THEN NULL ELSE handle_temp_c END AS handle_temp_c "
-        "FROM vitals_samples WHERE ts >= ? ORDER BY ts",
-        (t_from,),
-    )
+    print(f"{cal.n_samples} settled quasi-static idle samples in {cal.n_segments} segments over {cal.n_days} days")
+    print(f"mean offset {cal.mean_offset_c:.2f} C  (sd {cal.sd_c:.2f}, 95% CI "
+          f"[{cal.ci95_c[0]:.2f}, {cal.ci95_c[1]:.2f}])")
+    if cal.day_mean_c is not None:
+        print(f"  day (08-20): mean {cal.day_mean_c:.2f}")
+    if cal.night_mean_c is not None:
+        print(f"  night: mean {cal.night_mean_c:.2f}")
+    t_slope = cal.slope / cal.slope_se if cal.slope_se and cal.slope_se == cal.slope_se and cal.slope_se > 0 else float("nan")
+    print(f"offset vs ambient: slope {cal.slope:.4f} C/C (day-jackknife se {cal.slope_se:.4f}, t {t_slope:.1f}), "
+          f"coverage {cal.ambient_lo_c:.1f}..{cal.ambient_hi_c:.1f} C; segment residual sd {cal.residual_sd_c:.2f} C")
 
-    settle_s = args.settle_hours * 3600.0
-    last_charge = None
-    samples: list[tuple[float, float, float]] = []  # ts, handle, ambient
-    for r in vit:
-        if (r["total_power_w"] or 0) > 50:
-            last_charge = r["ts"]
-            continue
-        if r["contactor_closed"] or (r["vehicle_current_a"] or 0) >= 1:
-            continue
-        if r["handle_temp_c"] is None:
-            continue
-        if last_charge is not None and r["ts"] - last_charge < settle_s:
-            continue
-        a_now = _interp(amb, r["ts"])
-        a_prev = _interp(amb, r["ts"] - 1800.0)
-        if a_now is None or a_prev is None or abs(a_now - a_prev) >= args.max_drift_c:
-            continue
-        samples.append((r["ts"], r["handle_temp_c"], a_now))
-
-    if not samples:
-        print("no settled quasi-static idle samples — is the sensor overlapping idle periods?")
-        return 1
-
-    # Collapse to contiguous segments (split on >10 min gaps).
-    segs: list[list[tuple[float, float, float]]] = [[samples[0]]]
-    for s in samples[1:]:
-        if s[0] - segs[-1][-1][0] > 600.0:
-            segs.append([s])
-        else:
-            segs[-1].append(s)
-    segs = [g for g in segs
-            if len(g) >= args.min_seg_samples and g[-1][0] - g[0][0] >= args.min_seg_span_s]
-    if len(segs) < 8:
-        print(f"only {len(segs)} usable idle segments — too few for inference; widen the lookback")
-        return 1
-
-    seg_off = [sum(h - a for _, h, a in g) / len(g) for g in segs]
-    seg_amb = [sum(a for _, _, a in g) / len(g) for g in segs]
-    seg_day = [datetime.fromtimestamp((g[0][0] + g[-1][0]) / 2).strftime("%Y-%m-%d") for g in segs]
-    seg_hour = [datetime.fromtimestamp((g[0][0] + g[-1][0]) / 2).hour for g in segs]
-
-    n = len(segs)
-    mean, sd = _mean_sd(seg_off)
-    se = sd / math.sqrt(n)
-    tcrit = 2.045 if n < 60 else 2.0
-    print(f"{len(samples)} settled quasi-static idle samples in {n} segments over "
-          f"{len(set(seg_day))} days")
-    print(f"mean offset {mean:.2f} C  (sd {sd:.2f}, 95% CI "
-          f"[{mean - tcrit * se:.2f}, {mean + tcrit * se:.2f}])")
-
-    day = [o for o, h in zip(seg_off, seg_hour) if 8 <= h < 20]
-    night = [o for o, h in zip(seg_off, seg_hour) if not 8 <= h < 20]
-    for label, vals in (("day (08-20)", day), ("night", night)):
-        if len(vals) >= 2:
-            mu, s = _mean_sd(vals)
-            print(f"  {label}: mean {mu:.2f} sd {s:.2f} (n={len(vals)})")
-
-    # offset ~ ambient regression, day-jackknifed slope error
-    mx, _ = _mean_sd(seg_amb)
-    my = mean
-    sxx = sum((x - mx) ** 2 for x in seg_amb)
-    slope = sum((x - mx) * (y - my) for x, y in zip(seg_amb, seg_off)) / sxx
-    days = sorted(set(seg_day))
-    jk = []
-    for d in days:
-        keep = [(x, y) for x, y, sd_ in zip(seg_amb, seg_off, seg_day) if sd_ != d]
-        kx = [x for x, _ in keep]
-        ky = [y for _, y in keep]
-        kmx = sum(kx) / len(kx)
-        kmy = sum(ky) / len(ky)
-        ksxx = sum((x - kmx) ** 2 for x in kx)
-        jk.append(sum((x - kmx) * (y - kmy) for x, y in zip(kx, ky)) / ksxx)
-    mj = sum(jk) / len(jk)
-    se_slope = math.sqrt((len(jk) - 1) / len(jk) * sum((v - mj) ** 2 for v in jk))
-    lo_a, hi_a = min(seg_amb), max(seg_amb)
-    print(f"offset vs ambient: slope {slope:.4f} C/C "
-          f"(day-jackknife se {se_slope:.4f}, t {slope / se_slope:.1f}), "
-          f"coverage {lo_a:.1f}..{hi_a:.1f} C")
-
-    ref = 30.0
-    off_ref = my + slope * (ref - mx)
+    model = calibration.proposed_model(cal, now)
+    why = calibration.gate(cal)
     print()
-    print("drop-in constants for thermal.py (linear model):")
-    print(f"  IDLE_OFFSET_REF_C = {off_ref:.2f}")
-    print(f"  IDLE_OFFSET_SLOPE = {slope:.4f}")
-    print(f"  IDLE_OFFSET_AMBIENT_REF_C = {ref:.1f}")
-    print(f"  IDLE_OFFSET_AMBIENT_RANGE_C = ({math.floor(lo_a):.1f}, {math.ceil(hi_a * 2) / 2:.1f})")
-
-    try:
-        from wallmonitor import thermal
-
-        rms_cur = math.sqrt(sum((o - thermal.idle_offset_c(a)) ** 2
-                                for o, a in zip(seg_off, seg_amb)) / n)
-        rms_new = math.sqrt(sum((o - (off_ref + slope * (a - ref))) ** 2
-                                for o, a in zip(seg_off, seg_amb)) / n)
-        print(f"segment RMS error — current thermal.py model: {rms_cur:.2f} C, "
-              f"this fit: {rms_new:.2f} C")
-    except ImportError:
-        pass
+    print("model this implies (what the running monitor would adopt" + (f" — but gated: {why})" if why else "):"))
+    print(json.dumps(model, indent=2))
+    print()
+    print("drop-in constants for thermal.py, if you prefer to change the seed:")
+    print(f"  IDLE_OFFSET_REF_C = {model['ref_c']:.2f}")
+    print(f"  IDLE_OFFSET_SLOPE = {model['slope']:.4f}")
+    print(f"  IDLE_OFFSET_AMBIENT_REF_C = {model['ambient_ref_c']:.1f}")
+    print(f"  IDLE_OFFSET_AMBIENT_RANGE_C = ({model['ambient_range_c'][0]:.1f}, {model['ambient_range_c'][1]:.1f})")
+    current = thermal.load_idle_offset(_Settings(conn)) if _has_settings(conn) else thermal.BUILTIN_IDLE_OFFSET
+    print(f"currently in effect on this database: {current.source} "
+          f"({current.ref_c:.2f} C at {current.ambient_ref_c:.0f} C, slope {current.slope:.4f})")
     return 0
+
+
+class _Settings:
+    """Just enough of Database for thermal.load_idle_offset over a raw connection."""
+
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+
+    def get_setting(self, key: str) -> str | None:
+        row = self._conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+
+def _has_settings(conn: sqlite3.Connection) -> bool:
+    return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings'").fetchone())
 
 
 if __name__ == "__main__":

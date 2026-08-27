@@ -24,10 +24,13 @@ the trip happens.
   against the default τ, so only charges of ~22 min or more at steady
   current teach the model there.
 - **The charger is its own thermometer.** Idle, the handle sits ~1–2 °C above
-  ambient (a calibrated, ambient-dependent offset — see
-  `contrib/calibrate_idle_offset.py`), so ambient can be read without any
-  extra sensor. A LAN ambient sensor or the car's thermometer, when present,
-  take precedence — see [Ambient sensing](ambient-sensors.md).
+  ambient (an ambient-dependent offset), so ambient can be read without any
+  extra sensor. The offset model ships as a seed from one install and is
+  **recalibrated to yours automatically** once a stationary ambient sensor
+  has overlapped a few days of idle time; without one it stands, labelled,
+  with a stated ±1.5 °C uncertainty on every proxy read. A LAN ambient
+  sensor or the car's thermometer, when present, take precedence — see
+  [Ambient sensing](ambient-sensors.md).
 
 ## What gets fitted: segments, not sessions
 

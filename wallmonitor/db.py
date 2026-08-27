@@ -615,6 +615,23 @@ class Database:
         )
         return rows[0] if rows else None
 
+    def ambient_series(self, t_from: float, t_to: float, exclude_source: str | None = None) -> list[tuple[float, float]]:
+        """(ts, temp_c) for every ambient sample in the window, oldest
+        first, unbucketed and unlimited — calibration needs the real
+        series. exclude_source drops one tag (the car's roaming sensor)."""
+        from .calibration import AMBIENT_SQL
+
+        rows = self._rows(AMBIENT_SQL, (t_from, t_to, exclude_source if exclude_source is not None else ""))
+        return [(row["ts"], row["temp_c"]) for row in rows]
+
+    def idle_calibration_rows(self, t_from: float, t_to: float) -> list[dict]:
+        """Raw (unbucketed) vitals for the idle-offset calibration, in the
+        exact shape contrib/calibrate_idle_offset.py reads — same SQL, so
+        the two can never disagree. Callers chunk by day."""
+        from .calibration import VITALS_SQL
+
+        return self._rows(VITALS_SQL, (t_from, t_to))
+
     def set_setting(self, key: str, value: str) -> None:
         """Upsert into the string key/value settings table (currently only
         the thermal baseline anchor lives here)."""
