@@ -15,8 +15,14 @@ the trip happens.
 
 - **Parameters are fitted per install** (`wallmonitor/thermal.py`) from your
   own recorded charging ramps: the time constant τ and the steady-state rise
-  at 48 A. Defaults come from a telemetry-verified alert-40 event and are
-  replaced as sessions accumulate.
+  at 48 A. Defaults come from a telemetry-verified alert-40 event on one
+  install and are replaced as sessions accumulate. Once fitted, the
+  dashboard's model note says so when this install landed far (>30%) from
+  those priors: forecasts before the first fit were governed by numbers
+  that did not describe this charger, and an install with a τ well under
+  the default has a standing cost — the fitter judges a charge's window
+  against the default τ, so only charges of ~22 min or more at steady
+  current teach the model there.
 - **The charger is its own thermometer.** Idle, the handle sits ~1–2 °C above
   ambient (a calibrated, ambient-dependent offset — see
   `contrib/calibrate_idle_offset.py`), so ambient can be read without any

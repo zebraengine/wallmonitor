@@ -1101,9 +1101,26 @@ async function viewLive(root) {
         (drift.off_current_n ? ` (${drift.off_current_n} session${drift.off_current_n === 1 ? "" : "s"} away from the usual ` +
         `~${fmtNum(drift.typical_current_a, 0)} A excluded from the comparison.)` : ""));
     }
+    // The defaults come from one verified install. Once this install has
+    // fits of its own, say plainly when they landed far from those priors:
+    // the forecast before the first fit was governed by numbers that did
+    // not describe this charger, and a fast tau has a standing cost — the
+    // fitter's identifiability gate is floored at the default tau, so short
+    // charges on such an install never teach the model.
+    const dev = model.prior_deviation;
+    let priorNote = "";
+    if (model.fitted && dev && dev.notable) {
+      const parts = [];
+      if (Math.abs(dev.tau_frac) > 0.3) parts.push(`τ ${fmtNum(model.tau_min, 1)} min vs the ${fmtNum(dev.default_tau_min, 0)} min default`);
+      if (Math.abs(dev.rise_frac) > 0.3) parts.push(`rise +${fmtNum(model.rise_ref_c, 0)} °C vs the +${fmtNum(dev.default_rise_ref_c, 0)} °C default`);
+      priorNote = ` This install differs from the built-in priors (${parts.join("; ")}) — forecasts before its first ` +
+        `fitted session were rough` +
+        (dev.tau_frac < -0.3 ? `, and with a τ this fast only charges of ≥ ${fmtNum(1.8 * dev.default_tau_min, 0)} min ` +
+          "at steady current teach the model." : ".");
+    }
     const modelNote = `Model: τ ≈ ${fmtNum(model.tau_min, 1)} min, +${fmtNum(model.rise_ref_c, 0)} °C at ${fmtNum(model.ref_current_a, 0)} A — ` +
-      (model.fitted ? `fitted from ${model.tau_fits} recorded session ramp${model.tau_fits === 1 ? "" : "s"}.`
-                : "defaults from the verified alert-40 event; refits automatically as sessions accumulate.") +
+      (model.fitted ? `fitted from ${model.tau_fits} recorded session ramp${model.tau_fits === 1 ? "" : "s"}.` + priorNote
+                : "defaults from one verified install, used until this charger has fits of its own; refits automatically as sessions accumulate.") +
       (drift && !drift.drifting && !drift.lead ? ` Heat rise stable across the last ${drift.recent_n + drift.baseline_n} fitted sessions` +
         `${drift.off_current_n ? ` (${drift.off_current_n} off-current session${drift.off_current_n === 1 ? "" : "s"} excluded)` : ""}.` : "");
     thermalCard.append(el("div", { class: "chart-card" },
