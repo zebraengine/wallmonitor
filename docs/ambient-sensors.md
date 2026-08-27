@@ -15,6 +15,31 @@ the live forecast, and the idle ambient tile. No configuration: the sensor
 can appear, disappear, or never exist, and every path falls back to the
 handle proxy.
 
+A stationary sensor does one more thing: it **calibrates the handle proxy
+to your install**. The proxy's idle-offset model (how far above garage air
+the idle handle settles, as a function of ambient) ships as a seed fitted
+on one install. Once your sensor has overlapped a few days of settled idle
+time, the daily maintenance pass refits that model from your own history —
+settled, quasi-static idle segments only, per-segment means, a
+day-jackknifed slope — and adopts it when it passes sanity gates and moves
+materially from what is stored. From then on every handle-derived ambient
+read (pre-charge idle, cool-down tails, the idle tile when the sensor is
+briefly silent) goes through *your* model; `/api/thermal` reports it under
+`model.idle_offset` with `source: "calibrated"`, the segment count and
+coverage, and the dashboard's model note says so. Adoption is recorded as
+an `idle_offset_calibrated` event and marked on the rise-vs-date chart,
+because it reinterprets every proxy-tier fit in history at once — a step
+there after a recalibration is the correction working, not the connector
+changing. Re-anchor the verified baseline afterwards if the step is large.
+
+Without a sensor the seed stands, labelled `source: "built-in"`, and every
+proxy-derived ambient carries a stated uncertainty (`ambient_se_c`,
+±1.5 °C) that the idle tile and model-basis forecasts show. That
+uncertainty cannot be reduced without ground truth — it is the honest
+price of running sensor-less, and the reason a $20 sensor is worth it.
+`contrib/calibrate_idle_offset.py` runs the same estimator over a copy of
+any database and prints what the monitor would adopt.
+
 Two dialects are accepted:
 
 - **Ecowitt gateway (GW1100/GW1200)** — in the gateway's local web UI, set

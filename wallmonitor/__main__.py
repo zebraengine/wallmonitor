@@ -30,12 +30,16 @@ from .web import make_app
 log = logging.getLogger("wallmonitor")
 
 
-async def _maintenance(db: Database, cfg) -> None:
-    """Background housekeeping: the one-time diagnostics backfill, then —
-    when retention is enabled — a daily raw-JSON trim of samples older
-    than the retention window. Chunked throughout, so live polling only
-    ever waits a moment."""
+async def _maintenance(db: Database, cfg, poller: Poller) -> None:
+    """Background housekeeping: the one-time diagnostics backfill, then a
+    daily pass that (a) refits the idle-offset model from this install's
+    own settled-idle history when a stationary ambient sensor has been
+    reporting, adopting it only on a material, sane change, and (b) when
+    retention is enabled, trims raw JSON older than the window. Chunked
+    throughout, so live polling only ever waits a moment."""
     import time as _time
+
+    from . import calibration, thermal
 
     def report(done: int, total: int) -> None:
         if done % 200_000 < 10_000 or done >= total:
@@ -44,15 +48,27 @@ async def _maintenance(db: Database, cfg) -> None:
     touched = await asyncio.to_thread(db.backfill_diag_columns, 10_000, report)
     if touched:
         log.info("diagnostics backfill complete: %d rows", touched)
-    if not cfg.retain_raw_days:
-        return
     while True:
-        cutoff = _time.time() - cfg.retain_raw_days * 86400.0
-        counts = await asyncio.to_thread(db.trim_raw, cutoff)
-        total = sum(counts.values())
-        if total:
-            log.info("retention: trimmed raw JSON from %d rows (%s)", total,
-                     ", ".join(f"{k}={v}" for k, v in counts.items() if v))
+        now = _time.time()
+        try:
+            old, new, why = await asyncio.to_thread(
+                calibration.maybe_adopt, db, now, thermal.IDLE_OFFSET_SETTING)
+            if new is not None:
+                log.info("idle-offset calibration adopted: %.2f C at %.0f C, slope %.4f, %d segments over %d days",
+                         new["ref_c"], new["ambient_ref_c"], new["slope"], new["segments"], new["days"])
+                await poller._event(now, "idle_offset_calibrated", {"old": old, "new": new})
+                poller.invalidate_thermal()
+            elif why and why != "no material change":
+                log.info("idle-offset calibration not adopted: %s", why)
+        except Exception:
+            log.exception("idle-offset calibration failed")
+        if cfg.retain_raw_days:
+            cutoff = now - cfg.retain_raw_days * 86400.0
+            counts = await asyncio.to_thread(db.trim_raw, cutoff)
+            total = sum(counts.values())
+            if total:
+                log.info("retention: trimmed raw JSON from %d rows (%s)", total,
+                         ", ".join(f"{k}={v}" for k, v in counts.items() if v))
         await asyncio.sleep(24 * 3600.0)
 
 
@@ -97,7 +113,7 @@ async def run(argv: list[str] | None = None) -> None:
     client = aiohttp.ClientSession()
     poller = Poller(cfg, db, bus, client)
     await poller.start()
-    backfill = asyncio.create_task(_maintenance(db, cfg), name="wallmonitor-maintenance")
+    backfill = asyncio.create_task(_maintenance(db, cfg, poller), name="wallmonitor-maintenance")
 
     app = make_app(db, bus, poller)
     runner = web.AppRunner(app)

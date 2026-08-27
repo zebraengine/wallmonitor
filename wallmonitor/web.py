@@ -224,22 +224,27 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
 
     # Model parameters change only as new sessions land, so the (SQLite-heavy)
     # history fit is cached; the live prediction is computed on every call.
-    thermal_fit: dict = {"params": None, "fits": [], "ts": 0.0}
+    thermal_fit: dict = {"params": None, "fits": [], "ts": 0.0, "idle_offset": None}
 
     async def api_thermal(request: web.Request) -> web.Response:
         """The full thermal picture: fitted model, live forecast, per-segment
         fits, drift verdict, baseline anchor. Also what the BLE amp
         controller polls every 30 s. ?refit busts the 6 h fit cache."""
         now = time.time()
+        # A newly adopted idle-offset model reinterprets every proxy-tier
+        # fit, so the cache is keyed on the stored model too.
+        idle_offset = await asyncio.to_thread(db.get_setting, thermal.IDLE_OFFSET_SETTING)
         if (
             thermal_fit["params"] is None
             or now - thermal_fit["ts"] > 6 * 3600
+            or thermal_fit["idle_offset"] != idle_offset
             or "refit" in request.query
         ):
             fits = await asyncio.to_thread(thermal.fit_sessions, db, now)
             thermal_fit["fits"] = fits
             thermal_fit["params"] = thermal.fit_history(db, now, fits=fits)
             thermal_fit["ts"] = now
+            thermal_fit["idle_offset"] = idle_offset
         result = await asyncio.to_thread(thermal.predict, db, now, thermal_fit["params"])
         anchor = await asyncio.to_thread(thermal.baseline_anchor, db)
         return web.json_response(

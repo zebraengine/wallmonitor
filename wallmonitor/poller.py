@@ -495,6 +495,11 @@ class Poller:
             await asyncio.to_thread(self.db.clear_alert, ts, IDENTITY_ALERT, "monitor")
             await self._event(ts, "device_restored", {"serial": serial, "host": self.cfg.host})
 
+    def invalidate_thermal(self) -> None:
+        """Drop the cached forecast params so the next tick refits under a
+        newly adopted idle-offset model (proxy-tier fits reinterpret)."""
+        self._params = None
+
     async def recheck_thermal_drift(self, ts: float) -> None:
         """Refit history and raise/clear the degradation alert.
 

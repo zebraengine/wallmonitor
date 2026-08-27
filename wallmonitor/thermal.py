@@ -31,6 +31,7 @@ is measured and removed instead of leaking into the fitted rise.
 from __future__ import annotations
 
 import math
+import json
 from dataclasses import dataclass
 from statistics import median
 
@@ -63,35 +64,122 @@ IDLE_OFFSET_SLOPE = -0.124  # d(offset)/d(ambient)
 IDLE_OFFSET_AMBIENT_REF_C = 30.0
 IDLE_OFFSET_AMBIENT_RANGE_C = (23.0, 38.5)  # calibration coverage; clamp outside
 
+# These constants are the *seed*, not the calibration: when a stationary
+# ambient sensor gives this install ground truth, calibration.maybe_adopt
+# refits the same linear model from its own settled-idle history and
+# stores it under this settings key; every proxy read then goes through
+# the install's model. Without a sensor the seed stands, labelled as such.
+IDLE_OFFSET_SETTING = "idle_offset_model"
+# Proxy ambient uncertainty when no calibration exists: the built-in fit's
+# own segment scatter was ~0.5 C on its install; a different garage can be
+# off by a constant this large without any way to know.
+IDLE_OFFSET_UNCALIBRATED_SE_C = 1.5
 
-def idle_offset_c(ambient_c: float) -> float:
+
+@dataclass(frozen=True)
+class IdleOffset:
+    """The idle-offset model: offset = ref_c + slope * (ambient - ambient_ref_c),
+    linear inside ambient_range_c and held at the boundary value outside it
+    (continuous at both edges), so out-of-range readings degrade to a
+    constant-offset proxy instead of extrapolating the slope."""
+
+    ref_c: float = IDLE_OFFSET_REF_C
+    slope: float = IDLE_OFFSET_SLOPE
+    ambient_ref_c: float = IDLE_OFFSET_AMBIENT_REF_C
+    ambient_range_c: tuple[float, float] = IDLE_OFFSET_AMBIENT_RANGE_C
+    source: str = "built-in"
+    segments: int = 0
+    days: int = 0
+    residual_sd_c: float | None = None
+    calibrated_ts: float | None = None
+
+    def offset_c(self, ambient_c: float) -> float:
+        lo, hi = self.ambient_range_c
+        clamped = min(max(ambient_c, lo), hi)
+        return self.ref_c + self.slope * (clamped - self.ambient_ref_c)
+
+    def handle_c(self, ambient_c: float) -> float:
+        return ambient_c + self.offset_c(ambient_c)
+
+    def ambient_from_handle(self, handle_c: float) -> float:
+        ta = (handle_c - self.ref_c + self.slope * self.ambient_ref_c) / (1.0 + self.slope)
+        lo, hi = self.ambient_range_c
+        if ta < lo:
+            return handle_c - self.offset_c(lo)
+        if ta > hi:
+            return handle_c - self.offset_c(hi)
+        return ta
+
+    @property
+    def ambient_se_c(self) -> float:
+        """How far a proxy ambient read may sit from the truth (1 sigma):
+        the calibration's own segment scatter, or the uncalibrated default."""
+        if self.source == "calibrated" and self.residual_sd_c is not None:
+            return max(self.residual_sd_c, 0.2)
+        return IDLE_OFFSET_UNCALIBRATED_SE_C
+
+    def as_dict(self) -> dict:
+        return {
+            "source": self.source,
+            "ref_c": round(self.ref_c, 3),
+            "slope": round(self.slope, 4),
+            "ambient_ref_c": self.ambient_ref_c,
+            "ambient_range_c": [self.ambient_range_c[0], self.ambient_range_c[1]],
+            "segments": self.segments,
+            "days": self.days,
+            "residual_sd_c": round(self.residual_sd_c, 3) if self.residual_sd_c is not None else None,
+            "ambient_se_c": round(self.ambient_se_c, 2),
+            "calibrated_ts": self.calibrated_ts,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "IdleOffset":
+        lo, hi = data["ambient_range_c"]
+        return cls(
+            ref_c=float(data["ref_c"]),
+            slope=float(data["slope"]),
+            ambient_ref_c=float(data["ambient_ref_c"]),
+            ambient_range_c=(float(lo), float(hi)),
+            source=str(data.get("source", "calibrated")),
+            segments=int(data.get("segments", 0)),
+            days=int(data.get("days", 0)),
+            residual_sd_c=data.get("residual_sd_c"),
+            calibrated_ts=data.get("calibrated_ts"),
+        )
+
+
+BUILTIN_IDLE_OFFSET = IdleOffset()
+
+
+def load_idle_offset(db: Database) -> IdleOffset:
+    """This install's idle-offset model: the calibrated one when a sane one
+    is stored, else the built-in seed. Never raises — a corrupt setting
+    falls back to the seed."""
+    raw = db.get_setting(IDLE_OFFSET_SETTING)
+    if not raw:
+        return BUILTIN_IDLE_OFFSET
+    try:
+        model = IdleOffset.from_dict(json.loads(raw))
+    except (ValueError, KeyError, TypeError):
+        return BUILTIN_IDLE_OFFSET
+    if not (-0.95 < model.slope < 0.95) or model.ambient_range_c[0] >= model.ambient_range_c[1]:
+        return BUILTIN_IDLE_OFFSET
+    return model
+
+
+def idle_offset_c(ambient_c: float, model: IdleOffset = BUILTIN_IDLE_OFFSET) -> float:
     """How far above garage air the idle handle settles, at this ambient."""
-    lo, hi = IDLE_OFFSET_AMBIENT_RANGE_C
-    clamped = min(max(ambient_c, lo), hi)
-    return IDLE_OFFSET_REF_C + IDLE_OFFSET_SLOPE * (clamped - IDLE_OFFSET_AMBIENT_REF_C)
+    return model.offset_c(ambient_c)
 
 
-def idle_handle_c(ambient_c: float) -> float:
+def idle_handle_c(ambient_c: float, model: IdleOffset = BUILTIN_IDLE_OFFSET) -> float:
     """Idle handle temperature expected at a given garage air temperature."""
-    return ambient_c + idle_offset_c(ambient_c)
+    return model.handle_c(ambient_c)
 
 
-def ambient_from_idle_handle(handle_c: float) -> float:
-    """Garage air implied by a settled idle handle: inverse of idle_handle_c.
-
-    Linear inside the calibrated ambient band; beyond it the offset holds at
-    the boundary value (continuous at both edges), so out-of-range readings
-    degrade to a constant-offset proxy instead of extrapolating the slope.
-    """
-    ta = (handle_c - IDLE_OFFSET_REF_C + IDLE_OFFSET_SLOPE * IDLE_OFFSET_AMBIENT_REF_C) / (
-        1.0 + IDLE_OFFSET_SLOPE
-    )
-    lo, hi = IDLE_OFFSET_AMBIENT_RANGE_C
-    if ta < lo:
-        return handle_c - idle_offset_c(lo)
-    if ta > hi:
-        return handle_c - idle_offset_c(hi)
-    return ta
+def ambient_from_idle_handle(handle_c: float, model: IdleOffset = BUILTIN_IDLE_OFFSET) -> float:
+    """Garage air implied by a settled idle handle: inverse of idle_handle_c."""
+    return model.ambient_from_handle(handle_c)
 REF_CURRENT_A = 48.0  # rise_ref_c is normalized to this charge current
 
 DEFAULT_TAU_MIN = 12.0
@@ -336,7 +424,7 @@ def _latest_measured_ambient(db: Database, now: float) -> tuple[float, str] | No
     return rows[-1]["temp_c"], tag
 
 
-def _ambient_before(db: Database, start_ts: float) -> float | None:
+def _ambient_before(db: Database, start_ts: float, model: IdleOffset = BUILTIN_IDLE_OFFSET) -> float | None:
     """Ambient estimate from the idle handle temperature before a session."""
     rows = db.vitals_range(start_ts - 2400, start_ts - 30, 5000)
     idle = [
@@ -348,7 +436,7 @@ def _ambient_before(db: Database, start_ts: float) -> float | None:
     ]
     if len(idle) < 5 or max(idle) - min(idle) > 2.0:
         return None
-    return ambient_from_idle_handle(median(idle))
+    return ambient_from_idle_handle(median(idle), model)
 
 
 # Cool-down-tail ambient: gates for reading ambient from a still-warm
@@ -359,7 +447,7 @@ COOLDOWN_MIN_DROP_C = 1.0
 COOLDOWN_MAX_RMSE_C = 0.5
 
 
-def _decay_asymptote(tail: list[dict], tau_min: float) -> float | None:
+def _decay_asymptote(tail: list[dict], tau_min: float, model: IdleOffset = BUILTIN_IDLE_OFFSET) -> float | None:
     """Ambient from a cooling handle's decay: least-squares asymptote of a
     first-order lag at a known tau, minus the idle offset. Gated on span,
     visible drop, and fit quality; None when the tail can't be trusted."""
@@ -386,7 +474,7 @@ def _decay_asymptote(tail: list[dict], tau_min: float) -> float | None:
     )
     if rmse > COOLDOWN_MAX_RMSE_C:
         return None  # not a clean single-exponential decay at this tau
-    ambient = ambient_from_idle_handle(asymptote)
+    ambient = ambient_from_idle_handle(asymptote, model)
     if not (-30.0 <= ambient <= TRIP_HANDLE_C):
         return None
     return ambient
@@ -406,7 +494,8 @@ def _idle_rows(rows: list[dict]) -> list[dict]:
     ]
 
 
-def _ambient_from_cooldown(db: Database, start_ts: float, tau_min: float) -> float | None:
+def _ambient_from_cooldown(db: Database, start_ts: float, tau_min: float,
+                          model: IdleOffset = BUILTIN_IDLE_OFFSET) -> float | None:
     """Ambient from the cool-down tail before a segment that starts warm.
 
     A stop/resume or post-derate segment begins before the handle has
@@ -430,10 +519,11 @@ def _ambient_from_cooldown(db: Database, start_ts: float, tau_min: float) -> flo
             break
         tail.append(row)
     tail.reverse()
-    return _decay_asymptote(tail, tau_min)
+    return _decay_asymptote(tail, tau_min, model)
 
 
-def _ambient_after(db: Database, end_ts: float, tau_min: float) -> float | None:
+def _ambient_after(db: Database, end_ts: float, tau_min: float,
+                   model: IdleOffset = BUILTIN_IDLE_OFFSET) -> float | None:
     """Ambient at the end of a load window, from the cool-down that follows.
 
     The moment current stops, the handle decays from its working temperature
@@ -454,7 +544,7 @@ def _ambient_after(db: Database, end_ts: float, tau_min: float) -> float | None:
         if row["ts"] - tail[-1]["ts"] > 120.0:
             break
         tail.append(row)
-    return _decay_asymptote(tail, tau_min)
+    return _decay_asymptote(tail, tau_min, model)
 
 
 def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list[dict]:
@@ -486,6 +576,7 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
         if session.get("end_ts") and (session.get("charging_s") or 0) >= MIN_SEGMENT_S
     ][:40]
     fits: list[dict] = []
+    idle_model = load_idle_offset(db)
     for sess in sessions:
         # Coarse pass over the whole session to locate charging segments —
         # bucket-averaged is fine here (and keeps a multi-day session cheap);
@@ -539,14 +630,14 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
             measured = _measured_ambient(db, seg_start - MEASURED_AMBIENT_WINDOW_S, seg_start + 60)
             ambient, ambient_source = measured if measured is not None else (None, None)
             if ambient is None:
-                ambient = _ambient_before(db, seg_start)
+                ambient = _ambient_before(db, seg_start, idle_model)
                 ambient_source = "pre_idle" if ambient is not None else None
             if ambient is None:
                 # Hot-handle start (stop/resume, post-derate): read ambient
                 # from the previous charge's cool-down tail instead, using
                 # this install's fitted tau (this segment's own plus any
                 # earlier fits this pass).
-                ambient = _ambient_from_cooldown(db, seg_start, tau_est)
+                ambient = _ambient_from_cooldown(db, seg_start, tau_est, idle_model)
                 if ambient is not None:
                     ambient_source = "cooldown_tail"
             ambient_end = None
@@ -554,7 +645,7 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
                 measured_end = _measured_ambient(db, seg_end - 60, seg_end + MEASURED_AMBIENT_WINDOW_S)
                 ambient_end = measured_end[0] if measured_end is not None else None
                 if ambient_end is None:
-                    ambient_end = _ambient_after(db, seg_end, tau_est)
+                    ambient_end = _ambient_after(db, seg_end, tau_est, idle_model)
             if ambient_end is not None:
                 # Bracketed: de-trend the samples against the linear ambient
                 # ramp across the load window and refit. With ambient
@@ -883,7 +974,9 @@ def _recent_steady_ambient(recent: list[dict], params: ThermalParams) -> float |
 
 def predict(db: Database, now: float, params: ThermalParams) -> dict:
     """Forecast alert-40 for the current state (live session or idle)."""
-    out: dict = {"model": params.as_dict(), "state": "no_data", "forecast": None}
+    idle_model = load_idle_offset(db)
+    out: dict = {"model": {**params.as_dict(), "idle_offset": idle_model.as_dict()},
+                 "state": "no_data", "forecast": None}
     recent = [
         row for row in db.vitals_range(now - 900, now, 2000) if row.get("handle_temp_c") is not None
     ]
@@ -942,7 +1035,7 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
             if ambient is None:
                 sid = last.get("session_id")
                 sess = db.session(int(sid)) if sid else None
-                ambient = _ambient_before(db, sess["start_ts"]) if sess else None
+                ambient = _ambient_before(db, sess["start_ts"], idle_model) if sess else None
                 source = "pre_session"
             if ambient is None:
                 ambient = _recent_steady_ambient(recent, params)
@@ -957,6 +1050,10 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
             t_inf = ambient + params.rise_ref_c * (current / REF_CURRENT_A) ** 2
             forecast["basis"] = "model"
             forecast["ambient_source"] = source
+            # A model-basis plateau is only as good as its ambient: a sensor
+            # reads air directly; every handle-derived route carries the
+            # idle-offset model's own uncertainty, 1:1 into the plateau.
+            forecast["ambient_se_c"] = 0.3 if source in ("measured", "measured_car") else idle_model.ambient_se_c
         # No flooring of t_inf at the current temperature: a steady state
         # below the handle is real, not noise — it's what cooling toward a
         # lower equilibrium looks like after a current cut or a derate.
@@ -989,10 +1086,11 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
             ambient, ambient_source = measured
             stable = True
         else:
-            ambient = ambient_from_idle_handle(last["handle_temp_c"])
+            ambient = ambient_from_idle_handle(last["handle_temp_c"], idle_model)
             ambient_source = "idle_handle"
         out["ambient_c"] = round(ambient, 1)
         out["ambient_source"] = ambient_source
+        out["ambient_se_c"] = 0.3 if measured is not None else idle_model.ambient_se_c
         out["ambient_stable"] = stable
         # Hypothetical: a full-rate session started right now.
         t_inf = ambient + params.rise_ref_c
