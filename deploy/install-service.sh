@@ -7,6 +7,11 @@
 #   sudo ./install-service.sh --host 192.168.1.50 --bind 0.0.0.0 --port 8480
 #   sudo ./install-service.sh --uninstall
 #
+# Optional daily backup (nothing is scheduled unless you ask): a verified,
+# compressed snapshot into a directory of your choosing — local, a NAS
+# mount, or a folder a sync client watches — every night at 03:30:
+#   sudo ./install-service.sh --host 192.168.1.50 --backup-dir /srv/backups/wallmonitor
+#
 # More than one Wall Connector: give each its own --name. That yields a
 # separate unit (wallmonitor-<name>), a separate database (<name>.db) and
 # the label shown in that instance's UI and notifications; link the
@@ -38,6 +43,7 @@ UNINSTALL="0"
 NAME=""
 LABEL=""
 PEERS=()
+BACKUP_DIR=""
 
 usage() { grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
@@ -55,6 +61,7 @@ while [[ $# -gt 0 ]]; do
     --name) NAME="$2"; shift 2 ;;
     --label) LABEL="$2"; shift 2 ;;
     --peer) PEERS+=("$2"); shift 2 ;;
+    --backup-dir) BACKUP_DIR="$2"; shift 2 ;;
     --uninstall) UNINSTALL="1"; shift ;;
     -h|--help) usage ;;
     *) echo "unknown argument: $1" >&2; usage 1 ;;
@@ -82,6 +89,8 @@ if [[ "$(id -u)" -ne 0 ]]; then
 fi
 
 if [[ "$UNINSTALL" == "1" ]]; then
+  systemctl disable --now "${SERVICE_NAME}-backup.timer" 2>/dev/null || true
+  rm -f "/etc/systemd/system/${SERVICE_NAME}-backup.timer" "/etc/systemd/system/${SERVICE_NAME}-backup.service"
   systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
   rm -f "$UNIT_PATH"
   systemctl daemon-reload
@@ -147,8 +156,42 @@ fi
   echo "WantedBy=multi-user.target"
 } > "$UNIT_PATH"
 
+# Opt-in daily backup: nothing is scheduled unless --backup-dir is given.
+BACKUP_UNIT="${SERVICE_NAME}-backup"
+if [[ -n "$BACKUP_DIR" ]]; then
+  ENV_LINES=""
+  [[ -n "$DB_PATH" ]] && ENV_LINES="Environment=WM_DB=${DB_PATH}"
+  cat > "/etc/systemd/system/${BACKUP_UNIT}.service" <<EOF_UNIT
+[Unit]
+Description=Daily database backup (${SERVICE_NAME})
+
+[Service]
+Type=oneshot
+User=${RUN_USER}
+WorkingDirectory=${MONITOR_DIR}
+${ENV_LINES}
+ExecStart=${UV_BIN} run --project ${MONITOR_DIR} python -m wallmonitor --backup ${BACKUP_DIR}
+EOF_UNIT
+  cat > "/etc/systemd/system/${BACKUP_UNIT}.timer" <<EOF_TIMER
+[Unit]
+Description=Run the ${SERVICE_NAME} backup daily
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+fi
+
 systemctl daemon-reload
 systemctl enable --now "$SERVICE_NAME"
+if [[ -n "$BACKUP_DIR" ]]; then
+  systemctl enable --now "${BACKUP_UNIT}.timer"
+  echo "daily backup timer enabled -> ${BACKUP_DIR} (systemctl list-timers ${BACKUP_UNIT}.timer)"
+fi
 
 echo ""
 echo "installed and started. Useful commands:"

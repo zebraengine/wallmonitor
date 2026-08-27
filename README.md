@@ -42,7 +42,8 @@ between dashboards, and the service installer's `--name` does it all per
 charger in one command. See [More than one Wall Connector](https://github.com/zebraengine/wallmonitor/blob/main/docs/running.md#more-than-one-wall-connector).
 
 All history lands in a single `wallmonitor.db` SQLite file — back up that
-one file and you have everything. For every option, and for running it as a
+one file and you have everything (`wallmonitor --backup DIR` writes a
+verified, compressed snapshot wherever you point it, while running). For every option, and for running it as a
 systemd service on an always-on box, see [Running wallmonitor](https://github.com/zebraengine/wallmonitor/blob/main/docs/running.md).
 
 ## At a glance

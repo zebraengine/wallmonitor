@@ -51,7 +51,8 @@ the recording pipeline in the order data flows through it.
 
 - **Storage** is a single SQLite file (`wallmonitor.db`, WAL mode) next to
   where you run the app, or wherever `--db` points. Back up that one file and
-  you have your complete history. There is no retention limit; expect very
+  you have your complete history — `--backup DIR` does it safely while the
+  monitor runs (see [Backup](running.md#backup)). There is no retention limit; expect very
   roughly 10–25 MB/day depending on how often a vehicle is attached. The
   charger itself keeps no history — the monitor's database *is* the history,
   starting from the first time it runs.

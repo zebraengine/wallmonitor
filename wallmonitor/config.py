@@ -39,6 +39,11 @@ class Config:
     retain_raw_days: float = 0.0
     # One-shot: VACUUM the database to reclaim trimmed space, print sizes, exit.
     compact: bool = False
+    # One-shot backup: snapshot, verify, compress, rotate into this directory
+    # (any path — local, NAS mount, sync-client folder), then exit.
+    backup_dir: str | None = None
+    backup_compress: str = "gzip"
+    backup_keep: str = "7/4/12"
     # Sibling instances watching other chargers, as (label, url) pairs;
     # rendered as a switcher in the header so one browser hops between them.
     peers: tuple[tuple[str, str], ...] = ()
@@ -170,6 +175,31 @@ def parse_args(argv: list[str] | None = None) -> Config:
         "Run it while the monitor service is stopped.",
     )
     parser.add_argument(
+        "--backup",
+        dest="backup_dir",
+        metavar="DIR",
+        default=_env("WM_BACKUP_DIR", None),
+        help="Write a verified, compressed snapshot of the database into DIR (created if "
+        "missing), rotate older snapshots there, and exit. Safe while the monitor runs. "
+        "DIR can be anything: a local path, a NAS mount, a folder a sync client watches. "
+        "(env: WM_BACKUP_DIR)",
+    )
+    parser.add_argument(
+        "--backup-compress",
+        choices=("gzip", "xz", "none"),
+        default=_env("WM_BACKUP_COMPRESS", "gzip"),
+        help="Snapshot compression: gzip (~12x, seconds — default), xz (~22x, minutes), or none. "
+        "(env: WM_BACKUP_COMPRESS)",
+    )
+    parser.add_argument(
+        "--backup-keep",
+        default=_env("WM_BACKUP_KEEP", "7/4/12"),
+        metavar="D/W/M",
+        help="Rotation: keep the newest snapshot per day for D days, per week for W weeks, "
+        "per month for M months (default 7/4/12; 0/0/0 keeps everything). Only "
+        "wallmonitor's own snapshot files are ever removed. (env: WM_BACKUP_KEEP)",
+    )
+    parser.add_argument(
         "--peer",
         action="append",
         default=None,
@@ -218,7 +248,16 @@ def parse_args(argv: list[str] | None = None) -> Config:
     if args.retain_raw_days and args.retain_raw_days < 7:
         parser.error("--retain-raw-days must be at least 7 (or 0 to disable)")
 
-    if not args.demo and not args.host and args.discover is None and not args.compact:
+    if args.backup_dir:
+        from .backup import Keep
+
+        try:
+            Keep.parse(args.backup_keep)
+        except ValueError as ex:
+            parser.error(str(ex))
+
+    if (not args.demo and not args.host and args.discover is None and not args.compact
+            and not args.backup_dir):
         parser.error(
             "--host (or WM_WC_HOST) is required — run `wallmonitor --discover` to find "
             "your Wall Connector's address, or --demo for the built-in simulator"
@@ -234,6 +273,9 @@ def parse_args(argv: list[str] | None = None) -> Config:
         label=args.label,
         retain_raw_days=float(args.retain_raw_days),
         compact=bool(args.compact),
+        backup_dir=args.backup_dir,
+        backup_compress=args.backup_compress,
+        backup_keep=args.backup_keep,
         peers=peers,
         discover=args.discover,
         notify_url=args.notify_url,

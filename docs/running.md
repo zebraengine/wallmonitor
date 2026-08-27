@@ -47,6 +47,9 @@ is the charger's microcontroller.
 | `--peer LABEL=URL` | `WM_PEERS` | — | Link another instance from the header switcher; repeatable (env: comma-separated) |
 | `--retain-raw-days` | `WM_RETAIN_RAW_DAYS` | `0` (off) | Trim raw JSON from samples older than N days (min 7); columns stay forever |
 | `--compact` | — | — | One-shot VACUUM to reclaim trimmed space; run with the service stopped |
+| `--backup DIR` | `WM_BACKUP_DIR` | — | One-shot verified, compressed snapshot into DIR, rotate, exit; safe while running |
+| `--backup-compress` | `WM_BACKUP_COMPRESS` | `gzip` | `gzip` (~12×, seconds), `xz` (~22×, minutes), or `none` |
+| `--backup-keep` | `WM_BACKUP_KEEP` | `7/4/12` | Keep newest per day / week / month for that many; `0/0/0` keeps all |
 | `--port` | `WM_PORT` | `8480` | Web UI port |
 | `--bind` | `WM_BIND` | `127.0.0.1` | Web UI bind address |
 | `--db` | `WM_DB` | `wallmonitor.db` | SQLite path |
@@ -164,6 +167,45 @@ service and run:
 ```bash
 uv run python -m wallmonitor --compact --db /path/to/wallmonitor.db
 ```
+
+## Backup
+
+The database is the history — the charger keeps none — and the
+degradation watch judges every new charge against it. One command makes a
+copy worth having:
+
+```bash
+uv run python -m wallmonitor --backup /path/to/backups --db /path/to/wallmonitor.db
+```
+
+It takes a consistent snapshot with SQLite's online backup API (safe while
+the service runs — about 4 s for a 1.4 GB database), runs
+`PRAGMA integrity_check` on the copy and refuses to continue if it isn't
+`ok`, compresses it (gzip by default: a 1.4 GB database becomes ~110 MB in
+about 15 s; `--backup-compress xz` halves that again in a few minutes), and
+places it as `wallmonitor-<serial>-<UTC timestamp>.db.gz` with an atomic
+rename, so a sync client never uploads a half-written file. Then it rotates:
+the newest snapshot per day for 7 days, per week for 4 weeks, per month for
+12 months (`--backup-keep D/W/M`). Only files matching its own naming
+pattern are ever deleted — anything else in the folder is left alone.
+
+**Where the folder is, is yours to decide**, and wallmonitor never talks to
+anything beyond it: a second disk; a NAS mount; a folder that iCloud Drive,
+Sync, Syncthing or Dropbox already watches; or simply a directory another
+machine pulls from — `rsync -a user@box:/path/to/backups/ ~/wallmonitor-backups/`
+from the *other* machine keeps credentials off the always-on box.
+
+Nothing is scheduled by default. To run it daily under the service's user,
+install with `--backup-dir DIR` (below), or add your own cron/timer entry.
+
+**Restore:** stop the service, then
+
+```bash
+gunzip -c wallmonitor-<serial>-<stamp>.db.gz > /path/to/wallmonitor.db
+rm -f /path/to/wallmonitor.db-wal /path/to/wallmonitor.db-shm   # stale WAL would corrupt the restored file
+```
+
+and start the service. The file is plain SQLite; nothing else is needed.
 
 ## Run as a service (Ubuntu / systemd)
 
