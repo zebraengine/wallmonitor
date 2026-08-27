@@ -560,11 +560,11 @@ async def test_thermal_fit_survives_ramp_and_midsession_derate(db):
         into = ts - start
         if into < 60:
             current = amps * into / 60.0  # ramp-up
-        elif into < 1200:
-            current = amps  # full rate for 20 min...
+        elif into < 1500:
+            current = amps  # full rate for 25 min...
         else:
             current = amps / 2  # ...then derated for hours (most samples)
-        temp = t_inf - (t_inf - temp0) * math.exp(-into / tau_s) if into < 1200 else 60.0
+        temp = t_inf - (t_inf - temp0) * math.exp(-into / tau_s) if into < 1500 else 60.0
         db.insert_vitals(ts, {
             "vehicle_connected": 1, "contactor_closed": 1, "vehicle_current_a": round(current, 2),
             "handle_temp_c": round(temp, 3), "pcba_temp_c": 55.0, "mcu_temp_c": 50.0,
@@ -577,6 +577,61 @@ async def test_thermal_fit_survives_ramp_and_midsession_derate(db):
     assert abs(fits[0]["tau_min"] - 12.0) < 1.5
     assert abs(fits[0]["current_a"] - amps) < 1.0
     assert fits[0]["rise_ref_c"] is not None and abs(fits[0]["rise_ref_c"] - rise) < 3.0
+
+
+async def test_thermal_fit_rejects_window_short_against_tau(db):
+    # A steady window that ends before the plateau shows can't separate rise
+    # from tau: the fitter trades a lower rise for a faster tau and passes
+    # every other gate with a fine RMSE. Seen on a real install as 21 min
+    # charges fitting 8 C under the rest and dragging the drift baseline
+    # down. The gate judges span against the install's median tau, not the
+    # fit's own (the biased quantity), so a truncated segment can't vouch
+    # for itself.
+    now = time.time()
+    tau_s = 720.0
+    for i in range(4):  # establish the install's tau from full-length ramps
+        _seed_thermal_session(db, now - (6 - i) * 7200, ambient_c=25.0, tau_s=tau_s, charge_s=1500.0)
+    short_start = now - 7200
+    _seed_thermal_session(db, short_start, ambient_c=25.0, tau_s=tau_s, charge_s=720.0)  # 1.0 tau
+    fits = thermal.fit_sessions(db, now)
+    assert len(fits) == 4, "the four plateau-observing ramps fit"
+    assert all(abs(fit["start_ts"] - short_start) > 120 for fit in fits), "the 1 tau window does not"
+    # The boundary itself: a 1.8 tau window is the shortest that passes.
+    _seed_thermal_session(db, now - 3600, ambient_c=25.0, tau_s=tau_s,
+                          charge_s=thermal.MIN_SPAN_TAU * tau_s + 60.0)
+    assert len(thermal.fit_sessions(db, now)) == 5
+
+
+async def test_thermal_fit_first_fit_judged_against_default_tau(db):
+    # Fresh install, no history: the gate has no earlier fits to judge a
+    # window against, and the fit's own tau is exactly the quantity a
+    # truncated window biases low. Floored at DEFAULT_TAU_MIN, a 12 min
+    # first charge is rejected even though its own tau (6 min) would have
+    # let it vouch for itself at 1.8 tau = 10.8 min.
+    now = time.time()
+    _seed_thermal_session(db, now - 7200, ambient_c=25.0, tau_s=360.0, charge_s=720.0)
+    assert thermal.fit_sessions(db, now) == []
+    # A charge that clears 1.8 x DEFAULT_TAU_MIN is the first to teach the model.
+    _seed_thermal_session(db, now - 3600, ambient_c=25.0, tau_s=360.0,
+                          charge_s=thermal.MIN_SPAN_TAU * thermal.DEFAULT_TAU_MIN * 60.0 + 60.0)
+    fits = thermal.fit_sessions(db, now)
+    assert len(fits) == 1 and abs(fits[0]["tau_min"] - 6.0) < 1.0
+
+
+async def test_thermal_fit_slow_tau_install_still_fits(db):
+    # A heavier cable or enclosed handle can have a tau near 20 min. The
+    # steady-prefix window must scale with the install's tau: a fixed 30 min
+    # cap would leave every window under 1.8 tau and the install blind.
+    now = time.time()
+    tau_s, rise = 1200.0, 30.0
+    for i in range(4):
+        _seed_thermal_session(db, now - (5 - i) * 4 * 3600, ambient_c=22.0, tau_s=tau_s,
+                              rise_ref_c=rise, charge_s=3900.0)
+    fits = thermal.fit_sessions(db, now)
+    assert len(fits) == 4
+    for fit in fits:
+        assert abs(fit["tau_min"] - 20.0) < 2.0
+        assert fit["rise_ref_c"] is not None and abs(fit["rise_ref_c"] - rise) < 3.0
 
 
 async def test_thermal_fit_covers_late_charging_segments(db):
@@ -1007,6 +1062,46 @@ async def test_thermal_drift_poller_alert(db):
     assert any(alert["alert"] == thermal.DRIFT_ALERT and alert["source"] == "monitor" for alert in alerts)
     events = db.events_range(now - 1, now + 1)
     assert any(event["kind"] == "thermal_drift" for event in events)
+
+
+async def _drift_notification(db, rises):
+    """Seed sessions with the given fitted rises, run the drift recheck, and
+    return the single (kind, body, detail) the poller tried to send."""
+    now = time.time()
+    for i, rise in enumerate(rises):
+        _seed_thermal_session(db, now - (len(rises) - i) * 7200, ambient_c=25.0, rise_ref_c=rise)
+    sent = []
+    async with aiohttp.ClientSession() as client:
+        poller = Poller(Config(host="127.0.0.1:1"), db, EventBus(), client)
+
+        async def capture(kind, title, body, detail):
+            sent.append((kind, body, detail))
+
+        poller._notify = capture
+        await poller.recheck_thermal_drift(now)
+    assert any(a["alert"] == thermal.DRIFT_ALERT for a in db.active_alerts())
+    assert len(sent) == 1
+    return sent[0]
+
+
+async def test_thermal_drift_confirmed_notifies_high_priority(db):
+    # Tight baseline, tight recent, big step: the interval clears zero, and
+    # that is the verdict worth interrupting a phone for.
+    kind, body, detail = await _drift_notification(db, [36.0, 36.5, 35.8, 36.2, 42.0, 41.5, 42.3])
+    assert detail["confident"] is True and kind == "thermal_drift"
+    assert "statistically confirmed" in body
+    assert Poller.NTFY_PRIORITY[kind] == "high"
+
+
+async def test_thermal_drift_lead_notifies_default_priority(db):
+    # Scattered baseline, modest step past the tripwire: drifting, but the
+    # interval straddles zero. Same alert and event, but with ~3.4 C
+    # session-to-session scatter the 2.5 C tripwire sits near one sigma, so
+    # an unconfirmed verdict is a lead for the dashboard, not a buzz.
+    kind, body, detail = await _drift_notification(db, [31.0, 38.0, 33.0, 38.0, 32.0, 37.0, 39.5, 38.0, 39.0])
+    assert detail["drifting"] is True and detail["confident"] is False
+    assert kind == "thermal_drift_lead" and "treat as a lead" in body
+    assert Poller.NTFY_PRIORITY[kind] == "default"
 
 
 async def test_baseline_anchor_reevaluates_drift_alert(db):

@@ -38,7 +38,11 @@ sudo ./install-service.sh --host <wall-connector-ip> [your other flags] \
 On the phone, install the ntfy app, point it at `http://<box-lan-ip>:8481`
 as the default server, and subscribe to the `wallmonitor` topic. Warnings
 arrive prioritized (a predicted derate is *urgent* — it's the one you can
-act on in the moment by lowering the vehicle's charge current).
+act on in the moment by lowering the vehicle's charge current). The
+degradation watch sends at *high* priority only when its confidence
+interval clears zero; a verdict that merely crosses the tripwire is sent as
+a lead at *default* priority — the same alert on the dashboard, without the
+phone buzz.
 
 iOS caveat, stated plainly: Apple only delivers instant background pushes
 through its own push service, so a purely self-hosted server means the iOS

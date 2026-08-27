@@ -105,6 +105,20 @@ MIN_RISE_SEEN_C = 4.0
 MAX_FIT_RMSE_C = 0.6
 TAU_RANGE_MIN = (3.0, 40.0)
 RISE_RANGE_C = (10.0, 80.0)
+# The steady-current window must be long against the install's time
+# constant, or rise and tau are not separately identifiable: a window that
+# ends before the plateau shows lets the fitter trade a lower rise for a
+# faster tau and pass every other gate with a fine RMSE. Judged against the
+# install's median tau (not this fit's own, which is exactly the biased
+# quantity), so a truncated segment can't vouch for itself — and floored at
+# DEFAULT_TAU_MIN, so on a fresh install the very first fit is judged
+# against a sane prior rather than its own possibly-truncated tau. At 1.8
+# tau the handle has covered ~83% of its rise. The steady-prefix window
+# scales with the same tau estimate (PREFIX_SPAN_TAU) so a slow-tau install
+# is not starved of fits by a fixed cap it can never clear.
+MIN_SPAN_TAU = 1.8
+PREFIX_SPAN_TAU = 2.5
+PREFIX_SPAN_MIN_S = 1800.0
 
 # Live-forecast gate: a steady-current window must hold this many samples
 # over this much time before its trajectory is projected.
@@ -185,8 +199,8 @@ def _fit_exponential(points: list[tuple[float, float]]) -> tuple[float, float, f
     return best
 
 
-def _steady_current_prefix(samples: list[dict]) -> list[dict]:
-    """The session's first steady-current run.
+def _steady_current_prefix(samples: list[dict], max_span_s: float = PREFIX_SPAN_MIN_S) -> list[dict]:
+    """The session's first steady-current run, capped at max_span_s.
 
     The reference current is the median of the first 10 minutes of charging,
     not of the whole session: a session that derates midway spends most of
@@ -218,7 +232,7 @@ def _steady_current_prefix(samples: list[dict]) -> list[dict]:
                 break  # the steady run ended (derate or charge stop)
             continue  # still ramping up to the plateau
         prefix.append(sample)
-        if sample["ts"] - prefix[0]["ts"] > 1800:  # first 30 min is where the ramp lives
+        if sample["ts"] - prefix[0]["ts"] > max_span_s:  # the ramp lives in the first few tau
             break
     return prefix
 
@@ -454,26 +468,47 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
         segments = _segments(coarse)[:MAX_SEGMENTS_PER_SESSION]
         for idx, (seg_start, seg_end) in enumerate(segments):
             next_start = segments[idx + 1][0] if idx + 1 < len(segments) else sess["end_ts"] + 1
-            t_hi = min(sess["end_ts"], seg_start + 2700, next_start - 1)
-            samples = db.vitals_range(seg_start - 1, t_hi + 1, 5000)
-            prefix = _steady_current_prefix(samples)
-            seg = [
-                (sample["ts"], sample["handle_temp_c"])
-                for sample in prefix
-                if sample.get("handle_temp_c") is not None
-            ]
-            if len(seg) < MIN_SEGMENT_SAMPLES or seg[-1][0] - seg[0][0] < MIN_SEGMENT_S:
-                continue
-            if max(temp for _, temp in seg) - seg[0][1] < MIN_RISE_SEEN_C:
-                continue
-            fit = _fit_exponential(seg)
-            if fit is None:
+            # The install's tau so far (the default until fits exist) sizes
+            # the window: a fixed cap that suits an 11 min tau would leave
+            # a 20 min tau install unable to clear the identifiability gate.
+            tau_prior = median(fit["tau_min"] for fit in fits) if fits else DEFAULT_TAU_MIN
+            fit = None
+            for _pass in range(2):
+                fit = None
+                span_cap_s = max(PREFIX_SPAN_MIN_S, PREFIX_SPAN_TAU * tau_prior * 60.0)
+                t_hi = min(sess["end_ts"], seg_start + span_cap_s + 900, next_start - 1)
+                samples = db.vitals_range(seg_start - 1, t_hi + 1, 5000)
+                prefix = _steady_current_prefix(samples, span_cap_s)
+                seg = [
+                    (sample["ts"], sample["handle_temp_c"])
+                    for sample in prefix
+                    if sample.get("handle_temp_c") is not None
+                ]
+                if len(seg) < MIN_SEGMENT_SAMPLES or seg[-1][0] - seg[0][0] < MIN_SEGMENT_S:
+                    break
+                if max(temp for _, temp in seg) - seg[0][1] < MIN_RISE_SEEN_C:
+                    break
+                fit = _fit_exponential(seg)
+                if fit is None:
+                    break
+                # The window was sized from the tau prior. If this segment
+                # fits slower than that, the prior under-sized it: widen to
+                # the fitted tau and refit once, so a slow-tau install (or
+                # the first fit on a fresh one) isn't stuck behind a window
+                # it can never clear.
+                slower = fit[0] / 60.0 > tau_prior * 1.1
+                if not slower or prefix[-1]["ts"] - prefix[0]["ts"] < span_cap_s - 60:
+                    break  # window is tau-sized, or the run ended on its own
+                tau_prior = fit[0] / 60.0
+            if fit is None or len(seg) < MIN_SEGMENT_SAMPLES:
                 continue
             tau_s, t_inf, rmse = fit
             if rmse > MAX_FIT_RMSE_C or t_inf <= seg[0][1] + 3.0:
                 continue
             i_med = median(sample["vehicle_current_a"] for sample in prefix)
             tau_est = median([tau_s / 60.0] + [fit["tau_min"] for fit in fits])
+            if seg[-1][0] - seg[0][0] < MIN_SPAN_TAU * max(tau_est, DEFAULT_TAU_MIN) * 60.0:
+                continue  # plateau never observed: rise/tau not identifiable
             measured = _measured_ambient(db, seg_start - MEASURED_AMBIENT_WINDOW_S, seg_start + 60)
             ambient, ambient_source = measured if measured is not None else (None, None)
             if ambient is None:
