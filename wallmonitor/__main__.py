@@ -65,6 +65,16 @@ async def run(argv: list[str] | None = None) -> None:
     cfg = parse_args(argv)
     if cfg.discover is not None:
         raise SystemExit(await run_discovery(cfg.discover, split_phase_hint=cfg.split_phase))
+    if cfg.backup_dir:
+        from .backup import Keep, run_backup
+
+        result = run_backup(cfg.db_path, cfg.backup_dir, cfg.backup_compress, Keep.parse(cfg.backup_keep))
+        print(f"{result.path}: {result.snapshot_bytes / 1e6:.1f} MB snapshot (integrity {result.integrity}, "
+              f"{result.snapshot_s:.1f} s) -> {result.output_bytes / 1e6:.1f} MB "
+              f"{cfg.backup_compress} ({result.compress_s:.1f} s)")
+        if result.deleted:
+            print(f"rotated out {len(result.deleted)}: " + ", ".join(result.deleted))
+        raise SystemExit(0)
     if cfg.compact:
         db = Database(cfg.db_path)
         try:
