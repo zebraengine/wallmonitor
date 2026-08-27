@@ -602,6 +602,38 @@ async def test_thermal_fit_rejects_window_short_against_tau(db):
     assert len(thermal.fit_sessions(db, now)) == 5
 
 
+async def test_thermal_fit_first_fit_judged_against_default_tau(db):
+    # Fresh install, no history: the gate has no earlier fits to judge a
+    # window against, and the fit's own tau is exactly the quantity a
+    # truncated window biases low. Floored at DEFAULT_TAU_MIN, a 12 min
+    # first charge is rejected even though its own tau (6 min) would have
+    # let it vouch for itself at 1.8 tau = 10.8 min.
+    now = time.time()
+    _seed_thermal_session(db, now - 7200, ambient_c=25.0, tau_s=360.0, charge_s=720.0)
+    assert thermal.fit_sessions(db, now) == []
+    # A charge that clears 1.8 x DEFAULT_TAU_MIN is the first to teach the model.
+    _seed_thermal_session(db, now - 3600, ambient_c=25.0, tau_s=360.0,
+                          charge_s=thermal.MIN_SPAN_TAU * thermal.DEFAULT_TAU_MIN * 60.0 + 60.0)
+    fits = thermal.fit_sessions(db, now)
+    assert len(fits) == 1 and abs(fits[0]["tau_min"] - 6.0) < 1.0
+
+
+async def test_thermal_fit_slow_tau_install_still_fits(db):
+    # A heavier cable or enclosed handle can have a tau near 20 min. The
+    # steady-prefix window must scale with the install's tau: a fixed 30 min
+    # cap would leave every window under 1.8 tau and the install blind.
+    now = time.time()
+    tau_s, rise = 1200.0, 30.0
+    for i in range(4):
+        _seed_thermal_session(db, now - (5 - i) * 4 * 3600, ambient_c=22.0, tau_s=tau_s,
+                              rise_ref_c=rise, charge_s=3900.0)
+    fits = thermal.fit_sessions(db, now)
+    assert len(fits) == 4
+    for fit in fits:
+        assert abs(fit["tau_min"] - 20.0) < 2.0
+        assert fit["rise_ref_c"] is not None and abs(fit["rise_ref_c"] - rise) < 3.0
+
+
 async def test_thermal_fit_covers_late_charging_segments(db):
     # A session shaped like real overnight use: a plug-in burst too short to
     # fit, hours of connected idle, then distinct charging segments (vehicle
