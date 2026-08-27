@@ -603,7 +603,7 @@ def fit_history(db: Database, now: float, lookback_days: float = 120.0,
 # earlier baseline and flags a sustained increase.
 DRIFT_RECENT_N = 3
 DRIFT_MIN_BASELINE_N = 3
-DRIFT_WARN_C = 2.5
+DRIFT_WARN_C = 2.5  # materiality floor, not the trigger — see detect_drift
 DRIFT_ALERT = "Handle heat rise increasing (check connector/wiring)"
 
 # Cross-current pooling: fits whose ambient was bracketed at both ends are
@@ -667,10 +667,16 @@ def detect_drift(fits: list[dict], anchor_ts: float | None = None) -> dict | Non
     from that moment, not "the first charges the monitor happened to see".
 
     The verdict carries its own uncertainty: MAD spread per side and a
-    Student-t ~95% confidence interval on the delta. "drifting" stays a
-    plain threshold tripwire; "confident" says whether the interval clears
-    zero — a Δ from a four-fit baseline is a lead, not a conviction, and the
-    UI should show the difference.
+    Student-t ~95% confidence interval on the delta. "drifting" — the alert
+    — needs both: the interval clears zero ("confident") *and* the delta is
+    material (>= DRIFT_WARN_C, the floor below which a real increase isn't
+    worth an inspection). A delta past the floor whose interval still
+    straddles zero is a "lead": shown, pushed quietly, but no alert. The
+    effective threshold ("threshold_c") is therefore the larger of the floor
+    and what this install's own scatter requires, so a noisy install must
+    show more before the watch alarms and a quiet one less — the fixed
+    2.5 °C tripwire sat near one sigma on a real install and fired on
+    scatter.
     """
     usable = [fit for fit in fits if fit["rise_ref_c"] is not None]
     if anchor_ts is not None:
@@ -702,10 +708,14 @@ def detect_drift(fits: list[dict], anchor_ts: float | None = None) -> dict | Non
     delta_se = math.sqrt(recent_se**2 + baseline_se**2)
     t_mult = _T95.get(len(recent) + len(baseline) - 2, 2.0)
     ci_lo, ci_hi = delta - t_mult * delta_se, delta + t_mult * delta_se
+    confident = ci_lo > 0.0
+    threshold = max(DRIFT_WARN_C, t_mult * delta_se)
+    drifting = confident and delta >= DRIFT_WARN_C
     cross_current = sum(1 for fit in comparable if abs(fit["current_a"] - typical_a) > band)
     return {
-        "drifting": delta >= DRIFT_WARN_C,
-        "confident": ci_lo > 0.0,
+        "drifting": drifting,
+        "lead": delta >= DRIFT_WARN_C and not drifting,
+        "confident": confident,
         "recent_rise_c": round(recent_med, 2),
         "baseline_rise_c": round(baseline_med, 2),
         "delta_c": round(delta, 2),
@@ -718,7 +728,8 @@ def detect_drift(fits: list[dict], anchor_ts: float | None = None) -> dict | Non
         "off_current_n": len(usable) - len(comparable),
         "cross_current_n": cross_current,
         "anchor_ts": anchor_ts,
-        "threshold_c": DRIFT_WARN_C,
+        "threshold_c": round(threshold, 2),
+        "floor_c": DRIFT_WARN_C,
     }
 
 

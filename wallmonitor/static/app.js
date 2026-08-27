@@ -1085,7 +1085,14 @@ async function viewLive(root) {
     // same current means added resistance somewhere in the current path.
     const drift = data.drift;
     let driftLine = null;
-    if (drift && drift.drifting) {
+    if (drift && drift.lead) {
+      driftLine = el("div", { class: "note" },
+        chipFor("warning", "heat rise: lead"),
+        ` Recent sessions average +${fmtNum(drift.recent_rise_c, 1)} °C at ${fmtNum(model.ref_current_a, 0)} A vs a ` +
+        `+${fmtNum(drift.baseline_rise_c, 1)} °C baseline (Δ ${fmtNum(drift.delta_c, 1)} °C) — past the ` +
+        `${fmtNum(drift.floor_c, 1)} °C floor but within this install's session-to-session scatter, which needs ` +
+        `Δ ≥ ${fmtNum(drift.threshold_c, 1)} °C to confirm. Not an alert; worth a look at the handle and pins.`);
+    } else if (drift && drift.drifting) {
       driftLine = el("div", { class: "note" },
         chipFor("serious", "heat rise increasing"),
         ` Recent sessions average +${fmtNum(drift.recent_rise_c, 1)} °C at ${fmtNum(model.ref_current_a, 0)} A vs a ` +
@@ -1097,7 +1104,7 @@ async function viewLive(root) {
     const modelNote = `Model: τ ≈ ${fmtNum(model.tau_min, 1)} min, +${fmtNum(model.rise_ref_c, 0)} °C at ${fmtNum(model.ref_current_a, 0)} A — ` +
       (model.fitted ? `fitted from ${model.tau_fits} recorded session ramp${model.tau_fits === 1 ? "" : "s"}.`
                 : "defaults from the verified alert-40 event; refits automatically as sessions accumulate.") +
-      (drift && !drift.drifting ? ` Heat rise stable across the last ${drift.recent_n + drift.baseline_n} fitted sessions` +
+      (drift && !drift.drifting && !drift.lead ? ` Heat rise stable across the last ${drift.recent_n + drift.baseline_n} fitted sessions` +
         `${drift.off_current_n ? ` (${drift.off_current_n} off-current session${drift.off_current_n === 1 ? "" : "s"} excluded)` : ""}.` : "");
     thermalCard.append(el("div", { class: "chart-card" },
       el("div", { class: "chart-title" }, "Thermal derate forecast", chip ? " " : null, chip),
@@ -1709,17 +1716,25 @@ async function viewAlerts(root, rangeKey = "7d") {
       // fits is a lead, not a conviction, and the note must show which.
       const [ciLo, ciHi] = drift.delta_ci95_c || [null, null];
       const sureness = ciLo == null ? "" :
-        ` · 95% CI ${fmtNum(ciLo, 1)}..${fmtNum(ciHi, 1)} °C from n=${drift.baseline_n}+${drift.recent_n}` +
-        (drift.confident ? "" : " — not yet statistically confirmed; more sessions will tighten this");
+        ` · 95% CI ${fmtNum(ciLo, 1)}..${fmtNum(ciHi, 1)} °C from n=${drift.baseline_n}+${drift.recent_n}`;
       const pooled = drift.cross_current_n
         ? ` (${drift.cross_current_n} ambient-bracketed fit${drift.cross_current_n > 1 ? "s" : ""} pooled from other charge currents)`
         : "";
+      // The alert threshold is the larger of the materiality floor and
+      // what this install's own scatter needs to clear zero — so the same
+      // delta is an alert on a quiet install and a lead on a noisy one.
+      const thresholdNote = `alert threshold Δ ≥ ${fmtNum(drift.threshold_c, 1)} °C` +
+        (drift.threshold_c > drift.floor_c + 0.05
+          ? ` (the ${fmtNum(drift.floor_c, 1)} °C floor, raised to what this install's scatter needs to confirm)`
+          : ` (the ${fmtNum(drift.floor_c, 1)} °C floor)`);
+      const summary = `recent median +${fmtNum(drift.recent_rise_c, 1)} °C vs baseline +${fmtNum(drift.baseline_rise_c, 1)} °C`;
       rise.card.append(el("div", { class: "note" },
         (drift.drifting
-          ? `Recent median +${fmtNum(drift.recent_rise_c, 1)} °C vs baseline +${fmtNum(drift.baseline_rise_c, 1)} °C ` +
-            `(Δ ${fmtNum(drift.delta_c, 1)} °C ≥ ${fmtNum(drift.threshold_c, 1)} °C threshold) — a monitor alert is active`
-          : `Stable: recent median +${fmtNum(drift.recent_rise_c, 1)} °C vs baseline +${fmtNum(drift.baseline_rise_c, 1)} °C ` +
-            `(alert threshold Δ ≥ ${fmtNum(drift.threshold_c, 1)} °C)`) + sureness + pooled + "."));
+          ? `Confirmed: ${summary} (Δ ${fmtNum(drift.delta_c, 1)} °C; ${thresholdNote}) — a monitor alert is active`
+          : drift.lead
+            ? `Lead: ${summary} (Δ ${fmtNum(drift.delta_c, 1)} °C, past the floor but not yet confirmed; ${thresholdNote}) — ` +
+              "no alert; more sessions will settle it"
+            : `Stable: ${summary} (${thresholdNote})`) + sureness + pooled + "."));
     }
     // Ambient bracketing: fits that read ambient at both ends of the load
     // window are de-trended for weather that moved during the charge — the

@@ -125,6 +125,7 @@ class Poller:
         # Thermal params for the in-poller derate forecast: fitted lazily,
         # refreshed whenever a session closes (the only time fits change).
         self._params: thermal.ThermalParams | None = None
+        self._drift_lead_active = False  # latch: push a lead once per episode, not per session
         self._next_forecast_ts = 0.0
         self._derate_active = False
         self._alert_labels: dict | None = None
@@ -514,35 +515,50 @@ class Poller:
             # No verdict — the comparable history got too thin (sessions aged
             # out of the lookback, or off-current sessions were set aside). An
             # active alert can no longer be justified either, so let it clear.
+            self._drift_lead_active = False
             cleared = await asyncio.to_thread(self.db.clear_alert, ts, thermal.DRIFT_ALERT, "monitor")
             if cleared:
                 await self._event(ts, "thermal_drift_cleared", {"reason": "insufficient_history"})
             return
+        ci_lo, ci_hi = drift["delta_ci95_c"]
+        body = (
+            f"Recent sessions run +{drift['recent_rise_c']:.1f} °C vs a +{drift['baseline_rise_c']:.1f} °C "
+            f"baseline at the same current (Δ {drift['delta_c']:.1f} °C, 95% CI {ci_lo:.1f}..{ci_hi:.1f}, "
+            f"n={drift['baseline_n']}+{drift['recent_n']}"
+        )
         if drift["drifting"]:
+            # Confirmed: the interval clears zero and the delta is material.
+            self._drift_lead_active = False
             _, newly = await asyncio.to_thread(self.db.raise_alert, ts, thermal.DRIFT_ALERT, "monitor")
             if newly:
                 await self._event(ts, "thermal_drift", drift)
-                ci_lo, ci_hi = drift["delta_ci95_c"]
-                sureness = (
-                    "statistically confirmed"
-                    if drift["confident"]
-                    else f"not yet confirmed at n={drift['baseline_n']}+{drift['recent_n']} — treat as a lead"
-                )
-                # Same alert and event either way; only the phone's interrupt
-                # level follows the statistics. A lead is a dashboard note,
-                # not a buzz — see the false-positive rate in detect_drift.
                 await self._notify(
-                    "thermal_drift" if drift["confident"] else "thermal_drift_lead",
+                    "thermal_drift",
                     "Heat rise climbing vs baseline",
-                    f"Recent sessions run +{drift['recent_rise_c']:.1f} °C vs a +{drift['baseline_rise_c']:.1f} °C "
-                    f"baseline at the same current (Δ {drift['delta_c']:.1f} °C, 95% CI {ci_lo:.1f}..{ci_hi:.1f}, "
-                    f"{sureness}) — inspect the handle and charge-port pins, and have the terminal torque checked.",
+                    body + ", statistically confirmed) — inspect the handle and charge-port pins, "
+                    "and have the terminal torque checked.",
+                    drift,
+                )
+            return
+        # Not confirmed: whatever alert was latched can no longer be justified.
+        cleared = await asyncio.to_thread(self.db.clear_alert, ts, thermal.DRIFT_ALERT, "monitor")
+        if cleared:
+            await self._event(ts, "thermal_drift_cleared", drift)
+        if drift["lead"]:
+            # Past the floor but inside this install's own scatter: a lead
+            # for the dashboard and a quiet push, once per episode — no alert.
+            if not self._drift_lead_active:
+                self._drift_lead_active = True
+                await self._event(ts, "thermal_drift_lead", drift)
+                await self._notify(
+                    "thermal_drift_lead",
+                    "Heat rise may be climbing — a lead, not yet confirmed",
+                    body + f"; needs Δ ≥ {drift['threshold_c']:.1f} °C at this install's scatter to confirm) "
+                    "— worth a look at the handle and pins next time you're there; more sessions will settle it.",
                     drift,
                 )
         else:
-            cleared = await asyncio.to_thread(self.db.clear_alert, ts, thermal.DRIFT_ALERT, "monitor")
-            if cleared:
-                await self._event(ts, "thermal_drift_cleared", drift)
+            self._drift_lead_active = False
 
     async def _check_derate_forecast(self, ts: float, raw: dict) -> None:
         """While charging: warn while the user can still act — a capped

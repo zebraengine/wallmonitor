@@ -115,6 +115,22 @@ means added resistance — a loose lug, a degrading contact — so when recent
 segments' fitted rise climbs past the baseline, the poller raises a monitor
 alert and the Alerts page charts the fitted-rise trend.
 
+### What counts as drift
+
+The alert needs two things at once: the recent-vs-baseline delta must be
+**material** (≥ 2.5 °C — a confirmed 0.3 °C increase is real but not worth
+an inspection) and **confirmed** — its 95% confidence interval, built from
+this install's own session-to-session scatter, must clear zero. The
+effective alert threshold is therefore the larger of the floor and what the
+scatter demands, and the dashboard shows which one is binding. A noisy
+install (variable ambient, a sensor in a draughty spot) must show more
+before the watch alarms; a quiet one, less. A fixed 2.5 °C tripwire sat
+near one sigma on a real install and fired on scatter alone.
+
+A delta past the floor whose interval still straddles zero is a **lead**:
+shown on the dashboard, pushed once at default priority, no alert row. More
+sessions either confirm it or dissolve it.
+
 ### What it compares
 
 - **Only sessions near the install's recent operating current.** Cap the
