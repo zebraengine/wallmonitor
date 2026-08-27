@@ -987,9 +987,31 @@ async def test_thermal_drift_wide_scatter_is_not_confident(db):
     for i, rise in enumerate([30.0, 36.0, 31.0, 35.8, 36.2, 42.0, 36.6]):
         _seed_thermal_session(db, now - (7 - i) * 7200, ambient_c=25.0, rise_ref_c=rise)
     drift = thermal.detect_drift(thermal.fit_sessions(db, now))
-    assert drift is not None and drift["drifting"] is True
-    assert drift["confident"] is False
+    assert drift is not None and drift["confident"] is False
     assert drift["delta_ci95_c"][0] < 0
+    # Past the floor, inside the scatter: a lead, not an alert — and the
+    # effective threshold says how much this install needs to confirm.
+    assert drift["drifting"] is False and drift["lead"] is True
+    assert drift["threshold_c"] > drift["floor_c"] and drift["delta_c"] < drift["threshold_c"]
+
+
+def test_thermal_drift_threshold_follows_install_scatter():
+    # Same delta, two installs: the quiet one's interval clears zero and
+    # it alarms; the noisy one's doesn't and it gets a lead. The threshold
+    # is the larger of the materiality floor and what the scatter needs.
+    def fits(rises):
+        return [{"start_ts": 1000.0 * i, "rise_ref_c": r, "current_a": 48.5, "ambient_drift_c": None}
+                for i, r in enumerate(rises)]
+    quiet = thermal.detect_drift(fits([36.0, 36.2, 35.9, 36.1, 36.0, 35.8, 39.0, 39.2, 38.9]))
+    noisy = thermal.detect_drift(fits([33.0, 39.0, 34.0, 38.0, 35.0, 37.0, 39.0, 39.2, 38.9]))
+    assert abs(quiet["delta_c"] - 3.0) < 0.2 and abs(noisy["delta_c"] - 3.0) < 0.6
+    assert quiet["drifting"] is True and quiet["lead"] is False
+    assert abs(quiet["threshold_c"] - thermal.DRIFT_WARN_C) < 0.01  # the floor binds
+    assert noisy["drifting"] is False and noisy["lead"] is True
+    assert noisy["threshold_c"] > thermal.DRIFT_WARN_C  # the scatter binds
+    # A confirmed but immaterial increase is not drift either.
+    tiny = thermal.detect_drift(fits([36.0, 36.1, 35.9, 36.0, 36.1, 35.9, 36.8, 36.9, 36.7]))
+    assert tiny["confident"] is True and tiny["drifting"] is False and tiny["lead"] is False
 
 
 async def test_thermal_drift_pools_bracketed_cross_current_fits(db):
@@ -1079,7 +1101,8 @@ async def _drift_notification(db, rises):
 
         poller._notify = capture
         await poller.recheck_thermal_drift(now)
-    assert any(a["alert"] == thermal.DRIFT_ALERT for a in db.active_alerts())
+        # A second recheck with nothing new must not push again.
+        await poller.recheck_thermal_drift(now + 1)
     assert len(sent) == 1
     return sent[0]
 
@@ -1088,20 +1111,25 @@ async def test_thermal_drift_confirmed_notifies_high_priority(db):
     # Tight baseline, tight recent, big step: the interval clears zero, and
     # that is the verdict worth interrupting a phone for.
     kind, body, detail = await _drift_notification(db, [36.0, 36.5, 35.8, 36.2, 42.0, 41.5, 42.3])
-    assert detail["confident"] is True and kind == "thermal_drift"
+    assert detail["drifting"] is True and kind == "thermal_drift"
     assert "statistically confirmed" in body
     assert Poller.NTFY_PRIORITY[kind] == "high"
+    assert any(a["alert"] == thermal.DRIFT_ALERT for a in db.active_alerts())
 
 
 async def test_thermal_drift_lead_notifies_default_priority(db):
-    # Scattered baseline, modest step past the tripwire: drifting, but the
-    # interval straddles zero. Same alert and event, but with ~3.4 C
-    # session-to-session scatter the 2.5 C tripwire sits near one sigma, so
-    # an unconfirmed verdict is a lead for the dashboard, not a buzz.
+    # Scattered baseline, modest step past the floor: the interval straddles
+    # zero. With ~3.4 C session-to-session scatter the 2.5 C floor sits near
+    # one sigma, so this is a lead for the dashboard and a quiet push that
+    # says what it would take to confirm — not an alert.
     kind, body, detail = await _drift_notification(db, [31.0, 38.0, 33.0, 38.0, 32.0, 37.0, 39.5, 38.0, 39.0])
-    assert detail["drifting"] is True and detail["confident"] is False
-    assert kind == "thermal_drift_lead" and "treat as a lead" in body
+    assert detail["lead"] is True and detail["drifting"] is False
+    assert kind == "thermal_drift_lead" and "to confirm" in body
     assert Poller.NTFY_PRIORITY[kind] == "default"
+    # A lead is not an alert: no banner, no alert row — an event only.
+    assert not any(a["alert"] == thermal.DRIFT_ALERT for a in db.active_alerts())
+    kinds = [e["kind"] for e in db.events_range(time.time() - 60, time.time() + 60)]
+    assert "thermal_drift_lead" in kinds and "thermal_drift" not in kinds
 
 
 async def test_baseline_anchor_reevaluates_drift_alert(db):
