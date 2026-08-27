@@ -634,6 +634,21 @@ async def test_thermal_fit_slow_tau_install_still_fits(db):
         assert fit["rise_ref_c"] is not None and abs(fit["rise_ref_c"] - rise) < 3.0
 
 
+def test_thermal_params_report_prior_deviation():
+    # Unfitted: nothing to compare. Fitted near the defaults: reported but
+    # not notable. Fitted far off (a fast-tau, low-rise install): notable,
+    # with the sign the UI needs to warn that short charges won't fit.
+    assert thermal.ThermalParams().prior_deviation() is None
+    near = thermal.ThermalParams(tau_min=12.5, rise_ref_c=34.0, tau_fits=3, rise_fits=3)
+    dev = near.prior_deviation()
+    assert dev["notable"] is False and abs(dev["tau_frac"]) < 0.1
+    far = thermal.ThermalParams(tau_min=6.0, rise_ref_c=20.0, tau_fits=3, rise_fits=3)
+    dev = far.prior_deviation()
+    assert dev["notable"] is True and dev["tau_frac"] < -0.3 and dev["rise_frac"] < -0.3
+    assert dev["default_tau_min"] == thermal.DEFAULT_TAU_MIN
+    assert far.as_dict()["prior_deviation"] == dev
+
+
 async def test_thermal_fit_covers_late_charging_segments(db):
     # A session shaped like real overnight use: a plug-in burst too short to
     # fit, hours of connected idle, then distinct charging segments (vehicle

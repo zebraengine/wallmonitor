@@ -153,6 +153,32 @@ class ThermalParams:
     def fitted(self) -> bool:
         return self.tau_fits > 0 and self.rise_fits > 0
 
+    # How far a fitted value may sit from the default before the dashboard
+    # says the priors were a poor fit for this install. A heuristic, not a
+    # statistic: 30% is roughly where the default-driven forecast's plateau
+    # error exceeds the fit's own noise and early-session predictions were
+    # materially off.
+    PRIOR_DEVIATION_FRAC = 0.30
+
+    def prior_deviation(self) -> dict | None:
+        """How this install's fitted tau and rise compare to the defaults
+        that governed the forecast before its first fit landed — None until
+        fitted. The frontend renders it as an honesty note: the priors are
+        from one verified install, and a user whose charger differs should
+        know that early forecasts were rough and (for a fast tau) that short
+        charges no longer teach the model."""
+        if not self.fitted:
+            return None
+        tau_frac = self.tau_min / DEFAULT_TAU_MIN - 1.0
+        rise_frac = self.rise_ref_c / DEFAULT_RISE_REF_C - 1.0
+        return {
+            "default_tau_min": DEFAULT_TAU_MIN,
+            "default_rise_ref_c": DEFAULT_RISE_REF_C,
+            "tau_frac": round(tau_frac, 3),
+            "rise_frac": round(rise_frac, 3),
+            "notable": max(abs(tau_frac), abs(rise_frac)) > self.PRIOR_DEVIATION_FRAC,
+        }
+
     def as_dict(self) -> dict:
         """The `model` object served by /api/thermal and the SSE thermal
         frame — fitted values plus the fixed thresholds."""
@@ -168,6 +194,7 @@ class ThermalParams:
             "rise_fits": self.rise_fits,
             "fit_rmse_c": round(self.fit_rmse_c, 3) if self.fit_rmse_c is not None else None,
             "fitted": self.fitted,
+            "prior_deviation": self.prior_deviation(),
         }
 
 
