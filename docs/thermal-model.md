@@ -36,6 +36,16 @@ So the fitter works per **charging segment**: it finds each segment's opening
 ramp wherever it occurs in the session and lets the quality gates decide
 what teaches the model. No configuration or "monitoring mode" is needed.
 
+One gate deserves spelling out: the steady-current window must span at
+least 1.8× the install's median τ (≈ 20 min at a typical 11 min τ). Shorter
+than that the plateau is never observed, and the exponential can explain
+the same samples with a lower rise and a faster τ — passing every other
+gate with a fine RMSE while under-reading the rise by several degrees. Such
+fits are not "noisy"; they are biased low, and a few of them in a drift
+baseline manufacture a degradation verdict. The span is judged against the
+install's τ, not the fit's own, so a truncated segment cannot vouch for
+itself.
+
 The unit of thermal analysis is the **load window** — the stretch where
 current actually flows.
 

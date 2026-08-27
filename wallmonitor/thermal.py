@@ -105,6 +105,15 @@ MIN_RISE_SEEN_C = 4.0
 MAX_FIT_RMSE_C = 0.6
 TAU_RANGE_MIN = (3.0, 40.0)
 RISE_RANGE_C = (10.0, 80.0)
+# The steady-current window must be long against the install's time
+# constant, or rise and tau are not separately identifiable: a window that
+# ends before the plateau shows lets the fitter trade a lower rise for a
+# faster tau and pass every other gate with a fine RMSE. Judged against the
+# install's median tau (not this fit's own, which is exactly the biased
+# quantity), so a truncated segment can't vouch for itself. At 1.8 tau the
+# handle has covered ~83% of its rise; the 30 min steady-prefix cap keeps
+# a stricter multiple out of reach at typical tau.
+MIN_SPAN_TAU = 1.8
 
 # Live-forecast gate: a steady-current window must hold this many samples
 # over this much time before its trajectory is projected.
@@ -474,6 +483,8 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
                 continue
             i_med = median(sample["vehicle_current_a"] for sample in prefix)
             tau_est = median([tau_s / 60.0] + [fit["tau_min"] for fit in fits])
+            if seg[-1][0] - seg[0][0] < MIN_SPAN_TAU * tau_est * 60.0:
+                continue  # plateau never observed: rise/tau not identifiable
             measured = _measured_ambient(db, seg_start - MEASURED_AMBIENT_WINDOW_S, seg_start + 60)
             ambient, ambient_source = measured if measured is not None else (None, None)
             if ambient is None:

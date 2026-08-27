@@ -528,8 +528,11 @@ class Poller:
                     if drift["confident"]
                     else f"not yet confirmed at n={drift['baseline_n']}+{drift['recent_n']} — treat as a lead"
                 )
+                # Same alert and event either way; only the phone's interrupt
+                # level follows the statistics. A lead is a dashboard note,
+                # not a buzz — see the false-positive rate in detect_drift.
                 await self._notify(
-                    "thermal_drift",
+                    "thermal_drift" if drift["confident"] else "thermal_drift_lead",
                     "Heat rise climbing vs baseline",
                     f"Recent sessions run +{drift['recent_rise_c']:.1f} °C vs a +{drift['baseline_rise_c']:.1f} °C "
                     f"baseline at the same current (Δ {drift['delta_c']:.1f} °C, 95% CI {ci_lo:.1f}..{ci_hi:.1f}, "
@@ -627,13 +630,15 @@ class Poller:
     NTFY_PRIORITY = {
         "derate_warning": "urgent",  # actionable *now* — lower the amps
         "alert_raised": "high",
-        "thermal_drift": "high",
+        "thermal_drift": "high",  # confidence interval clears zero
+        "thermal_drift_lead": "default",  # tripwire only — a lead, not a conviction
         "poll_error": "default",
     }
     NTFY_TAGS = {
         "derate_warning": "zap,warning",
         "alert_raised": "rotating_light",
         "thermal_drift": "wrench",
+        "thermal_drift_lead": "wrench,mag",
         "poll_error": "electric_plug,x",
     }
 
