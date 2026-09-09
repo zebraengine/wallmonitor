@@ -3,6 +3,7 @@
 import asyncio
 import math
 import time
+from statistics import median
 
 import aiohttp
 import pytest
@@ -334,7 +335,7 @@ def _seed_idle(db, t_from, t_to, ambient_c, dt=10.0):
 
 def _seed_thermal_session(db, start_ts, ambient_c, tau_s=720.0, rise_ref_c=36.0,
                           amps=48.6, charge_s=1500.0, dt=10.0,
-                          ambient_end_c=None, cooldown_s=0.0):
+                          ambient_end_c=None, cooldown_s=0.0, sag_to_a=None):
     """Idle lead-in plus a charging ramp that follows the first-order model.
 
     With ambient_end_c set, ambient drifts linearly across the charge (the
@@ -342,24 +343,35 @@ def _seed_thermal_session(db, start_ts, ambient_c, tau_s=720.0, rise_ref_c=36.0,
     integrating the lag ODE against the moving ambient. cooldown_s appends
     post-session idle decay samples — the tail the fitter reads the load
     window's end ambient from.
+
+    With sag_to_a set, the charge current falls linearly to that value
+    across the window — the charger's own thermal regulation, which flattens
+    the ramp for a reason that has nothing to do with the connector. Kept
+    inside the steady-prefix band on purpose: that is what makes it
+    dangerous, and what the free-plateau gate exists to catch.
     """
     _seed_idle(db, start_ts - 1800, start_ts, ambient_c, dt)
     sid = db.start_session(start_ts)
     t0_temp = thermal.idle_handle_c(ambient_c)
     rise_at = rise_ref_c * (amps / thermal.REF_CURRENT_A) ** 2
+    integrate = ambient_end_c is not None or sag_to_a is not None
     temp = t0_temp
     ts = start_ts
     while ts <= start_ts + charge_s:
-        if ambient_end_c is None:
+        elapsed = (ts - start_ts) / charge_s
+        amps_now = amps if sag_to_a is None else amps + (sag_to_a - amps) * elapsed
+        if not integrate:
             t_inf = ambient_c + rise_at
             temp = t_inf - (t_inf - t0_temp) * math.exp(-(ts - start_ts) / tau_s)
         db.insert_vitals(ts, {
-            "vehicle_connected": 1, "contactor_closed": 1, "vehicle_current_a": amps,
+            "vehicle_connected": 1, "contactor_closed": 1, "vehicle_current_a": round(amps_now, 1),
             "handle_temp_c": round(temp, 3), "pcba_temp_c": 55.0, "mcu_temp_c": 50.0,
-        }, sid, amps * 233.0)
-        if ambient_end_c is not None:
-            ambient_now = ambient_c + (ambient_end_c - ambient_c) * (ts - start_ts) / charge_s
-            temp += dt * ((ambient_now + rise_at - temp) / tau_s)
+        }, sid, amps_now * 233.0)
+        if integrate:
+            ambient_now = ambient_c if ambient_end_c is None else \
+                ambient_c + (ambient_end_c - ambient_c) * elapsed
+            rise_now = rise_ref_c * (amps_now / thermal.REF_CURRENT_A) ** 2
+            temp += dt * ((ambient_now + rise_now - temp) / tau_s)
         ts += dt
     db.close_session(sid, start_ts + charge_s, "vehicle_disconnected")
     ambient_final = ambient_end_c if ambient_end_c is not None else ambient_c
@@ -991,7 +1003,11 @@ async def test_thermal_drift_confidence_interval(db):
     assert drift["drifting"] is True and drift["confident"] is True
     ci_lo, ci_hi = drift["delta_ci95_c"]
     assert ci_lo < drift["delta_c"] < ci_hi and ci_lo > 0
-    assert drift["baseline_mad_c"] < 1.0 and drift["recent_mad_c"] < 1.0
+    # One regression, so one scatter: how far the fits sit from the modelled
+    # trend, which is what the interval above is actually built from. A step
+    # change fitted by a straight line leaves residual by construction — the
+    # scatter here is mostly that, not measurement noise.
+    assert drift["resid_sd_c"] < 2.0 and drift["n"] == 7
 
 
 async def test_thermal_drift_wide_scatter_is_not_confident(db):
@@ -1019,7 +1035,12 @@ def test_thermal_drift_threshold_follows_install_scatter():
                 for i, r in enumerate(rises)]
     quiet = thermal.detect_drift(fits([36.0, 36.2, 35.9, 36.1, 36.0, 35.8, 39.0, 39.2, 38.9]))
     noisy = thermal.detect_drift(fits([33.0, 39.0, 34.0, 38.0, 35.0, 37.0, 39.0, 39.2, 38.9]))
-    assert abs(quiet["delta_c"] - 3.0) < 0.2 and abs(noisy["delta_c"] - 3.0) < 0.6
+    # delta_c is the modelled change across the observed span, not a step
+    # between two medians: a late 3 C jump fitted with a straight line reads
+    # a little larger than the step itself, and the same jump buried in
+    # scatter reads larger still. Both stay in the same neighbourhood — what
+    # separates them is the interval, below.
+    assert 3.0 < quiet["delta_c"] < 4.5 and 3.0 < noisy["delta_c"] < 5.5
     assert quiet["drifting"] is True and quiet["lead"] is False
     assert abs(quiet["threshold_c"] - thermal.DRIFT_WARN_C) < 0.01  # the floor binds
     assert noisy["drifting"] is False and noisy["lead"] is True
@@ -1054,6 +1075,129 @@ async def test_thermal_drift_pools_bracketed_cross_current_fits(db):
     _seed_thermal_session(db, now - 1800, ambient_c=25.0, rise_ref_c=42.5, amps=32.0)
     drift = thermal.detect_drift(thermal.fit_sessions(db, now))
     assert drift is not None and drift["off_current_n"] >= 1
+
+
+async def test_thermal_fit_flags_regulated_windows(db):
+    # The Gen 3 defends its own thermal limit by trimming charge current as
+    # the handle warms, and it can trim ~10% without ever leaving the
+    # steady-prefix band. The ramp then flattens because the current fell,
+    # and the exponential reads that flattening as the plateau. Each fit has
+    # to say whether its window was left alone.
+    now = time.time()
+    steady = _seed_thermal_session(db, now - 4 * 7200, ambient_c=25.0)
+    folded = _seed_thermal_session(db, now - 2 * 7200, ambient_c=25.0, sag_to_a=43.5)
+    fits = {fit["session_id"]: fit for fit in thermal.fit_sessions(db, now)}
+    assert fits[steady]["free_plateau"] is True
+    assert abs(fits[steady]["current_sag_a"]) < 0.5
+    assert fits[folded]["free_plateau"] is False
+    assert fits[folded]["current_sag_a"] > 1.0
+    # And the regulated window really is biased low, which is why it cannot
+    # be allowed near a baseline: same seeded connector, smaller answer.
+    assert fits[folded]["rise_ref_c"] < fits[steady]["rise_ref_c"] - 1.0
+
+
+async def test_thermal_drift_excludes_regulated_windows(db):
+    # Regulated windows are biased low, so a history that starts regulated
+    # and ends free-running manufactures a rise out of nothing. (On a real
+    # install this is seasonal: foldback starts sooner in a hot garage, so
+    # the bias arrives and leaves with the weather.) Excluding them is what
+    # makes the remaining fits comparable to each other at all.
+    now = time.time()
+    for i in range(4):
+        _seed_thermal_session(db, now - (10 - i) * 7200, ambient_c=25.0, sag_to_a=43.5)
+    for i in range(6):
+        _seed_thermal_session(db, now - (6 - i) * 7200, ambient_c=25.0)
+    fits = thermal.fit_sessions(db, now)
+    assert sum(1 for fit in fits if not fit["free_plateau"]) == 4
+    drift = thermal.detect_drift(fits)
+    assert drift is not None
+    assert drift["regulated_n"] == 4 and drift["n"] == 6
+    assert drift["drifting"] is False and drift["lead"] is False
+    assert abs(drift["delta_c"]) < thermal.DRIFT_WARN_C
+
+
+async def test_thermal_drift_holds_charge_current(db):
+    # The install's connector is unchanged; the vehicle simply starts asking
+    # for 39.6 A instead of 48.6. The (48/I)^2 normalization does not
+    # describe any real install exactly, so every reduced-current fit
+    # normalizes ~7 C high — and a recent-vs-baseline median split reports
+    # that as a confirmed degradation. Holding current in the regression
+    # reads it as what it is: a level shift with current, not a trend.
+    now = time.time()
+    for i, rise in enumerate([36.0, 36.5, 35.8, 36.2, 36.1, 36.4]):
+        _seed_thermal_session(db, now - (10 - i) * 7200, ambient_c=25.0, rise_ref_c=rise,
+                              cooldown_s=900.0, ambient_end_c=25.0)
+    for i, rise in enumerate([43.4, 43.7, 43.5]):
+        _seed_thermal_session(db, now - (4 - i) * 7200, ambient_c=25.0, rise_ref_c=rise,
+                              amps=39.6, cooldown_s=900.0, ambient_end_c=25.0)
+    fits = thermal.fit_sessions(db, now)
+    drift = thermal.detect_drift(fits)
+    assert drift is not None and drift["n"] == 9
+    # The raw split the old watch used would have called this an alert.
+    naive = median(fit["rise_ref_c"] for fit in fits[-3:]) - median(fit["rise_ref_c"] for fit in fits[:-3])
+    assert naive > thermal.DRIFT_WARN_C
+    assert drift["drifting"] is False
+    assert "current" in drift["covariates"]
+    # A cap applied once and kept is nearly collinear with the calendar, so
+    # the slope cannot be pinned down — and the widened interval says so
+    # instead of the verdict quietly picking one explanation.
+    assert "current" in drift["collinear_with_time"]
+    assert drift["confident"] is False
+
+    # Vary the current instead of stepping it, and the confound separates:
+    # the same nine fits, interleaved, pin the slope near zero.
+    now2 = now + 400 * 86400
+    for i in range(9):
+        amps, rise = (39.6, 43.5) if i % 2 else (48.6, 36.2)
+        _seed_thermal_session(db, now2 - (10 - i) * 7200, ambient_c=25.0, rise_ref_c=rise,
+                              amps=amps, cooldown_s=900.0, ambient_end_c=25.0)
+    mixed = thermal.detect_drift([fit for fit in thermal.fit_sessions(db, now2 + 3600)
+                                  if fit["start_ts"] > now2 - 20 * 7200])
+    assert mixed is not None and mixed["drifting"] is False
+    assert not mixed["collinear_with_time"]
+    assert abs(mixed["delta_c"]) < thermal.DRIFT_WARN_C
+
+
+async def test_thermal_drift_reports_ambient_confound(db):
+    # The premise of rise_ref is that subtracting ambient leaves a number
+    # about the connector. On an install where it does not — the fits still
+    # slope against garage temperature — a cooling autumn walks the rise
+    # upward all by itself. The regression must attribute that to ambient
+    # rather than to time, and must say the measurement is compromised
+    # rather than presenting an adjusted number as clean.
+    now = time.time()
+    ambients = [34.0, 32.5, 31.0, 29.5, 28.0, 26.5, 25.0, 24.0]
+    for i, ambient in enumerate(ambients):
+        _seed_thermal_session(db, now - (12 - i) * 7200, ambient_c=ambient,
+                              rise_ref_c=36.0 + (29.0 - ambient) * 0.8,
+                              cooldown_s=900.0, ambient_end_c=ambient)
+    fits = thermal.fit_sessions(db, now)
+    drift = thermal.detect_drift(fits)
+    assert drift is not None
+    naive = median(fit["rise_ref_c"] for fit in fits[-3:]) - median(fit["rise_ref_c"] for fit in fits[:-3])
+    assert naive > thermal.DRIFT_WARN_C  # the median split would have alerted
+    assert "ambient" in drift["covariates"]
+    assert drift["ambient_coef_c_per_c"] < -0.5
+    assert "ambient" in drift["compromised_by"]
+    assert drift["drifting"] is False and abs(drift["delta_c"]) < thermal.DRIFT_WARN_C
+
+
+async def test_thermal_drift_ambient_confound_caps_verdict_at_lead(db):
+    # Same broken premise, but this time with a real trend on top of it. The
+    # delta is material and the interval clears zero, yet the number rests on
+    # fits that are measuring something other than connector resistance — so
+    # it is a lead to be explained, never an alert to act on.
+    now = time.time()
+    ambients = [34.0, 32.5, 31.0, 29.5, 28.0, 26.5, 25.0, 24.0]
+    for i, ambient in enumerate(ambients):
+        _seed_thermal_session(db, now - (12 - i) * 7200, ambient_c=ambient,
+                              rise_ref_c=36.0 + (29.0 - ambient) * 0.8 + i * 1.2,
+                              cooldown_s=900.0, ambient_end_c=ambient)
+    drift = thermal.detect_drift(thermal.fit_sessions(db, now))
+    assert drift is not None
+    assert drift["delta_c"] > thermal.DRIFT_WARN_C and drift["confident"] is True
+    assert drift["compromised_by"] == ["ambient"]
+    assert drift["drifting"] is False and drift["lead"] is True
 
 
 async def test_thermal_baseline_anchor(db):

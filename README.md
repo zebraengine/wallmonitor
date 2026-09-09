@@ -68,9 +68,11 @@ systemd service on an always-on box, see [Running wallmonitor](https://github.co
 - **Automatic derate prevention** — an optional daemon caps the vehicle's
   charge current through a least-privilege BLE pairing when the forecast
   firms up, and restores it once the risk clears
-- **Degradation watch** — ambient-corrected heat-rise trend with confidence
-  intervals and a verified-baseline anchor, so "getting worse" is a
-  statistical claim, not a vibe
+- **Degradation watch** — heat rise regressed on time while ambient and
+  charge current are held, over windows the charger was not regulating,
+  with confidence intervals and a verified-baseline anchor, so "getting
+  worse" is a statistical claim about the connector and not about the
+  weather
 - **Actionable notifications, local-only** — browser push and LAN
   webhook/self-hosted ntfy for phones, with a systemd + Docker deploy recipe
 - Resilience: seamless restarts, downtime recorded as explicit gap events,

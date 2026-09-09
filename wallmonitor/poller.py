@@ -527,9 +527,10 @@ class Poller:
             return
         ci_lo, ci_hi = drift["delta_ci95_c"]
         body = (
-            f"Recent sessions run +{drift['recent_rise_c']:.1f} °C vs a +{drift['baseline_rise_c']:.1f} °C "
-            f"baseline at the same current (Δ {drift['delta_c']:.1f} °C, 95% CI {ci_lo:.1f}..{ci_hi:.1f}, "
-            f"n={drift['baseline_n']}+{drift['recent_n']}"
+            f"Fitted rise is trending +{drift['slope_c_per_day'] * 30.0:.1f} °C/month with ambient and "
+            f"charge current held: +{drift['baseline_rise_c']:.1f} → +{drift['recent_rise_c']:.1f} °C across "
+            f"{drift['span_days']:.0f} days (Δ {drift['delta_c']:.1f} °C, 95% CI {ci_lo:.1f}..{ci_hi:.1f}, "
+            f"n={drift['n']} free-running fits"
         )
         if drift["drifting"]:
             # Confirmed: the interval clears zero and the delta is material.
@@ -550,16 +551,31 @@ class Poller:
         if cleared:
             await self._event(ts, "thermal_drift_cleared", drift)
         if drift["lead"]:
-            # Past the floor but inside this install's own scatter: a lead
-            # for the dashboard and a quiet push, once per episode — no alert.
+            # Past the floor but not confirmable: either inside this install's
+            # own scatter, or resting on a measurement the install itself
+            # undermines. A lead for the dashboard and a quiet push, once per
+            # episode — no alert. Say which of the two it is, because they
+            # call for different things: more sessions settle scatter, while a
+            # rise that still tracks garage temperature needs the confounder
+            # found before any number here means much.
+            if "ambient" in drift["compromised_by"]:
+                why = (
+                    f"; but this install's rise still moves {drift['ambient_coef_c_per_c']:+.2f} °C per °C of "
+                    "ambient after the subtraction, so the fits are carrying something other than connector "
+                    "resistance) — find that before reading the trend as hardware"
+                )
+            else:
+                why = (
+                    f"; needs Δ ≥ {drift['threshold_c']:.1f} °C at this install's scatter to confirm) "
+                    "— worth a look at the handle and pins next time you're there; more sessions will settle it"
+                )
             if not self._drift_lead_active:
                 self._drift_lead_active = True
                 await self._event(ts, "thermal_drift_lead", drift)
                 await self._notify(
                     "thermal_drift_lead",
                     "Heat rise may be climbing — a lead, not yet confirmed",
-                    body + f"; needs Δ ≥ {drift['threshold_c']:.1f} °C at this install's scatter to confirm) "
-                    "— worth a look at the handle and pins next time you're there; more sessions will settle it.",
+                    body + why + ".",
                     drift,
                 )
         else:

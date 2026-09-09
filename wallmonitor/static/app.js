@@ -1086,19 +1086,29 @@ async function viewLive(root) {
     // same current means added resistance somewhere in the current path.
     const drift = data.drift;
     let driftLine = null;
+    // The trend is a modelled slope with ambient and charge current held,
+    // not a difference of medians — so the number quoted is what the rise
+    // did over the window at fixed conditions, and the covariate that would
+    // otherwise have explained it is named when it is doing real work.
+    const ambientConfounded = drift && (drift.compromised_by || []).includes("ambient");
     if (drift && drift.lead) {
       driftLine = el("div", { class: "note" },
         chipFor("warning", "heat rise: lead"),
-        ` Recent sessions average +${fmtNum(drift.recent_rise_c, 1)} °C at ${fmtNum(model.ref_current_a, 0)} A vs a ` +
-        `+${fmtNum(drift.baseline_rise_c, 1)} °C baseline (Δ ${fmtNum(drift.delta_c, 1)} °C) — past the ` +
-        `${fmtNum(drift.floor_c, 1)} °C floor but within this install's session-to-session scatter, which needs ` +
-        `Δ ≥ ${fmtNum(drift.threshold_c, 1)} °C to confirm. Not an alert; worth a look at the handle and pins.`);
+        ` Fitted rise trends +${fmtNum(drift.slope_c_per_day * 30, 1)} °C/month at fixed ambient and current ` +
+        `(+${fmtNum(drift.baseline_rise_c, 1)} → +${fmtNum(drift.recent_rise_c, 1)} °C over ${fmtNum(drift.span_days, 0)} days, ` +
+        `Δ ${fmtNum(drift.delta_c, 1)} °C) — past the ${fmtNum(drift.floor_c, 1)} °C floor but ` +
+        (ambientConfounded
+          ? `this install's rise still moves ${fmtNum(drift.ambient_coef_c_per_c, 2)} °C per °C of ambient after the ` +
+            "subtraction, so the fits are measuring something besides connector resistance. Not an alert; find that first."
+          : `within this install's session-to-session scatter, which needs Δ ≥ ${fmtNum(drift.threshold_c, 1)} °C to ` +
+            "confirm. Not an alert; worth a look at the handle and pins."));
     } else if (drift && drift.drifting) {
       driftLine = el("div", { class: "note" },
         chipFor("serious", "heat rise increasing"),
-        ` Recent sessions average +${fmtNum(drift.recent_rise_c, 1)} °C at ${fmtNum(model.ref_current_a, 0)} A vs a ` +
-        `+${fmtNum(drift.baseline_rise_c, 1)} °C baseline (Δ ${fmtNum(drift.delta_c, 1)} °C). More heat at the same current ` +
-        `means added resistance — inspect the handle and charge-port pins, and have the terminal torque checked.` +
+        ` Fitted rise trends +${fmtNum(drift.slope_c_per_day * 30, 1)} °C/month at fixed ambient and current ` +
+        `(+${fmtNum(drift.baseline_rise_c, 1)} → +${fmtNum(drift.recent_rise_c, 1)} °C over ${fmtNum(drift.span_days, 0)} days, ` +
+        `Δ ${fmtNum(drift.delta_c, 1)} °C). More heat at the same current and ambient means added resistance — ` +
+        "inspect the handle and charge-port pins, and have the terminal torque checked." +
         (drift.off_current_n ? ` (${drift.off_current_n} session${drift.off_current_n === 1 ? "" : "s"} away from the usual ` +
         `~${fmtNum(drift.typical_current_a, 0)} A excluded from the comparison.)` : ""));
     }
@@ -1132,7 +1142,7 @@ async function viewLive(root) {
     const modelNote = `Model: τ ≈ ${fmtNum(model.tau_min, 1)} min, +${fmtNum(model.rise_ref_c, 0)} °C at ${fmtNum(model.ref_current_a, 0)} A — ` +
       (model.fitted ? `fitted from ${model.tau_fits} recorded session ramp${model.tau_fits === 1 ? "" : "s"}.` + priorNote
                 : "defaults from one verified install, used until this charger has fits of its own; refits automatically as sessions accumulate.") +
-      (drift && !drift.drifting && !drift.lead ? ` Heat rise stable across the last ${drift.recent_n + drift.baseline_n} fitted sessions` +
+      (drift && !drift.drifting && !drift.lead ? ` Heat rise stable across ${drift.n} free-running fitted sessions` +
         `${drift.off_current_n ? ` (${drift.off_current_n} off-current session${drift.off_current_n === 1 ? "" : "s"} excluded)` : ""}.` : "") +
       idleNote;
     thermalCard.append(el("div", { class: "chart-card" },
@@ -1746,11 +1756,11 @@ async function viewAlerts(root, rangeKey = "7d") {
       unit: "°C", digits: 1, height: 180, vlines: calMarks,
     });
     if (drift) {
-      // The verdict carries its own uncertainty — a delta from a handful of
+      // The verdict carries its own uncertainty — a slope from a handful of
       // fits is a lead, not a conviction, and the note must show which.
       const [ciLo, ciHi] = drift.delta_ci95_c || [null, null];
       const sureness = ciLo == null ? "" :
-        ` · 95% CI ${fmtNum(ciLo, 1)}..${fmtNum(ciHi, 1)} °C from n=${drift.baseline_n}+${drift.recent_n}`;
+        ` · 95% CI ${fmtNum(ciLo, 1)}..${fmtNum(ciHi, 1)} °C from n=${drift.n}`;
       const pooled = drift.cross_current_n
         ? ` (${drift.cross_current_n} ambient-bracketed fit${drift.cross_current_n > 1 ? "s" : ""} pooled from other charge currents)`
         : "";
@@ -1761,7 +1771,8 @@ async function viewAlerts(root, rangeKey = "7d") {
         (drift.threshold_c > drift.floor_c + 0.05
           ? ` (the ${fmtNum(drift.floor_c, 1)} °C floor, raised to what this install's scatter needs to confirm)`
           : ` (the ${fmtNum(drift.floor_c, 1)} °C floor)`);
-      const summary = `recent median +${fmtNum(drift.recent_rise_c, 1)} °C vs baseline +${fmtNum(drift.baseline_rise_c, 1)} °C`;
+      const summary = `+${fmtNum(drift.baseline_rise_c, 1)} → +${fmtNum(drift.recent_rise_c, 1)} °C over ` +
+        `${fmtNum(drift.span_days, 0)} days (${fmtNum(drift.slope_c_per_day * 30, 2)} °C/month)`;
       rise.card.append(el("div", { class: "note" },
         (drift.drifting
           ? `Confirmed: ${summary} (Δ ${fmtNum(drift.delta_c, 1)} °C; ${thresholdNote}) — a monitor alert is active`
@@ -1769,6 +1780,43 @@ async function viewAlerts(root, rangeKey = "7d") {
             ? `Lead: ${summary} (Δ ${fmtNum(drift.delta_c, 1)} °C, past the floor but not yet confirmed; ${thresholdNote}) — ` +
               "no alert; more sessions will settle it"
             : `Stable: ${summary} (${thresholdNote})`) + sureness + pooled + "."));
+      // What the trend was actually held against, and what it could not be
+      // held against. A slope is only as meaningful as its controls, so the
+      // covariates are named rather than left implicit — and an install
+      // whose rise still tracks ambient is told so plainly, because that is
+      // the finding, not a footnote to it.
+      const covs = drift.covariates || [];
+      rise.card.append(el("div", { class: "note" },
+        `Estimated by regressing fitted rise on time` +
+        (covs.length ? ` while holding ${covs.join(" and ")}` : ", with no covariate varying enough to hold") +
+        `; residual scatter ±${fmtNum(drift.resid_sd_c, 1)} °C on ${drift.dof} degrees of freedom` +
+        (drift.current_coef_c_per_a != null
+          ? `. Charge current carries ${fmtNum(drift.current_coef_c_per_a, 2)} °C per amp here — the residual ` +
+            "error in the I² normalization, absorbed rather than left to masquerade as a trend"
+          : "") + "."));
+      if (drift.ambient_coef_c_per_c != null) {
+        const confounded = (drift.compromised_by || []).includes("ambient");
+        rise.card.append(el("div", { class: "note" },
+          `Rise vs ambient: ${fmtNum(drift.ambient_coef_c_per_c, 2)} ± ${fmtNum(drift.ambient_coef_se, 2)} °C per °C. ` +
+          (confounded
+            ? "Subtracting ambient was supposed to leave a number that depends on the connector and not the weather; " +
+              "here it did not, so something the model does not carry — multi-day heat soak, a charger regulating to a " +
+              "fixed handle temperature, a badly sited sensor — is inside the measurement. The trend above is adjusted " +
+              "for it, but this install can raise a lead and never an alert until it is found."
+            : "Flat enough that the ambient subtraction is doing its job.")));
+      }
+      // Regulated windows are the fits the charger wrote itself: current
+      // trimmed back as the handle warmed, so the plateau is a setpoint and
+      // its "rise" tracks how close the handle got to the limit. Excluding
+      // them is what makes the rest comparable; saying how many were
+      // excluded is what keeps a thin verdict from looking well-fed.
+      if (drift.regulated_n) {
+        rise.card.append(el("div", { class: "note" },
+          `${drift.regulated_n} further fit${drift.regulated_n === 1 ? " was" : "s were"} excluded: the charger trimmed ` +
+          "charge current back inside the ramp window, so the plateau it reached was one the charger held, not the " +
+          "connector's own. A charge at a current low enough to run unregulated end to end is worth more to this watch " +
+          "than several at full rate."));
+      }
     }
     // Ambient bracketing: fits that read ambient at both ends of the load
     // window are de-trended for weather that moved during the charge — the
