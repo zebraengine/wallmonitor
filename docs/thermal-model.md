@@ -58,6 +58,31 @@ itself.
 The unit of thermal analysis is the **load window** — the stretch where
 current actually flows.
 
+## Free-running windows, and the ones the charger wrote
+
+The other way a plateau can be fictitious is that the charger chose it. A
+Gen 3 defends its own thermal limit long before alert 40: as the handle
+warms it trims charge current back, and it can trim ~10 % without ever
+leaving the fitter's steady-current band. The ramp then flattens *because
+the current fell*, and the exponential reads that flattening as the
+plateau — a lower rise paired with a faster τ, clearing every other gate
+with an excellent RMSE.
+
+That bias is not random. Foldback starts sooner in a hot garage, so the
+under-read arrives and leaves with the weather; and a session that runs at
+a low enough current never triggers it at all. Measured on one install:
+windows whose current sagged fitted a median +33.3 °C rise where the same
+charger's steady windows fitted +37.2 °C.
+
+So every fit records `current_sag_a` — how far current fell from the head
+of the window to its tail, compared by quarter-medians — and
+`free_plateau`, true when that sag stayed inside 1.5 % of the window's
+current. On the install above the two populations did not overlap: steady
+windows sagged ≤ 0.6 %, regulated ones ≥ 3.9 %.
+
+Regulated fits still describe what the handle actually did, so the
+forecast keeps them. The degradation watch cannot use them at all.
+
 ## Ambient is a bracket, not a point
 
 A single start-of-window ambient silently assumes the weather held still for
@@ -120,35 +145,77 @@ per-segment fit, and the drift verdict.
 ## Degradation watch
 
 The same per-segment fits feed a trend. Rising heat at unchanged current
-means added resistance — a loose lug, a degrading contact — so when recent
-segments' fitted rise climbs past the baseline, the poller raises a monitor
-alert and the Alerts page charts the fitted-rise trend.
+means added resistance — a loose lug, a degrading contact — so when the
+fitted rise climbs over time, the poller raises a monitor alert and the
+Alerts page charts the fitted-rise trend.
+
+### What it estimates, and why not a median split
+
+The watch **regresses fitted rise on time** across the whole comparable
+history, holding ambient and charge current, and reads the *time*
+coefficient. The reported Δ is that slope times the observed span.
+
+It did once compare a recent median against a baseline median, and that
+asks the wrong question. "Are the last few fits higher?" is answered for
+you by anything that moved with the calendar: a garage that cooled between
+the two halves, or a vehicle capped to a lower current whose (48/I)²
+normalization then lifts every recent fit at once. On one install the
+split reported **+7.2 °C with a 95 % CI of [5.4, 9.1]** — "statistically
+confirmed" — for a connector whose rise, regressed on time with ambient and
+current held, was moving +0.01 ± 0.04 °C/day. The confidence was real. It
+was confidence in the wrong estimand.
+
+Regression fixes three things at once:
+
+- **Confounders become covariates.** Ambient and charge current are
+  adjusted for instead of assumed away, and each one's coefficient is
+  reported so you can see what it was worth.
+- **Every fit counts.** The estimate uses the whole history rather than
+  three fits against a handful, which is where the precision comes from.
+- **Unseparable confounds declare themselves.** When a covariate cannot be
+  told apart from the calendar — a current cap applied once and kept is
+  nearly collinear with time — the collinearity inflates the slope's
+  standard error and the verdict declines to confirm. That is the honest
+  outcome, and it is reached automatically rather than by a rule someone
+  had to anticipate.
+
+A covariate earns a column only when the history actually moved in it
+(≥ 3 °C of ambient, ≥ 2 A of current); below that it buys nothing and
+spends a degree of freedom. `/api/thermal` reports which columns were used
+(`covariates`), each coefficient, the residual scatter, and any covariate
+that correlated with time past 0.8 (`collinear_with_time`).
 
 ### What counts as drift
 
-The alert needs two things at once: the recent-vs-baseline delta must be
-**material** (≥ 2.5 °C — a confirmed 0.3 °C increase is real but not worth
-an inspection) and **confirmed** — its 95% confidence interval, built from
-this install's own session-to-session scatter, must clear zero. The
-effective alert threshold is therefore the larger of the floor and what the
-scatter demands, and the dashboard shows which one is binding. A noisy
-install (variable ambient, a sensor in a draughty spot) must show more
-before the watch alarms; a quiet one, less. A fixed 2.5 °C tripwire sat
-near one sigma on a real install and fired on scatter alone.
+The alert needs the change to be **material** (≥ 2.5 °C — a confirmed
+0.3 °C increase is real but not worth an inspection), **confirmed** — the
+slope's 95 % confidence interval, at a small-sample Student-t multiplier,
+must clear zero — and **soundly measured** (see the ambient confound
+below). The effective threshold is the larger of the floor and what this
+install's own scatter demands, and the dashboard shows which one is
+binding. A noisy install must show more before the watch alarms; a quiet
+one, less.
 
-A delta past the floor whose interval still straddles zero is a **lead**:
-shown on the dashboard, pushed once at default priority, no alert row. More
-sessions either confirm it or dissolve it.
+A change past the floor that fails either of the other two tests is a
+**lead**: shown on the dashboard, pushed once at default priority, no alert
+row. More sessions either confirm it or dissolve it.
 
 ### What it compares
 
+- **Only free-running fits.** Windows the charger was regulating are
+  excluded outright — their plateau is a setpoint, not an equilibrium.
+  `regulated_n` says how many sat out, and the Alerts page says so too,
+  because a verdict resting on four fits should not look like one resting
+  on twelve.
 - **Only sessions near the install's recent operating current.** Cap the
   vehicle at a new amperage and the watch follows, rather than judging
   forever against a current the install no longer uses.
 - **Pooled across a wider current band when the fits are clean.**
-  Ambient-bracketed fits are clean enough under the I² normalization to pool
-  in, so a baseline recorded at 48 A keeps judging charges after a cap to
-  40 A instead of the verdict going dark.
+  Ambient-bracketed fits join from a wider band, and the regression's own
+  current term then *adjusts* them: residual error in the I² normalization
+  lands on that coefficient instead of masquerading as a trend. On the
+  install above that coefficient read −0.99 °C per amp, which is the whole
+  of the phantom +7.2 °C.
 
 ### How sure it is
 
@@ -168,11 +235,43 @@ healthy", not "vs the first charges the monitor happened to see".
 
 ### The confounder the fits can't remove
 
-A **rise-vs-ambient scatter** on the same page separates the one thing
-left. Ambient is subtracted per fit, so a healthy install shows a flat cloud
-regardless of garage temperature:
+The premise of `rise_ref` is that subtracting ambient leaves a number that
+depends on the connector and not on the weather. The watch checks that
+premise instead of assuming it: the regression's **ambient coefficient**
+is how much rise still moves per degree of garage air after the
+subtraction. A healthy install reads flat.
 
-- a cloud **still sloping upward with ambient** exposes an environment
-  effect the model doesn't carry — multi-day heat soak of cable and
-  structure in an uninsulated garage;
+An install reading materially non-zero (≥ 0.3 °C/°C, resolved well enough
+to be sure of the sign) has something in the measurement that the model
+does not carry, and the watch says so and **caps its verdict at a lead** —
+it can never raise an alert until the cause is found. Adjusting for a
+confounder is not the same as understanding it.
+
+The **rise-vs-ambient scatter** on the same page shows the shape:
+
+- a cloud **sloping upward with ambient** exposes an environment effect —
+  multi-day heat soak of cable and structure in an uninsulated garage;
+- a cloud **sloping downward** is the signature of a handle held at a
+  fixed temperature by something — most often charger regulation that the
+  free-plateau gate did not catch, since a hotter garage means the trim
+  starts sooner;
 - an **elevated-but-flat** cloud is the genuine added-resistance signature.
+
+### What the watch cannot do, and what to charge to fix it
+
+Everything above measures a plateau the charger allowed. On an install
+where full-rate charging always ends in foldback, the only free-running
+windows are the low-current ones, and the watch is judging a handful of
+fits at a current the install rarely uses.
+
+The cheapest fix is a **fixed-condition probe**: once a month, charge at a
+current low enough to run unregulated end to end (well under whatever
+first triggers foldback), for at least 3 τ. That yields a plateau nobody
+imposed, at a repeatable operating point, and comparing those month over
+month is a degradation test with no extrapolation in it at all. A single
+such charge is worth more to this watch than several at full rate.
+
+Deliberately varying the current — 32 / 40 / 48 A inside one week, at
+similar ambient — is worth doing once for a different reason: it breaks the
+collinearity between current and the calendar, which is the one thing that
+stops the regression from separating a cap from a trend.

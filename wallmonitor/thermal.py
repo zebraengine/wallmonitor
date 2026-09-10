@@ -208,6 +208,31 @@ MIN_SPAN_TAU = 1.8
 PREFIX_SPAN_TAU = 2.5
 PREFIX_SPAN_MIN_S = 1800.0
 
+# The steady-prefix band (10% of the reference current) is wide enough to
+# hide the charger's own thermal regulation: a Gen 3 that trims 48.6 A to
+# 44.7 A as the handle nears its limit never leaves the band, so the ramp
+# keeps collecting samples whose flattening is *caused by the current
+# dropping*. The exponential then reads that as the plateau — a lower rise
+# paired with a faster tau, passing every gate with a fine RMSE. Measured on
+# one install: fits whose current sagged read a median 33.3 C rise against
+# 37.2 C for the same charger's steady windows, and because foldback starts
+# sooner in a hot garage the bias tracked ambient, manufacturing a 7 C
+# "drift" verdict out of the seasons.
+#
+# So each fit records whether its window was *free-running*: current held
+# flat end to end, making the fitted plateau the connector's own equilibrium
+# rather than one the charger imposed. Only free-running fits are compared
+# by the degradation watch. The other half of "the plateau was real" —
+# whether the window ran long enough to observe it — is MIN_SPAN_TAU above,
+# already enforced before any fit is emitted.
+#
+# The threshold separates the two populations with room to spare: on that
+# install steady windows sagged <= 0.6% while regulated ones sagged >= 3.9%.
+# The absolute floor keeps sensor quantization on a low-current charge from
+# reading as regulation.
+FREE_CURRENT_SAG_FRAC = 0.015
+FREE_CURRENT_SAG_MIN_A = 0.5
+
 # Live-forecast gate: a steady-current window must hold this many samples
 # over this much time before its trajectory is projected.
 TRAJECTORY_MIN_SAMPLES = 8
@@ -350,6 +375,34 @@ def _steady_current_prefix(samples: list[dict], max_span_s: float = PREFIX_SPAN_
         if sample["ts"] - prefix[0]["ts"] > max_span_s:  # the ramp lives in the first few tau
             break
     return prefix
+
+
+def _current_sag_a(prefix: list[dict]) -> float:
+    """How far the window's current fell from its opening to its close.
+
+    Head and tail quarters are compared by median, so a single dropped
+    sample or a momentary blip cannot pass for regulation. Signed: a
+    negative sag means the current *rose* across the window, which breaks
+    the constant-current premise just as thoroughly.
+    """
+    quarter = max(2, len(prefix) // 4)
+    head = median(sample["vehicle_current_a"] for sample in prefix[:quarter])
+    tail = median(sample["vehicle_current_a"] for sample in prefix[-quarter:])
+    return head - tail
+
+
+def _free_plateau(prefix: list[dict], sag_a: float) -> bool:
+    """Did the charger leave this window alone?
+
+    True when the current held flat across the whole window, so the fitted
+    plateau is the connector's own equilibrium at that current. False when
+    the charger was trimming current back — the plateau is then a setpoint
+    the charger held, and the fitted rise says more about how close the
+    handle got to the limit than about connector resistance.
+    """
+    i_ref = median(sample["vehicle_current_a"] for sample in prefix)
+    tolerance = max(FREE_CURRENT_SAG_MIN_A, FREE_CURRENT_SAG_FRAC * i_ref)
+    return abs(sag_a) <= tolerance
 
 
 def _segments(rows: list[dict]) -> list[tuple[float, float]]:
@@ -569,7 +622,14 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
     ambient_source ("measured" for a stationary LAN sensor, "measured_car"
     for a parked vehicle's sensor, else "pre_idle" or "cooldown_tail"),
     ambient_c, and — when bracketed — ambient_end_c and ambient_drift_c
-    (end minus start)."""
+    (end minus start).
+
+    Every fit also carries current_sag_a (how far current fell across the
+    window) and free_plateau: False means the charger was trimming current
+    back as the handle warmed, so the fitted plateau is a setpoint it held
+    rather than the connector's own equilibrium. Such fits still serve the
+    forecast — they describe what the handle actually did — but the
+    degradation watch compares only free-running ones."""
     sessions = [
         session
         for session in db.sessions_range(now - lookback_days * 86400, now)
@@ -670,6 +730,7 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
                 rise = (t_inf - ambient) * (REF_CURRENT_A / i_med) ** 2
                 if not (RISE_RANGE_C[0] <= rise <= RISE_RANGE_C[1]):
                     rise = None
+            sag_a = _current_sag_a(prefix)
             fits.append(
                 {
                     "session_id": sess["id"],
@@ -678,6 +739,8 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
                     "rise_ref_c": round(rise, 2) if rise is not None else None,
                     "rmse_c": round(rmse, 3),
                     "current_a": round(i_med, 1),
+                    "current_sag_a": round(sag_a, 2),
+                    "free_plateau": _free_plateau(prefix, sag_a),
                     "ambient_source": ambient_source if rise is not None else None,
                     "ambient_c": round(ambient, 2) if rise is not None else None,
                     "ambient_end_c": (
@@ -717,17 +780,59 @@ def fit_history(db: Database, now: float, lookback_days: float = 120.0,
 
 # A loose lug or degrading contact shows up as extra resistance: more heat
 # rise for the same current. Prediction alone hides that (the rolling median
-# just follows it), so the drift watch compares recent sessions against the
-# earlier baseline and flags a sustained increase.
-DRIFT_RECENT_N = 3
-DRIFT_MIN_BASELINE_N = 3
+# just follows it), so the drift watch models rise against time and flags a
+# sustained increase.
+#
+# It models rather than compares, because a recent-vs-baseline median split
+# answers the wrong question. The split asks "are the last few fits higher?",
+# which any covariate that moved with the calendar answers for it: a garage
+# that cooled between the two halves, or a vehicle capped to a lower current
+# whose (48/I)^2 normalization then lifts every recent fit. On one install
+# that split reported +7.2 C with a 95% CI of [5.4, 9.1] — "statistically
+# confirmed" — from a connector whose rise, regressed on time with ambient
+# and current held, was moving +0.01 C/day, indistinguishable from flat. The
+# confidence was real; it was confidence in the wrong estimand.
+#
+# So the watch fits rise_ref ~ days + ambient + current over the whole
+# comparable history and reads the *days* coefficient. Ambient and current
+# stop being confounders and become covariates, the estimate uses every fit
+# instead of six, and when a covariate genuinely cannot be separated from
+# time the collinearity inflates the slope's standard error and the verdict
+# declines to confirm — which is the honest outcome, reached automatically.
+DRIFT_MIN_N = 6
+DRIFT_TYPICAL_N = 3  # newest fits defining the install's current operating point
 DRIFT_WARN_C = 2.5  # materiality floor, not the trigger — see detect_drift
 DRIFT_ALERT = "Handle heat rise increasing (check connector/wiring)"
 
 # Cross-current pooling: fits whose ambient was bracketed at both ends are
 # trustworthy enough under the I^2 normalization to join the comparison from
 # a wider current band; start-only fits must still match the typical current.
+# The regression carries a current term of its own, so pooled fits are
+# adjusted rather than merely admitted — a residual error in the I^2
+# normalization lands on that coefficient instead of on the time slope.
 DRIFT_POOL_BAND_FRAC = 0.25
+
+# A covariate earns a column only when the history actually moved in it.
+# Regressing on a covariate that barely varies buys nothing and spends a
+# degree of freedom the small-sample t-multiplier charges dearly for.
+DRIFT_AMBIENT_SPREAD_C = 3.0
+DRIFT_CURRENT_SPREAD_A = 2.0
+
+# Reported, not gated: how strongly a covariate moved with the calendar.
+# Past this the two cannot be told apart, and the slope's standard error
+# will already be showing it — the flag exists so the UI can say *why* an
+# apparently large delta refused to confirm.
+DRIFT_COLLINEAR_R = 0.8
+
+# The premise of rise_ref is that subtracting ambient leaves a number that
+# depends on the connector and not on the weather. An install where rise
+# still moves this much per degree of ambient — materially, and resolved
+# well enough to be sure of the sign — has broken that premise: something
+# the model does not carry (multi-day heat soak, a charger regulating to a
+# fixed handle temperature, a badly sited sensor) is in the measurement.
+# The regression adjusts for it, but adjustment is not understanding, so
+# such an install can still raise a lead and never an alert.
+DRIFT_AMBIENT_CONFOUND_C = 0.3
 
 # The settings key holding the baseline anchor: a timestamp before which
 # fits are excluded from the drift comparison. Set it when the hardware has
@@ -735,21 +840,79 @@ DRIFT_POOL_BAND_FRAC = 0.25
 # "verified healthy", not "the first charges the monitor happened to see".
 BASELINE_ANCHOR_KEY = "thermal_baseline_anchor_ts"
 
-# Two-sided 95% Student-t multipliers by degrees of freedom, for the delta's
-# confidence interval. Small-sample medians are noisy; a plain 1.96 would
-# overstate the confidence exactly when the history is thinnest.
-_T95 = {1: 12.71, 2: 4.30, 3: 3.18, 4: 2.78, 5: 2.57, 6: 2.45, 7: 2.36, 8: 2.31, 9: 2.26, 10: 2.23}
+# Two-sided 95% Student-t multipliers by residual degrees of freedom, for
+# the slope's confidence interval. A plain 1.96 would overstate the
+# confidence exactly when the history is thinnest.
+_T95 = {1: 12.71, 2: 4.30, 3: 3.18, 4: 2.78, 5: 2.57, 6: 2.45, 7: 2.36, 8: 2.31, 9: 2.26, 10: 2.23,
+        11: 2.20, 12: 2.18, 13: 2.16, 14: 2.14, 15: 2.13, 16: 2.12, 17: 2.11, 18: 2.10, 19: 2.09,
+        20: 2.09, 25: 2.06, 30: 2.04, 40: 2.02, 60: 2.00}
 
 
-def _median_stats(values: list[float]) -> tuple[float, float, float]:
-    """(median, MAD, standard error of the median).
+def _t95(dof: int) -> float:
+    """Two-sided 95% t multiplier. An untabulated dof falls back to the
+    next-lower tabulated one, which is the larger multiplier — rounding
+    toward caution rather than away from it."""
+    if dof < 1:
+        return _T95[1]
+    if dof in _T95:
+        return _T95[dof]
+    return _T95[max(key for key in _T95 if key <= dof)]
 
-    Spread comes from the median absolute deviation — robust to the odd wild
-    fit — scaled to a normal-equivalent sigma (1.4826) and to the median's
-    sampling efficiency (1.2533 / sqrt(n))."""
-    med = median(values)
-    mad = median(abs(value - med) for value in values)
-    return med, mad, 1.2533 * (1.4826 * mad) / math.sqrt(len(values))
+
+def _invert(matrix: list[list[float]]) -> list[list[float]] | None:
+    """Gauss-Jordan inverse with partial pivoting; None if singular.
+
+    The pivot tolerance is relative to the largest entry, because the design
+    matrix mixes columns of wildly different scale (a count of fits against
+    a sum of squared day-offsets)."""
+    size = len(matrix)
+    scale = max((abs(value) for row in matrix for value in row), default=0.0)
+    if scale <= 0.0:
+        return None
+    aug = [row[:] + [1.0 if i == j else 0.0 for j in range(size)] for i, row in enumerate(matrix)]
+    for col in range(size):
+        pivot = max(range(col, size), key=lambda row: abs(aug[row][col]))
+        if abs(aug[pivot][col]) < 1e-10 * scale:
+            return None
+        aug[col], aug[pivot] = aug[pivot], aug[col]
+        divisor = aug[col][col]
+        aug[col] = [value / divisor for value in aug[col]]
+        for row in range(size):
+            if row != col and aug[row][col] != 0.0:
+                factor = aug[row][col]
+                aug[row] = [value - factor * base for value, base in zip(aug[row], aug[col])]
+    return [row[size:] for row in aug]
+
+
+def _ols(y: list[float], design: list[list[float]]) -> tuple[list[float], list[float], float, int] | None:
+    """Ordinary least squares: (coefficients, standard errors, residual sd,
+    residual dof), or None when the design is singular or leaves too few
+    degrees of freedom for the standard errors to mean anything."""
+    rows, cols = len(y), len(design[0])
+    dof = rows - cols
+    if dof < 2:
+        return None
+    xtx = [[sum(design[i][a] * design[i][b] for i in range(rows)) for b in range(cols)]
+           for a in range(cols)]
+    inv = _invert(xtx)
+    if inv is None:
+        return None
+    xty = [sum(design[i][a] * y[i] for i in range(rows)) for a in range(cols)]
+    beta = [sum(inv[a][b] * xty[b] for b in range(cols)) for a in range(cols)]
+    sse = sum((y[i] - sum(design[i][j] * beta[j] for j in range(cols))) ** 2 for i in range(rows))
+    variance = sse / dof
+    se = [math.sqrt(max(variance * inv[j][j], 0.0)) for j in range(cols)]
+    return beta, se, math.sqrt(variance), dof
+
+
+def _pearson(xs: list[float], ys: list[float]) -> float:
+    """Correlation coefficient; 0.0 when either side is constant."""
+    x_bar, y_bar = sum(xs) / len(xs), sum(ys) / len(ys)
+    sxy = sum((x - x_bar) * (y - y_bar) for x, y in zip(xs, ys))
+    sxx = sum((x - x_bar) ** 2 for x in xs)
+    syy = sum((y - y_bar) ** 2 for y in ys)
+    return sxy / math.sqrt(sxx * syy) if sxx > 0 and syy > 0 else 0.0
+
 
 # Actionable warning: the live forecast puts the 65 C trip inside this
 # horizon, so the user still has time to lower the vehicle's charge current
@@ -759,50 +922,62 @@ DERATE_ALERT = "Derate predicted (lower vehicle charge current to avoid it)"
 
 
 def detect_drift(fits: list[dict], anchor_ts: float | None = None) -> dict | None:
-    """Compare the last few sessions' fitted rise against the baseline.
+    """Regress fitted rise on time, holding ambient and current, and read the
+    time coefficient.
 
-    Returns None while there is too little history to judge; otherwise a
-    verdict dict with the medians compared. Only rise (not tau) is watched:
-    added contact resistance changes how much heat is made, not how fast the
-    handle mass warms.
+    Returns None while there is too little comparable history to judge;
+    otherwise a verdict dict. Only rise (not tau) is watched: added contact
+    resistance changes how much heat is made, not how fast the handle mass
+    warms.
 
-    Only sessions charging near the install's typical current are compared.
-    rise_ref_c is normalized by (REF/I)^2, and far from the measured current
-    that normalization amplifies ordinary fit error — a session at 40 A with
-    an unremarkable raw rise extrapolates to an alarming number at 48 A, and
-    with only DRIFT_RECENT_N recent sessions a single such point can swing
-    the median past the threshold and manufacture a drift verdict. Fits with
-    bracketed ambient are cleaner, so they join from a wider current band —
-    that is what lets a baseline recorded at 48 A keep judging charges after
-    the vehicle is capped to 40 A, instead of the verdict going dark.
+    **Only free-running fits are compared.** A window whose current the
+    charger was trimming back as the handle warmed has a plateau the charger
+    chose, and its fitted rise moves with how close the handle got to the
+    limit — which is to say, with ambient. Those fits still describe what the
+    handle did, so the forecast keeps them; a degradation comparison cannot
+    use them at all.
 
-    "Typical" is the median current of the newest fits, not of all history:
-    when the user caps the vehicle at a new current, the watch follows the
-    new operating point.
+    **Only sessions near the install's recent operating current**, with
+    ambient-bracketed fits pooled in from a wider band. "Typical" is the
+    median current of the newest fits, not of all history: when the user caps
+    the vehicle at a new current, the watch follows the new operating point.
 
     anchor_ts, when set, excludes fits from before it: the user has had the
     hardware inspected and verified, so "baseline" means "verified healthy"
     from that moment, not "the first charges the monitor happened to see".
 
-    The verdict carries its own uncertainty: MAD spread per side and a
-    Student-t ~95% confidence interval on the delta. "drifting" — the alert
-    — needs both: the interval clears zero ("confident") *and* the delta is
-    material (>= DRIFT_WARN_C, the floor below which a real increase isn't
-    worth an inspection). A delta past the floor whose interval still
-    straddles zero is a "lead": shown, pushed quietly, but no alert. The
-    effective threshold ("threshold_c") is therefore the larger of the floor
-    and what this install's own scatter requires, so a noisy install must
-    show more before the watch alarms and a quiet one less — the fixed
-    2.5 °C tripwire sat near one sigma on a real install and fired on
-    scatter.
+    The estimate is the modelled change across the observed span —
+    slope x days — not a difference of medians, so ambient and charge current
+    are adjusted for rather than assumed away. Its confidence interval is the
+    slope's, at a small-sample Student-t multiplier. "drifting" — the alert —
+    needs the interval to clear zero ("confident"), the change to be material
+    (>= DRIFT_WARN_C, the floor below which a real increase is not worth an
+    inspection), and the measurement itself to be sound: an install whose
+    rise still tracks ambient after the subtraction (see
+    DRIFT_AMBIENT_CONFOUND_C) is measuring something other than connector
+    resistance, and can raise a lead but never an alert. A change past the
+    floor that fails either test is a "lead": shown, pushed quietly, no alert
+    row. The effective threshold ("threshold_c") is the larger of the floor
+    and what this install's own scatter requires.
     """
-    usable = [fit for fit in fits if fit["rise_ref_c"] is not None]
-    if anchor_ts is not None:
-        usable = [fit for fit in usable if fit["start_ts"] >= anchor_ts]
-    if len(usable) < DRIFT_RECENT_N + DRIFT_MIN_BASELINE_N:
+    usable = [
+        fit for fit in fits
+        if fit["rise_ref_c"] is not None
+        # Fits predating the free-plateau gate carry no verdict either way;
+        # nothing better to assume than that the window was steady.
+        and fit.get("free_plateau", True)
+        and (anchor_ts is None or fit["start_ts"] >= anchor_ts)
+    ]
+    regulated_n = sum(
+        1 for fit in fits
+        if fit["rise_ref_c"] is not None
+        and not fit.get("free_plateau", True)
+        and (anchor_ts is None or fit["start_ts"] >= anchor_ts)
+    )
+    if len(usable) < DRIFT_MIN_N:
         return None
     usable.sort(key=lambda fit: fit["start_ts"])
-    typical_a = median(fit["current_a"] for fit in usable[-DRIFT_RECENT_N:])
+    typical_a = median(fit["current_a"] for fit in usable[-DRIFT_TYPICAL_N:])
     band = max(2.0, 0.1 * typical_a)
     pool_band = DRIFT_POOL_BAND_FRAC * typical_a
     comparable = [
@@ -814,34 +989,100 @@ def detect_drift(fits: list[dict], anchor_ts: float | None = None) -> dict | Non
             and abs(fit["current_a"] - typical_a) <= pool_band
         )
     ]
-    rises = [(fit["start_ts"], fit["rise_ref_c"]) for fit in comparable]
-    rises.sort(key=lambda entry: entry[0])
-    if len(rises) < DRIFT_RECENT_N + DRIFT_MIN_BASELINE_N:
+    if len(comparable) < DRIFT_MIN_N:
         return None
-    recent = [rise for _, rise in rises[-DRIFT_RECENT_N:]]
-    baseline = [rise for _, rise in rises[:-DRIFT_RECENT_N]]
-    recent_med, recent_mad, recent_se = _median_stats(recent)
-    baseline_med, baseline_mad, baseline_se = _median_stats(baseline)
-    delta = recent_med - baseline_med
-    delta_se = math.sqrt(recent_se**2 + baseline_se**2)
-    t_mult = _T95.get(len(recent) + len(baseline) - 2, 2.0)
+
+    origin = comparable[0]["start_ts"]
+    days = [(fit["start_ts"] - origin) / 86400.0 for fit in comparable]
+    span_days = days[-1] - days[0]
+    if span_days <= 0.0:
+        return None
+    rises = [fit["rise_ref_c"] for fit in comparable]
+    currents = [fit["current_a"] for fit in comparable]
+    # Ambient is missing on fits that read it from neither end; centre what
+    # is there on its own mean so the intercept keeps its meaning.
+    ambients = [fit.get("ambient_c") for fit in comparable]
+    have_ambient = all(value is not None for value in ambients)
+
+    # Each covariate column is earned by variation. Centring them makes the
+    # intercept the predicted rise at the first fit under average conditions,
+    # which is what the UI reports as the baseline.
+    columns: list[tuple[str, list[float]]] = []
+    if have_ambient and max(ambients) - min(ambients) >= DRIFT_AMBIENT_SPREAD_C:
+        mean_ambient = sum(ambients) / len(ambients)
+        columns.append(("ambient", [value - mean_ambient for value in ambients]))
+    if max(currents) - min(currents) >= DRIFT_CURRENT_SPREAD_A:
+        mean_current = sum(currents) / len(currents)
+        columns.append(("current", [value - mean_current for value in currents]))
+
+    # A thin history cannot afford every column. Drop them back to front —
+    # current first, ambient last — until the design is estimable, because
+    # ambient is the confounder this watch exists to survive and the one
+    # most likely to move with the calendar on its own.
+    fit_result = None
+    while True:
+        design = [[1.0, day] + [column[i] for _, column in columns] for i, day in enumerate(days)]
+        fit_result = _ols(rises, design)
+        if fit_result is not None or not columns:
+            break
+        columns.pop()
+    if fit_result is None:
+        return None
+    beta, se, resid_sd, dof = fit_result
+    names = [name for name, _ in columns]
+    coef = {name: (beta[2 + i], se[2 + i]) for i, name in enumerate(names)}
+
+    slope, slope_se = beta[1], se[1]
+    delta = slope * span_days
+    delta_se = slope_se * span_days
+    t_mult = _t95(dof)
     ci_lo, ci_hi = delta - t_mult * delta_se, delta + t_mult * delta_se
     confident = ci_lo > 0.0
     threshold = max(DRIFT_WARN_C, t_mult * delta_se)
-    drifting = confident and delta >= DRIFT_WARN_C
+
+    # What could not be told apart from the calendar, and what the ambient
+    # subtraction failed to remove. Neither is an error; both are reasons a
+    # delta that looks large is not yet an alert.
+    compromised: list[str] = []
+    collinear = {
+        name: _pearson(days, column)
+        for name, column in columns
+        if abs(_pearson(days, column)) > DRIFT_COLLINEAR_R
+    }
+    ambient_coef, ambient_se = coef.get("ambient", (None, None))
+    ambient_confounded = (
+        ambient_coef is not None
+        and abs(ambient_coef) >= DRIFT_AMBIENT_CONFOUND_C
+        and abs(ambient_coef) > 2.0 * ambient_se
+    )
+    if ambient_confounded:
+        compromised.append("ambient")
+
+    drifting = confident and delta >= DRIFT_WARN_C and not compromised
     cross_current = sum(1 for fit in comparable if abs(fit["current_a"] - typical_a) > band)
     return {
         "drifting": drifting,
         "lead": delta >= DRIFT_WARN_C and not drifting,
         "confident": confident,
-        "recent_rise_c": round(recent_med, 2),
-        "baseline_rise_c": round(baseline_med, 2),
+        "baseline_rise_c": round(beta[0], 2),
+        "recent_rise_c": round(beta[0] + slope * span_days, 2),
         "delta_c": round(delta, 2),
         "delta_ci95_c": [round(ci_lo, 2), round(ci_hi, 2)],
-        "recent_mad_c": round(recent_mad, 2),
-        "baseline_mad_c": round(baseline_mad, 2),
-        "recent_n": len(recent),
-        "baseline_n": len(baseline),
+        "slope_c_per_day": round(slope, 4),
+        "slope_se_c_per_day": round(slope_se, 4),
+        "span_days": round(span_days, 1),
+        "n": len(comparable),
+        "resid_sd_c": round(resid_sd, 2),
+        "dof": dof,
+        "covariates": names,
+        "ambient_coef_c_per_c": round(ambient_coef, 3) if ambient_coef is not None else None,
+        "ambient_coef_se": round(ambient_se, 3) if ambient_se is not None else None,
+        "current_coef_c_per_a": (
+            round(coef["current"][0], 3) if "current" in coef else None
+        ),
+        "collinear_with_time": {name: round(value, 2) for name, value in collinear.items()},
+        "compromised_by": compromised,
+        "regulated_n": regulated_n,
         "typical_current_a": round(typical_a, 1),
         "off_current_n": len(usable) - len(comparable),
         "cross_current_n": cross_current,
