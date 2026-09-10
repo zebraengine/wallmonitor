@@ -803,10 +803,12 @@ async def test_thermal_fit_debiases_in_window_ambient_drift(db):
 
 async def test_thermal_drift_follows_current_change(db):
     # The user caps the vehicle at a new charge current (e.g. 48 A -> 40 A to
-    # stay under the derate on hot days). The old all-history median kept
-    # "typical" at 48 A forever: every new session was off-current, the drift
-    # verdict froze on stale data, and an active alert could never clear or
-    # re-confirm. Typical must follow the install's recent operating point.
+    # stay under the derate on hot days). The failure to avoid is a verdict
+    # that freezes on stale data — judging from the old 48 A fits while every
+    # new charge sits outside the band, so an active alert can never clear or
+    # re-confirm. The rule is that the comparison must contain the newest
+    # free-running charge or produce nothing at all; as charges at the new
+    # current accumulate, the band follows them.
     now = time.time()
     for i, rise in enumerate([36.0, 36.5, 35.8, 36.2, 36.1, 36.4]):
         _seed_thermal_session(db, now - (14 - i) * 7200, ambient_c=25.0, rise_ref_c=rise)
@@ -814,8 +816,9 @@ async def test_thermal_drift_follows_current_change(db):
         _seed_thermal_session(db, now - (7 - i) * 7200, ambient_c=25.0, rise_ref_c=rise, amps=40.6)
     fits = thermal.fit_sessions(db, now)
     drift = thermal.detect_drift(fits)
-    # Three 40 A fits and no 40 A baseline yet: the honest "can't judge yet"
-    # (which clears a stale alert) rather than a verdict frozen at 48 A.
+    # Three 40 A fits, unbracketed so they cannot pool across currents, and
+    # no 40 A baseline yet: the honest "can't judge yet" (which clears a
+    # stale alert) rather than a verdict frozen on the older 48 A fits.
     assert drift is None
     # More 40 A history accumulates — the watch re-arms at the new current
     # and a genuine same-current increase is still flagged.
@@ -1067,8 +1070,12 @@ async def test_thermal_drift_pools_bracketed_cross_current_fits(db):
     drift = thermal.detect_drift(fits)
     assert drift is not None, "bracketed 48 A baseline must keep judging 40 A charges"
     assert drift["drifting"] is False
-    assert abs(drift["typical_current_a"] - 40.6) < 0.1
-    assert drift["cross_current_n"] == 6  # the 48 A baseline, pooled in
+    # "Typical" is the install's usual current across its history, not its
+    # newest few fits — the regression holds current, so a cap is adjusted
+    # for rather than chased, and a stable band cannot be inverted by an
+    # occasional off-current charge.
+    assert abs(drift["typical_current_a"] - 48.6) < 0.1
+    assert drift["cross_current_n"] == 3  # the 40 A charges, pooled in
     # Un-bracketed off-current fits must still be excluded (the old rule).
     # (Seeded clear of session 9's cool-down tail so neither ambient read is
     # contaminated by interleaved samples.)
@@ -1156,6 +1163,33 @@ async def test_thermal_drift_holds_charge_current(db):
     assert mixed is not None and mixed["drifting"] is False
     assert not mixed["collinear_with_time"]
     assert abs(mixed["delta_c"]) < thermal.DRIFT_WARN_C
+
+
+async def test_thermal_drift_admits_calibration_probe_fits(db):
+    # A calibration probe deliberately charges well under the operating
+    # current so the handle reaches a plateau nothing trimmed. Those are the
+    # best fits an install can produce and the pooling band used to discard
+    # them silently — leaving the automation running and its data ignored.
+    now = time.time()
+    # Ten charges at the 48.6 A operating current with a 32 A probe dropped
+    # in at positions 3 and 8, the way a monthly cadence actually lands.
+    rises = [36.0, 36.5, 35.8, 36.2, 36.1, 36.4, 36.0, 36.3, 35.9, 36.2]
+    for i, rise in enumerate(rises):
+        amps = 32.0 if i in (3, 8) else 48.6
+        _seed_thermal_session(db, now - (24 - 2 * i) * 7200, ambient_c=25.0, rise_ref_c=rise,
+                              amps=amps, cooldown_s=900.0, ambient_end_c=25.0)
+    fits = thermal.fit_sessions(db, now)
+    probes = [fit for fit in fits if fit["current_a"] < 36.0]
+    assert len(probes) == 2 and all(fit["free_plateau"] for fit in probes)
+    drift = thermal.detect_drift(fits)
+    assert drift is not None
+    assert drift["n"] == len(fits), "probe fits must reach the regression, not be pooled out"
+    assert drift["off_current_n"] == 0
+    # Interleaving them is also what keeps current separable from the
+    # calendar, which is the other thing a probe buys.
+    assert "current" in drift["covariates"]
+    assert not drift["collinear_with_time"]
+    assert drift["drifting"] is False
 
 
 async def test_thermal_drift_reports_ambient_confound(db):

@@ -7,6 +7,9 @@
 # Usage (run with sudo, from anywhere):
 #   sudo ./install-derate-amp-control.sh --tesla-ble http://<esp32-host>
 #   sudo ./install-derate-amp-control.sh --tesla-ble http://<esp32-host> --dry-run
+#   # add a monthly calibration probe (a held, unregulated charge the
+#   # degradation watch can compare month to month):
+#   sudo ./install-derate-amp-control.sh --tesla-ble http://<esp32-host> --probe-amps 32
 #   sudo ./install-derate-amp-control.sh --uninstall
 #
 # The ESP32 host/IP lands only in the local systemd unit — never commit it.
@@ -28,6 +31,9 @@ NORMAL_AMPS=""
 LEAD_TIME_MIN=""
 CONFIRM_TICKS=""
 MIN_CAP_DELTA_A=""
+PROBE_AMPS=""
+PROBE_INTERVAL_DAYS=""
+PROBE_HOLD_MIN=""
 STATE_FILE=""
 INTERVAL="30"
 DRY_RUN="0"
@@ -45,6 +51,9 @@ while [[ $# -gt 0 ]]; do
     --lead-time-min) LEAD_TIME_MIN="$2"; shift 2 ;;
     --confirm-ticks) CONFIRM_TICKS="$2"; shift 2 ;;
     --min-cap-delta-a) MIN_CAP_DELTA_A="$2"; shift 2 ;;
+    --probe-amps) PROBE_AMPS="$2"; shift 2 ;;
+    --probe-interval-days) PROBE_INTERVAL_DAYS="$2"; shift 2 ;;
+    --probe-hold-min) PROBE_HOLD_MIN="$2"; shift 2 ;;
     --state-file) STATE_FILE="$2"; shift 2 ;;
     --interval) INTERVAL="$2"; shift 2 ;;
     --dry-run) DRY_RUN="1"; shift ;;
@@ -87,6 +96,9 @@ DAEMON_ARGS="--tesla-ble ${TESLA_BLE} --wallmonitor ${WALLMONITOR}"
 [[ -n "$LEAD_TIME_MIN" ]] && DAEMON_ARGS+=" --lead-time-min ${LEAD_TIME_MIN}"
 [[ -n "$CONFIRM_TICKS" ]] && DAEMON_ARGS+=" --confirm-ticks ${CONFIRM_TICKS}"
 [[ -n "$MIN_CAP_DELTA_A" ]] && DAEMON_ARGS+=" --min-cap-delta-a ${MIN_CAP_DELTA_A}"
+[[ -n "$PROBE_AMPS" ]] && DAEMON_ARGS+=" --probe-amps ${PROBE_AMPS}"
+[[ -n "$PROBE_INTERVAL_DAYS" ]] && DAEMON_ARGS+=" --probe-interval-days ${PROBE_INTERVAL_DAYS}"
+[[ -n "$PROBE_HOLD_MIN" ]] && DAEMON_ARGS+=" --probe-hold-min ${PROBE_HOLD_MIN}"
 [[ -n "$STATE_FILE" ]] && DAEMON_ARGS+=" --state-file ${STATE_FILE}"
 [[ "$DRY_RUN" == "1" ]] && DAEMON_ARGS+=" --dry-run"
 [[ -n "$EXTRA_ARGS" ]] && DAEMON_ARGS+=" ${EXTRA_ARGS}"

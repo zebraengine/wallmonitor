@@ -101,6 +101,56 @@ records `amp_adjust_failed`, so bridge flakiness shows up in the same place
 as the decisions it blocked. Recording is best-effort by design: the event
 log is observability, never control flow.
 
+## The calibration probe
+
+The daemon exists to move charge current, which makes it the one component
+that can *stop* moving it on purpose — and that turns out to be worth as much
+as the capping.
+
+The [degradation watch](thermal-model.md#degradation-watch) can only compare
+charges whose current held steady through the ramp; anything else fits a
+plateau that a current change produced rather than the connector. On an
+install where this daemon caps often, those steady windows are scarce and
+land at whatever current the capping happened to stop at — which is a moving
+target, and one correlated with the weather, since a hot garage triggers
+capping sooner. Measured on one install: 285 caps in a month, 7 of 18 fitted
+windows contaminated, and the surviving ones split across three different
+currents.
+
+`--probe-amps` fixes that by manufacturing a clean window on a cadence:
+
+```bash
+sudo ./deploy/install-derate-amp-control.sh --tesla-ble http://<esp32-host> --probe-amps 32
+```
+
+Once every `--probe-interval-days` (default 30), the first charging session
+to come along is held at `--probe-amps` for `--probe-hold-min` (default 40)
+minutes, then released. Pick a current low enough that neither this daemon
+nor the vehicle wants to reduce it — on a 48 A install where foldback starts
+around 61 °C, 32 A plateaus near 53 °C with room to spare. Hold it for more
+than ~3x the install's time constant (`model.tau_min` in `/api/thermal`) so
+the handle actually reaches that plateau instead of being extrapolated to it.
+
+The result is a repeatable operating point: same current, unregulated, once a
+month. Comparing those to each other is a degradation test with no
+extrapolation across currents in it at all. They also break the collinearity
+between charge current and the calendar, which is what otherwise stops the
+watch's regression from telling a cap apart from a trend.
+
+Precedence is the whole contract, and it is deliberately simple:
+
+- **A thermal cap below the probe current always wins.** It is applied, and
+  the probe is abandoned — a window whose current just moved teaches nothing.
+- **The probe outranks restoring.** Stepping back toward full rate is exactly
+  what would ruin the measurement, so no step-up happens while it holds.
+- **An abandoned probe does not count.** Only a hold that ran its full length
+  updates the cadence, so a session that unplugs early — or one that needed a
+  real cap — simply retries next time.
+
+The probe is off unless `--probe-amps` is set. An install whose charges
+already run unregulated at full rate does not need one; `regulated_n` on the
+Alerts page says whether yours does.
+
 **Checking whether it would actually help, before or after deploying it:**
 `contrib/backtest_derate_amp_control.py` replays `decide()` against real
 historical sessions read straight from `wallmonitor.db` (point it at a copy,

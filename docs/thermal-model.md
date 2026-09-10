@@ -60,19 +60,26 @@ current actually flows.
 
 ## Free-running windows, and the ones the charger wrote
 
-The other way a plateau can be fictitious is that the charger chose it. A
-Gen 3 defends its own thermal limit long before alert 40: as the handle
-warms it trims charge current back, and it can trim ~10 % without ever
-leaving the fitter's steady-current band. The ramp then flattens *because
-the current fell*, and the exponential reads that flattening as the
-plateau — a lower rise paired with a faster τ, clearing every other gate
-with an excellent RMSE.
+The other way a plateau can be fictitious is that something chose it. The
+fitter's steady-current band is 10 % of the reference current, which is wide
+enough to hide a substantial reduction: 48.6 A trimmed to 44.7 A never
+leaves it. The ramp then flattens *because the current fell*, and the
+exponential reads that flattening as the plateau — a lower rise paired with
+a faster τ, clearing every other gate with an excellent RMSE.
 
-That bias is not random. Foldback starts sooner in a hot garage, so the
-under-read arrives and leaves with the weather; and a session that runs at
-a low enough current never triggers it at all. Measured on one install:
-windows whose current sagged fitted a median +33.3 °C rise where the same
-charger's steady windows fitted +37.2 °C.
+Who moved the current matters less than that it moved. On one install it was
+mostly the monitor's own doing: the optional [amp
+controller](amp-control.md) caps on this model's forecast, 285 times in a
+month, and the vehicle tapers on its own besides. The charger's *internal*
+foldback — the one alert 40 raises, counted by lifetime `thermal_foldbacks`
+— had not fired once in the same period. So this is first of all a feedback
+loop: the forecast caps the current, the cap contaminates the fit, the fit
+feeds the forecast.
+
+The bias is not random either. The controller caps sooner in a hot garage,
+so the under-read arrives and leaves with the weather. Measured on that
+install: windows whose current sagged fitted a median +33.3 °C rise where
+the same charger's steady windows fitted +37.2 °C.
 
 So every fit records `current_sag_a` — how far current fell from the head
 of the window to its tail, compared by quarter-medians — and
@@ -207,15 +214,26 @@ row. More sessions either confirm it or dissolve it.
   `regulated_n` says how many sat out, and the Alerts page says so too,
   because a verdict resting on four fits should not look like one resting
   on twelve.
-- **Only sessions near the install's recent operating current.** Cap the
-  vehicle at a new amperage and the watch follows, rather than judging
-  forever against a current the install no longer uses.
-- **Pooled across a wider current band when the fits are clean.**
+- **Only sessions near the install's usual charge current** — the median
+  across its whole comparable history, not its newest few fits. The
+  regression holds current, so a cap is something to adjust for rather than
+  chase, and a stable band cannot be inverted by the occasional
+  off-current charge (a monthly calibration probe is exactly such a charge:
+  at "newest three", two of them landing together made the *probe* current
+  typical and pooled the operating current out of its own comparison).
+- **Pooled across a wide current band when the fits are clean.**
   Ambient-bracketed fits join from a wider band, and the regression's own
   current term then *adjusts* them: residual error in the I² normalization
   lands on that coefficient instead of masquerading as a trend. On the
   install above that coefficient read −0.99 °C per amp, which is the whole
-  of the phantom +7.2 °C.
+  of the phantom +7.2 °C. The band is wide enough on purpose to admit a
+  [calibration probe](amp-control.md#the-calibration-probe).
+- **Never only stale sessions.** If none of the newest few free-running
+  charges make it into the comparison, the install has moved to a current
+  the band excludes and the watch reports nothing rather than a verdict
+  about a way it no longer charges — which also lets a stale alert clear.
+  As charges at the new current accumulate they become the median and the
+  band follows them.
 
 ### How sure it is
 
@@ -264,14 +282,16 @@ where full-rate charging always ends in foldback, the only free-running
 windows are the low-current ones, and the watch is judging a handful of
 fits at a current the install rarely uses.
 
-The cheapest fix is a **fixed-condition probe**: once a month, charge at a
-current low enough to run unregulated end to end (well under whatever
-first triggers foldback), for at least 3 τ. That yields a plateau nobody
-imposed, at a repeatable operating point, and comparing those month over
-month is a degradation test with no extrapolation in it at all. A single
-such charge is worth more to this watch than several at full rate.
+The fix is a **fixed-condition probe**: once a month, charge at a current
+low enough to run unregulated end to end (well under whatever first trims
+it), for at least 3 τ. That yields a plateau nobody imposed, at a
+repeatable operating point, and comparing those month over month is a
+degradation test with no extrapolation in it at all. A single such charge
+is worth more to this watch than several at full rate. It also breaks the
+collinearity between charge current and the calendar, which is the one
+thing that stops the regression from separating a cap from a trend.
 
-Deliberately varying the current — 32 / 40 / 48 A inside one week, at
-similar ambient — is worth doing once for a different reason: it breaks the
-collinearity between current and the calendar, which is the one thing that
-stops the regression from separating a cap from a trend.
+The [amp controller](amp-control.md#the-calibration-probe) automates it —
+`--probe-amps 32` — because the component that moves charge current is the
+one that can hold it still on purpose. Without the controller, setting the
+vehicle's charge limit by hand once a month does the same job.

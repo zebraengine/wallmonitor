@@ -209,22 +209,29 @@ PREFIX_SPAN_TAU = 2.5
 PREFIX_SPAN_MIN_S = 1800.0
 
 # The steady-prefix band (10% of the reference current) is wide enough to
-# hide the charger's own thermal regulation: a Gen 3 that trims 48.6 A to
-# 44.7 A as the handle nears its limit never leaves the band, so the ramp
-# keeps collecting samples whose flattening is *caused by the current
-# dropping*. The exponential then reads that as the plateau — a lower rise
-# paired with a faster tau, passing every gate with a fine RMSE. Measured on
-# one install: fits whose current sagged read a median 33.3 C rise against
-# 37.2 C for the same charger's steady windows, and because foldback starts
-# sooner in a hot garage the bias tracked ambient, manufacturing a 7 C
-# "drift" verdict out of the seasons.
+# hide a substantial current reduction: 48.6 A trimmed to 44.7 A never
+# leaves it, so the ramp keeps collecting samples whose flattening is
+# *caused by the current dropping*. The exponential then reads that as the
+# plateau — a lower rise paired with a faster tau, passing every gate with a
+# fine RMSE. Measured on one install: windows whose current sagged read a
+# median 33.3 C rise against 37.2 C for the same charger's steady windows.
+#
+# Who moves the current matters less than that it moved, and on that install
+# it was mostly *us*: the optional amp controller (contrib/) caps on this
+# model's own forecast, 285 times in a month, and the vehicle tapers on its
+# own besides. The charger's internal foldback — the one alert 40 raises,
+# counted by lifetime `thermal_foldbacks` — had not fired once in the same
+# period. So this is first of all a feedback loop: forecast caps the
+# current, the cap contaminates the fit, the fit feeds the forecast. Because
+# the controller caps sooner in a hot garage, the contamination also tracks
+# ambient, which is what turned it into a 7 C "drift" verdict.
 #
 # So each fit records whether its window was *free-running*: current held
 # flat end to end, making the fitted plateau the connector's own equilibrium
-# rather than one the charger imposed. Only free-running fits are compared
-# by the degradation watch. The other half of "the plateau was real" —
-# whether the window ran long enough to observe it — is MIN_SPAN_TAU above,
-# already enforced before any fit is emitted.
+# rather than one something else imposed. Only free-running fits are
+# compared by the degradation watch. The other half of "the plateau was
+# real" — whether the window ran long enough to observe it — is MIN_SPAN_TAU
+# above, already enforced before any fit is emitted.
 #
 # The threshold separates the two populations with room to spare: on that
 # install steady windows sagged <= 0.6% while regulated ones sagged >= 3.9%.
@@ -800,7 +807,9 @@ def fit_history(db: Database, now: float, lookback_days: float = 120.0,
 # time the collinearity inflates the slope's standard error and the verdict
 # declines to confirm — which is the honest outcome, reached automatically.
 DRIFT_MIN_N = 6
-DRIFT_TYPICAL_N = 3  # newest fits defining the install's current operating point
+# How many of the newest fits the comparison has to reach into to count as
+# describing the install as it charges now, rather than as it used to.
+DRIFT_RECENCY_N = 3
 DRIFT_WARN_C = 2.5  # materiality floor, not the trigger — see detect_drift
 DRIFT_ALERT = "Handle heat rise increasing (check connector/wiring)"
 
@@ -810,7 +819,16 @@ DRIFT_ALERT = "Handle heat rise increasing (check connector/wiring)"
 # The regression carries a current term of its own, so pooled fits are
 # adjusted rather than merely admitted — a residual error in the I^2
 # normalization lands on that coefficient instead of on the time slope.
-DRIFT_POOL_BAND_FRAC = 0.25
+#
+# The band is wide because the reason it was narrow is gone. It guarded a
+# median against a single off-current fit swinging it; there is no median
+# any more, every fit that gets here already held its current steady, and
+# the current term adjusts what is left. It has to be this wide to admit a
+# *calibration probe* — a charge deliberately held well under the operating
+# current so the handle reaches a plateau nothing trimmed (see
+# contrib/derate_amp_control.py --probe-amps). Those are the most valuable
+# fits an install can produce, and a narrow band silently discarded them.
+DRIFT_POOL_BAND_FRAC = 0.45
 
 # A covariate earns a column only when the history actually moved in it.
 # Regressing on a covariate that barely varies buys nothing and spends a
@@ -977,7 +995,15 @@ def detect_drift(fits: list[dict], anchor_ts: float | None = None) -> dict | Non
     if len(usable) < DRIFT_MIN_N:
         return None
     usable.sort(key=lambda fit: fit["start_ts"])
-    typical_a = median(fit["current_a"] for fit in usable[-DRIFT_TYPICAL_N:])
+    # The install's usual charge current, over its whole comparable history
+    # rather than its newest few fits. The old rule took the newest three so
+    # the watch would *follow* a cap — necessary when a median split could
+    # only compare like with like, and actively harmful now: the regression
+    # holds current, so a cap is something to adjust for rather than chase,
+    # and an occasional off-current charge taking over "typical" inverts the
+    # admission band and pools the operating current out of its own
+    # comparison. A monthly calibration probe is exactly such a charge.
+    typical_a = median(fit["current_a"] for fit in usable)
     band = max(2.0, 0.1 * typical_a)
     pool_band = DRIFT_POOL_BAND_FRAC * typical_a
     comparable = [
@@ -990,6 +1016,17 @@ def detect_drift(fits: list[dict], anchor_ts: float | None = None) -> dict | Non
         )
     ]
     if len(comparable) < DRIFT_MIN_N:
+        return None
+    recent_ts = {fit["start_ts"] for fit in usable[-DRIFT_RECENCY_N:]}
+    if not any(fit["start_ts"] in recent_ts for fit in comparable):
+        # None of the newest free-running charges made it into the
+        # comparison: the install has moved to a current the band excludes,
+        # and every fit that did make it describes a way it no longer
+        # charges. Report nothing rather than a verdict about the past — that
+        # also lets a stale alert clear. As charges at the new current
+        # accumulate they become the median and the band follows them.
+        # Deliberately "any of the newest few", not "the newest": a single
+        # odd charge must not blank a watch that is otherwise current.
         return None
 
     origin = comparable[0]["start_ts"]
