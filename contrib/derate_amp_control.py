@@ -123,6 +123,21 @@ class Config:
     forecast_confidence_k: float = 2.0
     min_amps: float = 6.0
 
+    # Calibration probe. The degradation watch can only compare windows the
+    # charge current held steady through — and on an install where this
+    # daemon caps often, those are scarce and land at whatever current the
+    # capping happened to choose. A probe manufactures one deliberately:
+    # hold a current low enough that nothing wants to trim it, long enough
+    # for the handle to reach its plateau, on a fixed cadence. The result is
+    # a repeatable operating point that month-over-month comparison can use
+    # without extrapolating across currents.
+    #
+    # Disabled at 0 — this is opt-in, and an install whose charges already
+    # run unregulated at full rate does not need it.
+    probe_amps: float = 0.0
+    probe_interval_days: float = 30.0
+    probe_hold_min: float = 40.0
+
 
 @dataclass
 class State:
@@ -137,6 +152,11 @@ class State:
     last_session_state: str | None = None
     restore_attempts: int = 0
     last_step_up_ts: float | None = None
+    # Calibration probe: when the current hold began, and when one last ran
+    # to completion. Only a *completed* hold updates last_probe_ts, so a
+    # session that unplugs mid-probe does not consume the month's slot.
+    probe_started_ts: float | None = None
+    last_probe_ts: float | None = None
 
 
 @dataclass
@@ -148,8 +168,9 @@ class Action:
     value: float | None = None
 
 
-def decide(thermal: dict, state: State, cfg: Config) -> tuple[Action, State, str]:
-    """Pure decision logic: what to do, the state to persist, and why."""
+def _decide_thermal(thermal: dict, state: State, cfg: Config) -> tuple[Action, State, str]:
+    """The derate-avoidance decision: what to do, the state to persist, and
+    why. Knows nothing about the calibration probe — see _apply_probe."""
     session_state = thermal.get("state")
     forecast = thermal.get("forecast") or {}
     basis = forecast.get("basis")
@@ -403,6 +424,109 @@ def decide(thermal: dict, state: State, cfg: Config) -> tuple[Action, State, str
     )
 
 
+def _apply_probe(
+    action: Action, new_state: State, reason: str, thermal: dict, prev: State, cfg: Config
+) -> tuple[Action, State, str]:
+    """Overlay the calibration probe on the derate decision.
+
+    A layer rather than a branch inside _decide_thermal, because that logic
+    is tuned by a string of live incidents and the probe has no business
+    reaching into it. The precedence is the only thing that matters here:
+
+    - **Safety always wins.** A cap below the probe current is a real
+      thermal decision; it is applied, and the probe is abandoned rather
+      than held over a window whose current just moved. An abandoned probe
+      does not update last_probe_ts, so the next session retries it.
+    - **The probe outranks restoring.** Stepping back up toward full rate is
+      exactly what would ruin the measurement, so while a probe holds, this
+      returns "none" and the step-up never happens.
+    - **A probe only starts from above.** If the current is already at or
+      under the probe current there is nothing to hold it down to.
+    """
+    if cfg.probe_amps <= 0:
+        return action, new_state, reason
+    session_state = thermal.get("state")
+    now_ts = thermal.get("ts")
+    current_a = thermal.get("current_a")
+
+    # Not charging: no probe can be running, and any half-finished one is
+    # abandoned (its window never completed, so it taught nothing).
+    if session_state != "charging":
+        return action, replace(new_state, probe_started_ts=None), reason
+
+    probing = prev.probe_started_ts is not None
+
+    if action.kind == "cap" and action.value is not None and action.value < cfg.probe_amps:
+        if probing:
+            return (
+                action,
+                replace(new_state, probe_started_ts=None),
+                f"{reason}; probe abandoned (thermal cap below the {cfg.probe_amps:g}A probe current)",
+            )
+        return action, new_state, reason
+
+    if probing:
+        if not isinstance(now_ts, (int, float)):
+            return Action("none"), new_state, "probe holding (no timestamp to age it against)"
+        held_min = (now_ts - prev.probe_started_ts) / 60.0
+        if held_min >= cfg.probe_hold_min:
+            return (
+                Action("restore", cfg.normal_amps),
+                replace(
+                    new_state,
+                    probe_started_ts=None,
+                    last_probe_ts=now_ts,
+                    capped=False,
+                    cap_value=None,
+                    clear_streak=0,
+                    trip_streak=0,
+                ),
+                (
+                    f"probe complete: held {cfg.probe_amps:g}A for {held_min:.0f}min, "
+                    f"restoring to {cfg.normal_amps:g}A"
+                ),
+            )
+        # Hold. clear_streak is pinned at zero so the restore path cannot
+        # bank confirming polls while the probe runs and then step up the
+        # instant it ends.
+        return (
+            Action("none"),
+            replace(
+                new_state,
+                probe_started_ts=prev.probe_started_ts,
+                capped=True,
+                cap_value=cfg.probe_amps,
+                clear_streak=0,
+            ),
+            f"probe holding {cfg.probe_amps:g}A ({held_min:.0f}/{cfg.probe_hold_min:g}min)",
+        )
+
+    # Start one? Only when due, only from a current above the probe value,
+    # and never on top of a thermal cap that is already lower — that session
+    # has bigger problems than calibration.
+    due = prev.last_probe_ts is None or (
+        isinstance(now_ts, (int, float)) and (now_ts - prev.last_probe_ts) >= cfg.probe_interval_days * 86400.0
+    )
+    already_lower = new_state.capped and new_state.cap_value is not None and new_state.cap_value <= cfg.probe_amps
+    if due and not already_lower and isinstance(current_a, (int, float)) and current_a > cfg.probe_amps + 1.0:
+        return (
+            Action("cap", cfg.probe_amps),
+            replace(new_state, probe_started_ts=now_ts, capped=True, cap_value=cfg.probe_amps),
+            (
+                f"calibration probe due: capping to {cfg.probe_amps:g}A for {cfg.probe_hold_min:g}min "
+                "to measure an unregulated plateau"
+            ),
+        )
+    return action, new_state, reason
+
+
+def decide(thermal: dict, state: State, cfg: Config) -> tuple[Action, State, str]:
+    """What to do, the state to persist, and why: the derate decision with
+    the calibration probe layered over it."""
+    action, new_state, reason = _decide_thermal(thermal, state, cfg)
+    return _apply_probe(action, new_state, reason, thermal, state, cfg)
+
+
 # ---------------------------------------------------------------------------
 # wallmonitor / tesla-ble access
 
@@ -569,8 +693,39 @@ def main(argv: list[str] | None = None) -> int:
         default="/tmp/derate_amp_control.state.json",
         help="remembers cap state and debounce streaks between runs",
     )
+    parser.add_argument(
+        "--probe-amps",
+        type=float,
+        default=Config.probe_amps,
+        help=(
+            "calibration probe: hold this charge current on a fixed cadence so the degradation watch "
+            "gets a plateau nothing trimmed (0 disables, the default). Pick a current low enough that "
+            "neither this daemon nor the vehicle wants to reduce it"
+        ),
+    )
+    parser.add_argument(
+        "--probe-interval-days",
+        type=float,
+        default=Config.probe_interval_days,
+        help="days between calibration probes (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--probe-hold-min",
+        type=float,
+        default=Config.probe_hold_min,
+        help=(
+            "minutes to hold the probe current; needs to exceed ~3x the install's thermal time "
+            "constant for the handle to reach its plateau (default: %(default)s)"
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="print the decision without changing the charger")
     args = parser.parse_args(argv)
+
+    if args.probe_amps and not (args.min_amps <= args.probe_amps <= args.normal_amps):
+        parser.error(
+            f"--probe-amps must sit between --min-amps ({args.min_amps:g}) and "
+            f"--normal-amps ({args.normal_amps:g}); got {args.probe_amps:g}"
+        )
 
     cfg = Config(
         normal_amps=args.normal_amps,
@@ -584,6 +739,9 @@ def main(argv: list[str] | None = None) -> int:
         reattempt_window_min=args.reattempt_window_min,
         forecast_confidence_k=args.forecast_confidence_k,
         min_amps=args.min_amps,
+        probe_amps=args.probe_amps,
+        probe_interval_days=args.probe_interval_days,
+        probe_hold_min=args.probe_hold_min,
     )
     state = load_state(args.state_file)
 

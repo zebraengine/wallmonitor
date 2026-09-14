@@ -471,3 +471,123 @@ def test_confidence_guard_falls_back_to_fit_rmse_without_se():
     action, state, reason = dac.decide(legacy, state, cfg)
     assert action.kind == "cap" and action.value == 43.0
     assert "fit rmse" in reason
+
+
+# --- calibration probe -------------------------------------------------
+# The degradation watch can only compare windows the current held steady
+# through, and on an install where this daemon caps often those are scarce
+# and land wherever the capping happened to stop. The probe manufactures one
+# on a cadence. Its whole contract is precedence: safety outranks it, it
+# outranks restoring, and it never reports a window it did not actually hold.
+
+
+def _probe_cfg(**kw):
+    kw.setdefault("probe_amps", 32.0)
+    kw.setdefault("probe_interval_days", 30.0)
+    kw.setdefault("probe_hold_min", 40.0)
+    return _cfg(**kw)
+
+
+def test_probe_disabled_by_default_changes_nothing():
+    # Zero probe_amps must leave the daemon byte-for-byte as it was for
+    # every install that never asked for this.
+    thermal = _thermal(will_trip=False, handle_c=50.0)
+    plain = dac.decide(thermal, dac.State(last_session_state="charging"), _cfg())
+    off = dac.decide(thermal, dac.State(last_session_state="charging"), _probe_cfg(probe_amps=0.0))
+    assert plain == off
+
+
+def test_probe_starts_when_due_and_caps_to_the_probe_current():
+    state = dac.State(last_session_state="charging")  # never probed
+    action, new, reason = dac.decide(_thermal(will_trip=False), state, _probe_cfg())
+    assert action.kind == "cap" and action.value == 32.0
+    assert new.probe_started_ts == 1_000_000.0 and new.last_probe_ts is None
+    assert "probe due" in reason
+
+
+def test_probe_not_due_until_the_interval_elapses():
+    recent = dac.State(last_session_state="charging", last_probe_ts=1_000_000.0 - 10 * 86400)
+    action, new, _ = dac.decide(_thermal(will_trip=False), recent, _probe_cfg())
+    assert action.kind == "none" and new.probe_started_ts is None
+    due = dac.State(last_session_state="charging", last_probe_ts=1_000_000.0 - 31 * 86400)
+    action, _, _ = dac.decide(_thermal(will_trip=False), due, _probe_cfg())
+    assert action.kind == "cap" and action.value == 32.0
+
+
+def test_probe_holds_against_the_restore_path():
+    # Stepping back toward full rate is exactly what would ruin the window,
+    # so a trajectory-clear signal that would normally step up must not.
+    held = dac.State(
+        last_session_state="charging", capped=True, cap_value=32.0,
+        probe_started_ts=1_000_000.0 - 10 * 60, clear_streak=9,
+    )
+    action, new, reason = dac.decide(
+        _thermal(will_trip=False, handle_c=45.0, ts=1_000_000.0), held, _probe_cfg())
+    assert action.kind == "none" and "probe holding" in reason
+    assert new.cap_value == 32.0 and new.probe_started_ts is not None
+    # and it cannot bank confirming polls to spend the moment it ends
+    assert new.clear_streak == 0
+
+
+def test_probe_completes_after_the_hold_and_restores():
+    held = dac.State(
+        last_session_state="charging", capped=True, cap_value=32.0,
+        probe_started_ts=1_000_000.0 - 41 * 60,
+    )
+    action, new, reason = dac.decide(_thermal(will_trip=False), held, _probe_cfg())
+    assert action.kind == "restore" and action.value == 48.0
+    assert "probe complete" in reason
+    assert new.probe_started_ts is None and new.last_probe_ts == 1_000_000.0
+    assert not new.capped
+
+
+def test_safety_cap_below_probe_current_wins_and_abandons_the_probe():
+    # A real thermal decision outranks calibration, and a window whose
+    # current just moved teaches nothing — so it is abandoned, not banked.
+    held = dac.State(
+        last_session_state="charging", capped=True, cap_value=32.0,
+        probe_started_ts=1_000_000.0 - 5 * 60, trip_streak=2,
+    )
+    action, new, reason = dac.decide(
+        _thermal(will_trip=True, mtt=5.0, suggested=28.0), held, _probe_cfg())
+    assert action.kind == "cap" and action.value == 28.0
+    assert new.probe_started_ts is None
+    assert "probe abandoned" in reason
+    # Abandoned, not completed: the next session must retry it.
+    assert new.last_probe_ts is None
+
+
+def test_probe_abandoned_by_an_unplug_does_not_consume_the_slot():
+    held = dac.State(
+        last_session_state="charging", capped=True, cap_value=32.0,
+        probe_started_ts=1_000_000.0 - 5 * 60,
+    )
+    _, new, _ = dac.decide(_thermal(state="idle"), held, _probe_cfg())
+    assert new.probe_started_ts is None and new.last_probe_ts is None
+
+
+def test_probe_does_not_start_from_a_lower_thermal_cap():
+    # A session already capped under the probe current has bigger problems
+    # than calibration; forcing it up to 32 A would be actively unsafe.
+    capped_low = dac.State(
+        last_session_state="charging", capped=True, cap_value=26.0, clear_streak=0)
+    action, new, _ = dac.decide(
+        _thermal(will_trip=False, handle_c=63.0), capped_low, _probe_cfg())
+    assert action.kind != "cap" or (action.value or 0) >= 32.0
+    assert new.probe_started_ts is None
+
+
+def test_probe_state_survives_an_old_state_file(tmp_path):
+    # A daemon upgrade reads state written before the probe existed. It must
+    # default the new fields rather than crash — and a probe must then be
+    # due, not silently skipped by a missing last_probe_ts.
+    path = tmp_path / "state.json"
+    path.write_text('{"capped": true, "cap_value": 40.0, "last_session_state": "charging"}')
+    state = dac.load_state(str(path))
+    assert state.capped and state.cap_value == 40.0
+    assert state.probe_started_ts is None and state.last_probe_ts is None
+    action, _, reason = dac.decide(_thermal(will_trip=False), state, _probe_cfg())
+    assert action.kind == "cap" and action.value == 32.0 and "probe due" in reason
+    # and the round-trip back to disk keeps the new fields
+    dac.save_state(str(path), dac.State(probe_started_ts=1.0, last_probe_ts=2.0))
+    assert dac.load_state(str(path)).last_probe_ts == 2.0
