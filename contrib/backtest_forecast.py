@@ -75,8 +75,6 @@ TICK_S = 30.0
 FIRST_TICK_S = 120.0
 LAST_TICK_S = 1200.0
 OPTIMISTIC_C = 2.0  # a plateau under-read by this much is the dangerous kind of wrong
-PROBE_CURRENT_FRAC = 0.75
-PROBE_MIN_S = 1800.0
 HOT_AMBIENT_C = 29.0
 WARM_START_C = 3.0  # handle this far above its idle level at a session's first run
 BUCKETS_MIN = ((2, 5), (5, 10), (10, 20))
@@ -104,7 +102,8 @@ class Run:
     idle_ambient_c: float | None = None  # from the idle handle before the session (first run)
     implied_ambient_c: float | None = None  # this run's own trajectory, through the current law
     kind: str = ""  # cold_start | warm_start | step_down | step_up
-    probe: bool = False
+    probe: bool = False  # started by the amp controller's calibration probe (from its amp_capped event)
+    probe_cable: str | None = None  # the probe's cable condition: any | cold | warm
     hot: bool = False
     sag_a: float = 0.0
     free: bool = True  # current held flat end to end: the plateau is the connector's own equilibrium
@@ -134,6 +133,7 @@ class BoundaryScore:
     kind: str
     probe: bool
     hot: bool
+    probe_condition: str | None  # "32A cold" etc., for grouping
     from_a: float | None
     to_a: float
     actual_c: float
@@ -243,9 +243,28 @@ def params_without(fits: list[dict], sid: int, current_exp: float | None = None)
     )
 
 
+def probe_starts(db: Database, sess: dict) -> list[tuple[float, float, str]]:
+    """(ts, amps, cable) for every calibration probe the amp controller
+    started in this session, from its amp_capped events. Probes before the
+    plan existed carry no condition and read as "any"."""
+    starts = []
+    for event in db.events_range(sess["start_ts"] - 60, sess["end_ts"] + 60, kinds=["amp_capped"]):
+        try:
+            detail = json.loads(event["detail"]) if event.get("detail") else {}
+        except ValueError:
+            continue
+        probe = detail.get("probe")
+        if probe:
+            starts.append((event["ts"], float(probe.get("amps") or 0.0), probe.get("cable") or "any"))
+        elif "calibration probe" in (detail.get("reason") or ""):
+            starts.append((event["ts"], float(detail.get("to_a") or 0.0), "any"))
+    return starts
+
+
 def build_runs(db: Database, sess: dict, params: thermal.ThermalParams, observe_tau: float,
                idle_model: thermal.IdleOffset, truth: str = "fit") -> list[Run]:
     rows = db.vitals_range(sess["start_ts"] - 1, sess["end_ts"] + 1, 500_000)
+    probes = probe_starts(db, sess)
     runs: list[Run] = []
     for index, raw in enumerate(split_runs(rows)):
         samples = [(row["ts"], row["handle_temp_c"]) for row in raw]
@@ -269,7 +288,12 @@ def build_runs(db: Database, sess: dict, params: thermal.ThermalParams, observe_
         if len(samples) >= thermal.TRAJECTORY_MIN_SAMPLES:
             t_inf, _se = thermal._project_t_inf(samples, params.tau_min)
             run.implied_ambient_c = t_inf - params.rise_at(run.current_a)
-        run.probe = run.current_a <= PROBE_CURRENT_FRAC * thermal.REF_CURRENT_A and run.span_s >= PROBE_MIN_S
+        # A probe run begins within a couple of minutes of the controller's
+        # cap event (the ramp to the probe current falls into a run too
+        # short to keep) at that current.
+        for probe_ts, probe_amps, cable in probes:
+            if -30.0 <= run.start_ts - probe_ts <= 180.0 and abs(run.current_a - probe_amps) <= 2.0:
+                run.probe, run.probe_cable = True, cable
         ambient_for_hot = run.sensor_ambient_c if run.sensor_ambient_c is not None else run.idle_ambient_c
         run.hot = ambient_for_hot is not None and ambient_for_hot >= HOT_AMBIENT_C
         if index == 0:
@@ -339,6 +363,7 @@ def score_boundary(run: Run, prev: Run | None, laws: dict[str, thermal.ThermalPa
         return None
     return BoundaryScore(
         run.session_id, run.kind, run.probe, run.hot,
+        f"{round(run.current_a):d}A {run.probe_cable}" if run.probe else None,
         prev.current_a if prev is not None else None, run.current_a, actual, predictions, se,
     )
 
@@ -365,8 +390,12 @@ STATS_HEADER = f"{'n':>5} {'bias':>6} {'|med|':>6} {'|p90|':>6} {'opt':>5}"
 def _boundary_table(boundaries: list[BoundaryScore], kinds: list[str], with_se: bool = False) -> None:
     methods = sorted({m for b in boundaries for m in b.predictions})
     groups: list[tuple[str, list[BoundaryScore]]] = [(kind, [b for b in boundaries if b.kind == kind]) for kind in kinds]
-    groups += [("probe", [b for b in boundaries if b.probe]), ("hot", [b for b in boundaries if b.hot]),
-               ("all", boundaries)]
+    groups += [("probe", [b for b in boundaries if b.probe])]
+    groups += [
+        (f"probe {condition}", [b for b in boundaries if b.probe_condition == condition])
+        for condition in sorted({b.probe_condition for b in boundaries if b.probe_condition})
+    ]
+    groups += [("hot", [b for b in boundaries if b.hot]), ("all", boundaries)]
     for label, group in groups:
         if not group:
             continue
@@ -503,7 +532,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"max {fmt(run.max_c)} | fit {fmt(run.fit_c)} (tau {fmt(run.fit_tau_min)}) "
                     f"30min-fit {fmt(run.window_c)} | truth {fmt(run.plateau_c)} | "
                     f"sensor {fmt(run.sensor_ambient_c)} implied {fmt(run.implied_ambient_c)} sag {run.sag_a:+.1f}"
-                    f"{' probe' if run.probe else ''}{' hot' if run.hot else ''}"
+                    f"{f' probe({run.probe_cable})' if run.probe else ''}{' hot' if run.hot else ''}"
                     f"{'' if run.free else ' REGULATED'}{' TRIPPED' if run.tripped else ''}"
                     f"{f' proj {run.projected_c:.1f}±{run.projected_se_c:.2f}' if run.projected_c is not None else ''}"
                 )

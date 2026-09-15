@@ -164,6 +164,44 @@ Precedence is the whole contract, and it is deliberately simple:
   updates the cadence, so a session that unplugs early — or one that needed a
   real cap — simply retries next time.
 
+### A probe plan
+
+One current, whenever due, gives the degradation watch its repeatable
+point. It cannot tell the forecast the two things the recorded history
+cannot: how rise scales with current in the band restores actually land in,
+and how much of the handle's heat is the *cable* still warm from the charge
+before. The [forecast backtest](thermal-model.md#measuring-the-forecast)
+found that heat-soak history to be the forecast's one remaining error — and
+found it inseparable from ambient in the history, because the controller
+chose every run's current on the strength of the model itself. A probe at
+the same current with a cold cable and a warm one measures it directly.
+
+```bash
+sudo ./deploy/install-derate-amp-control.sh --tesla-ble http://<esp32-host> \
+  --probe-amps 32,40 --probe-cable cold,warm
+```
+
+The plan is every current × every cable condition. **cold** is a probe
+started in a session's first three minutes after `--probe-cold-gap-h`
+(default 4) without charging; **warm** is a mid-session step-down after
+`--probe-warm-min` (default 30) at full rate, uncapped; **any** is the
+original behavior. The least-replicated condition goes first, and if it can
+still be met later in the session — a warm probe needs its 30 min first —
+the daemon waits for it rather than spending the slot on an easier one
+(unless the slot is overdue by a whole interval, when anything eligible
+will do). One probe per session. Probes run every
+`--probe-plan-interval-days` (default 7) until each condition has
+`--probe-replicates` (default 2) completions, then every
+`--probe-interval-days` as before, cycling. Each probe's start is recorded
+in its `amp_capped` event (`detail.probe`), which is how the backtest groups
+probe runs by condition.
+
+Two currents × two conditions × two replicates is eight probes: about two
+months at the weekly cadence, each costing ~40 min at reduced current. In a
+cooling season that is also a fixed-current sweep across a 15 °C ambient
+range — the test of an ambient effect that a summer's worth of controller-
+chosen history could not provide.
+
 The probe is off unless `--probe-amps` is set. An install whose charges
 already run unregulated at full rate does not need one; `regulated_n` on the
 Alerts page says whether yours does.

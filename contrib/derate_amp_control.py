@@ -108,9 +108,13 @@ import os
 import sys
 import urllib.error
 import urllib.request
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 
 TRIP_HANDLE_C = 65.0  # mirrors wallmonitor/thermal.py's TRIP_HANDLE_C (Gen 3, firmware 26.18.0)
+COLD_START_WINDOW_S = 180.0  # a cold-cable probe must start within this long of charging beginning
+FULL_RATE_FRAC = 0.9  # "at full rate" for the warm-cable clock: at least this fraction of normal_amps
+PROBE_LOG_KEEP = 50  # completed probes remembered in the state file
+PROBE_CABLES = ("any", "cold", "warm")
 
 
 @dataclass
@@ -141,11 +145,35 @@ class Config:
     # a repeatable operating point that month-over-month comparison can use
     # without extrapolating across currents.
     #
-    # Disabled at 0 — this is opt-in, and an install whose charges already
-    # run unregulated at full rate does not need it.
-    probe_amps: float = 0.0
+    # Disabled when empty — this is opt-in, and an install whose charges
+    # already run unregulated at full rate does not need it.
+    #
+    # A probe *plan* is the product of the currents and the cable
+    # conditions: "cold" is a probe started in a session's first minutes
+    # after a long gap since the last charge; "warm" is a mid-session
+    # step-down after a stretch at full rate, when the cable and connector
+    # are heat-soaked; "any" is the original behavior — whenever due. The
+    # backtest showed the forecast's remaining error is heat soak from the
+    # charge before, which the history cannot separate from ambient because
+    # the controller chose every run's current on the strength of the model
+    # itself; a probe at one current with a cold cable and a warm one
+    # measures it directly. Conditions are visited least-replicated first,
+    # at the plan interval until each has probe_replicates completions, then
+    # at the maintenance interval.
+    probe_amps: tuple[float, ...] = ()
+    probe_cable: tuple[str, ...] = ("any",)
     probe_interval_days: float = 30.0
+    probe_plan_interval_days: float = 7.0
+    probe_replicates: int = 2
     probe_hold_min: float = 40.0
+    probe_cold_gap_h: float = 4.0
+    probe_warm_min: float = 30.0
+
+    def __post_init__(self) -> None:
+        if isinstance(self.probe_amps, (int, float)):
+            self.probe_amps = (float(self.probe_amps),) if self.probe_amps > 0 else ()
+        if isinstance(self.probe_cable, str):
+            self.probe_cable = (self.probe_cable,)
 
 
 @dataclass
@@ -161,11 +189,25 @@ class State:
     last_session_state: str | None = None
     restore_attempts: int = 0
     last_step_up_ts: float | None = None
-    # Calibration probe: when the current hold began, and when one last ran
-    # to completion. Only a *completed* hold updates last_probe_ts, so a
-    # session that unplugs mid-probe does not consume the month's slot.
+    # Calibration probe: when the current hold began, at what current and
+    # cable condition, and when one last ran to completion. Only a
+    # *completed* hold updates last_probe_ts and probes_done, so a session
+    # that unplugs mid-probe does not consume the slot. probe_session_ts
+    # is the session a probe was attempted in: one per session.
     probe_started_ts: float | None = None
     last_probe_ts: float | None = None
+    probe_amps: float | None = None
+    probe_cable: str | None = None
+    probe_session_ts: float | None = None
+    probes_done: list[dict] = field(default_factory=list)
+    # Session bookkeeping the cable conditions are judged on: the last tick
+    # seen charging (so the gap before a session is known), when this
+    # session's charging began, that gap, and how long the current has held
+    # at full rate uncapped.
+    last_charging_ts: float | None = None
+    charging_since_ts: float | None = None
+    charging_gap_s: float | None = None
+    full_rate_since_ts: float | None = None
 
 
 @dataclass
@@ -175,6 +217,7 @@ class Action:
 
     kind: str  # "none" | "cap" | "restore"
     value: float | None = None
+    probe: dict | None = None  # {"amps", "cable"} when the cap starts a calibration probe
 
 
 def _decide_thermal(thermal: dict, state: State, cfg: Config) -> tuple[Action, State, str]:
@@ -460,36 +503,77 @@ def _apply_probe(
       returns "none" and the step-up never happens.
     - **A probe only starts from above.** If the current is already at or
       under the probe current there is nothing to hold it down to.
+    - **One probe per session**, and the plan's least-replicated condition
+      first: if that condition can still be met later in this session (a
+      warm-cable probe needs a stretch at full rate first), the daemon
+      waits for it rather than spending the slot on an easier one — unless
+      the slot is overdue by a whole interval, when any eligible condition
+      will do.
     """
-    if cfg.probe_amps <= 0:
+    if not cfg.probe_amps:
         return action, new_state, reason
     session_state = thermal.get("state")
     now_ts = thermal.get("ts")
     current_a = thermal.get("current_a")
+    has_ts = isinstance(now_ts, (int, float))
 
     # Not charging: no probe can be running, and any half-finished one is
     # abandoned (its window never completed, so it taught nothing).
     if session_state != "charging":
-        return action, replace(new_state, probe_started_ts=None), reason
+        return action, replace(
+            new_state, probe_started_ts=None, probe_amps=None, probe_cable=None,
+            charging_since_ts=None, charging_gap_s=None, full_rate_since_ts=None,
+        ), reason
+
+    # Session bookkeeping the cable conditions are judged on. The session
+    # started this tick if the previous run saw anything but "charging";
+    # a daemon upgraded mid-session knows neither when it began nor the gap
+    # before it, and a cold probe simply waits for the next session.
+    if prev.last_session_state != "charging":
+        since = now_ts if has_ts else None
+        gap = (now_ts - prev.last_charging_ts) if has_ts and prev.last_charging_ts is not None else None
+    else:
+        since, gap = prev.charging_since_ts, prev.charging_gap_s
+    at_full_rate = (
+        isinstance(current_a, (int, float)) and current_a >= FULL_RATE_FRAC * cfg.normal_amps and not new_state.capped
+    )
+    full_since = (prev.full_rate_since_ts if prev.full_rate_since_ts is not None else now_ts) if at_full_rate and has_ts else None
+    new_state = replace(
+        new_state,
+        last_charging_ts=now_ts if has_ts else prev.last_charging_ts,
+        charging_since_ts=since, charging_gap_s=gap, full_rate_since_ts=full_since,
+    )
 
     probing = prev.probe_started_ts is not None
+    # A state file written before the plan existed records no current for a
+    # hold in progress; that daemon had exactly one probe current.
+    active = (prev.probe_amps if prev.probe_amps is not None else cfg.probe_amps[0]) if probing else None
 
-    if action.kind == "cap" and action.value is not None and action.value < cfg.probe_amps:
-        if probing:
+    if action.kind == "cap" and action.value is not None:
+        if probing and action.value < active:
             return (
                 action,
-                replace(new_state, probe_started_ts=None),
-                f"{reason}; probe abandoned (thermal cap below the {cfg.probe_amps:g}A probe current)",
+                replace(new_state, probe_started_ts=None, probe_amps=None, probe_cable=None),
+                f"{reason}; probe abandoned (thermal cap below the {active:g}A probe current)",
             )
-        return action, new_state, reason
+        if not probing:
+            return action, new_state, reason  # a thermal decision this tick outranks starting a probe
 
     if probing:
-        if not isinstance(now_ts, (int, float)):
+        if not has_ts:
             return Action("none"), new_state, "probe holding (no timestamp to age it against)"
         held_min = (now_ts - prev.probe_started_ts) / 60.0
         if held_min >= cfg.probe_hold_min:
+            record = {"ts": now_ts, "amps": active, "cable": prev.probe_cable or "any"}
+            # The cadence is anchored at the probe's *session* start, not its
+            # completion: a probe that ends 40-70 min into a session would
+            # otherwise leave a session exactly one interval later a few
+            # minutes short of due at its first tick — the only minutes a
+            # cold-cable probe can start in.
+            anchor = since if since is not None else now_ts
             done = replace(
-                new_state, probe_started_ts=None, last_probe_ts=now_ts, clear_streak=0, trip_streak=0
+                new_state, probe_started_ts=None, probe_amps=None, probe_cable=None, last_probe_ts=anchor,
+                probes_done=(prev.probes_done + [record])[-PROBE_LOG_KEEP:], clear_streak=0, trip_streak=0,
             )
             # The probe's own plateau is the best measurement of today's
             # conditions the session will ever have, and the server has
@@ -499,12 +583,12 @@ def _apply_probe(
             sustainable = (thermal.get("forecast") or {}).get("sustainable_max_a")
             if isinstance(sustainable, (int, float)) and sustainable < cfg.normal_amps:
                 target = float(sustainable)
-                if target <= cfg.probe_amps:
+                if target <= active:
                     return (
                         Action("none"),
-                        replace(done, capped=True, cap_value=cfg.probe_amps),
+                        replace(done, capped=True, cap_value=active),
                         (
-                            f"probe complete: held {cfg.probe_amps:g}A for {held_min:.0f}min; "
+                            f"probe complete: held {active:g}A for {held_min:.0f}min; "
                             f"sustainable {target:g}A is no higher, holding"
                         ),
                     )
@@ -512,7 +596,7 @@ def _apply_probe(
                     Action("cap", target),
                     replace(done, capped=True, cap_value=target, last_step_up_ts=now_ts),
                     (
-                        f"probe complete: held {cfg.probe_amps:g}A for {held_min:.0f}min, "
+                        f"probe complete: held {active:g}A for {held_min:.0f}min, "
                         f"restoring to the sustainable {target:g}A"
                     ),
                 )
@@ -520,7 +604,7 @@ def _apply_probe(
                 Action("restore", cfg.normal_amps),
                 replace(done, capped=False, cap_value=None),
                 (
-                    f"probe complete: held {cfg.probe_amps:g}A for {held_min:.0f}min, "
+                    f"probe complete: held {active:g}A for {held_min:.0f}min, "
                     f"restoring to {cfg.normal_amps:g}A"
                 ),
             )
@@ -532,30 +616,82 @@ def _apply_probe(
             replace(
                 new_state,
                 probe_started_ts=prev.probe_started_ts,
+                probe_amps=active,
+                probe_cable=prev.probe_cable,
                 capped=True,
-                cap_value=cfg.probe_amps,
+                cap_value=active,
                 clear_streak=0,
             ),
-            f"probe holding {cfg.probe_amps:g}A ({held_min:.0f}/{cfg.probe_hold_min:g}min)",
+            f"probe holding {active:g}A ({held_min:.0f}/{cfg.probe_hold_min:g}min)",
         )
 
-    # Start one? Only when due, only from a current above the probe value,
-    # and never on top of a thermal cap that is already lower — that session
-    # has bigger problems than calibration.
-    due = prev.last_probe_ts is None or (
-        isinstance(now_ts, (int, float)) and (now_ts - prev.last_probe_ts) >= cfg.probe_interval_days * 86400.0
-    )
-    already_lower = new_state.capped and new_state.cap_value is not None and new_state.cap_value <= cfg.probe_amps
-    if due and not already_lower and isinstance(current_a, (int, float)) and current_a > cfg.probe_amps + 1.0:
-        return (
-            Action("cap", cfg.probe_amps),
-            replace(new_state, probe_started_ts=now_ts, capped=True, cap_value=cfg.probe_amps),
-            (
-                f"calibration probe due: capping to {cfg.probe_amps:g}A for {cfg.probe_hold_min:g}min "
-                "to measure an unregulated plateau"
-            ),
-        )
+    # Start one? Only when due, once per session, from a current above the
+    # probe value, and never on top of a thermal cap that is already lower
+    # — that session has bigger problems than calibration.
+    plan = _probe_plan(cfg)
+    counts = _probe_counts(prev, plan)
+    complete = all(count >= cfg.probe_replicates for count in counts.values())
+    interval_days = cfg.probe_interval_days if (complete or len(plan) == 1) else cfg.probe_plan_interval_days
+    if not has_ts or not isinstance(current_a, (int, float)):
+        return action, new_state, reason
+    elapsed = None if prev.last_probe_ts is None else now_ts - prev.last_probe_ts
+    if elapsed is not None and elapsed < interval_days * 86400.0:
+        return action, new_state, reason
+    if since is not None and prev.probe_session_ts == since:
+        return action, new_state, reason
+    overdue = elapsed is not None and elapsed >= 2.0 * interval_days * 86400.0
+    for amps, cable in sorted(plan, key=lambda cond: (counts[cond], plan.index(cond))):
+        already_lower = new_state.capped and new_state.cap_value is not None and new_state.cap_value <= amps
+        if already_lower or current_a <= amps + 1.0:
+            continue
+        status = _cable_status(cable, now_ts, since, gap, full_since, new_state.capped, cfg)
+        if status == "eligible":
+            return (
+                Action("cap", amps, probe={"amps": amps, "cable": cable}),
+                replace(
+                    new_state, probe_started_ts=now_ts, probe_amps=amps, probe_cable=cable,
+                    probe_session_ts=since, capped=True, cap_value=amps,
+                ),
+                (
+                    f"calibration probe due ({cable} cable): capping to {amps:g}A for {cfg.probe_hold_min:g}min "
+                    "to measure an unregulated plateau"
+                ),
+            )
+        if status == "pending" and not overdue:
+            return action, new_state, reason  # the condition that needs it most may still come this session
     return action, new_state, reason
+
+
+def _probe_plan(cfg: Config) -> list[tuple[float, str]]:
+    return [(amps, cable) for amps in cfg.probe_amps for cable in cfg.probe_cable]
+
+
+def _probe_counts(state: State, plan: list[tuple[float, str]]) -> dict[tuple[float, str], int]:
+    counts = {condition: 0 for condition in plan}
+    for done in state.probes_done:
+        key = (float(done.get("amps") or 0.0), done.get("cable") or "any")
+        if key in counts:
+            counts[key] += 1
+    return counts
+
+
+def _cable_status(
+    cable: str, now_ts: float, since: float | None, gap_s: float | None, full_since: float | None,
+    capped: bool, cfg: Config,
+) -> str:
+    """Whether a cable condition holds right now ("eligible"), could still
+    hold later in this session ("pending"), or cannot ("impossible")."""
+    if cable == "any":
+        return "eligible"
+    if cable == "cold":
+        if since is None or gap_s is None or gap_s < cfg.probe_cold_gap_h * 3600.0:
+            return "impossible"
+        return "eligible" if now_ts - since <= COLD_START_WINDOW_S else "impossible"
+    if cable == "warm":
+        if full_since is not None and now_ts - full_since >= cfg.probe_warm_min * 60.0:
+            return "eligible"
+        return "impossible" if capped else "pending"
+    return "impossible"
 
 
 def decide(thermal: dict, state: State, cfg: Config) -> tuple[Action, State, str]:
@@ -600,6 +736,8 @@ def event_for(action: Action, reason: str, thermal: dict, prev: State) -> tuple[
         "steady_state_c": forecast.get("steady_state_c"),
         "handle_c": thermal.get("handle_c"),
     }
+    if action.probe is not None:
+        detail["probe"] = action.probe  # the backtest groups probe runs by condition from this
     return ("amp_capped" if action.kind == "cap" else "amp_restored", detail)
 
 
@@ -734,19 +872,52 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--probe-amps",
-        type=float,
-        default=Config.probe_amps,
+        default="",
         help=(
             "calibration probe: hold this charge current on a fixed cadence so the degradation watch "
-            "gets a plateau nothing trimmed (0 disables, the default). Pick a current low enough that "
-            "neither this daemon nor the vehicle wants to reduce it"
+            "gets a plateau nothing trimmed (off by default). A comma-separated list probes each in "
+            "turn. Pick currents low enough that neither this daemon nor the vehicle wants to reduce them"
+        ),
+    )
+    parser.add_argument(
+        "--probe-cable",
+        default="any",
+        help=(
+            "cable condition(s) to probe under, comma-separated: 'any' (whenever due, the default), "
+            "'cold' (a session's first minutes after --probe-cold-gap-h without charging), 'warm' (a "
+            "mid-session step-down after --probe-warm-min at full rate). With more than one current or "
+            "condition the plan visits the least-replicated one first"
         ),
     )
     parser.add_argument(
         "--probe-interval-days",
         type=float,
         default=Config.probe_interval_days,
-        help="days between calibration probes (default: %(default)s)",
+        help="days between calibration probes once the plan is complete (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--probe-plan-interval-days",
+        type=float,
+        default=Config.probe_plan_interval_days,
+        help="days between probes while a multi-condition plan is still collecting (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--probe-replicates",
+        type=int,
+        default=Config.probe_replicates,
+        help="completed probes per condition before the plan counts as complete (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--probe-cold-gap-h",
+        type=float,
+        default=Config.probe_cold_gap_h,
+        help="hours without charging before a session counts as cold-cable (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--probe-warm-min",
+        type=float,
+        default=Config.probe_warm_min,
+        help="minutes at full rate, uncapped, before a warm-cable probe may start (default: %(default)s)",
     )
     parser.add_argument(
         "--probe-hold-min",
@@ -760,11 +931,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="print the decision without changing the charger")
     args = parser.parse_args(argv)
 
-    if args.probe_amps and not (args.min_amps <= args.probe_amps <= args.normal_amps):
-        parser.error(
-            f"--probe-amps must sit between --min-amps ({args.min_amps:g}) and "
-            f"--normal-amps ({args.normal_amps:g}); got {args.probe_amps:g}"
-        )
+    try:
+        probe_amps = tuple(float(part) for part in args.probe_amps.split(",") if part.strip())
+    except ValueError:
+        parser.error(f"--probe-amps must be a number or a comma-separated list of numbers; got {args.probe_amps!r}")
+    probe_amps = tuple(amps for amps in probe_amps if amps > 0)
+    for amps in probe_amps:
+        if not (args.min_amps <= amps <= args.normal_amps):
+            parser.error(
+                f"--probe-amps must sit between --min-amps ({args.min_amps:g}) and "
+                f"--normal-amps ({args.normal_amps:g}); got {amps:g}"
+            )
+    probe_cable = tuple(dict.fromkeys(part.strip() for part in args.probe_cable.split(",") if part.strip()))
+    if not probe_cable or any(cable not in PROBE_CABLES for cable in probe_cable):
+        parser.error(f"--probe-cable takes any of {', '.join(PROBE_CABLES)}; got {args.probe_cable!r}")
+    if "any" in probe_cable and len(probe_cable) > 1:
+        parser.error("--probe-cable 'any' cannot be combined with cold/warm")
 
     cfg = Config(
         normal_amps=args.normal_amps,
@@ -778,9 +960,14 @@ def main(argv: list[str] | None = None) -> int:
         reattempt_window_min=args.reattempt_window_min,
         forecast_confidence_k=args.forecast_confidence_k,
         min_amps=args.min_amps,
-        probe_amps=args.probe_amps,
+        probe_amps=probe_amps,
+        probe_cable=probe_cable,
         probe_interval_days=args.probe_interval_days,
+        probe_plan_interval_days=args.probe_plan_interval_days,
+        probe_replicates=args.probe_replicates,
         probe_hold_min=args.probe_hold_min,
+        probe_cold_gap_h=args.probe_cold_gap_h,
+        probe_warm_min=args.probe_warm_min,
     )
     state = load_state(args.state_file)
 
