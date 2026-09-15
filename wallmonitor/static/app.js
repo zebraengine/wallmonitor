@@ -1045,6 +1045,9 @@ async function viewLive(root) {
         chip = chipFor("good", "no derate expected");
         lines.push(`Handle is at ${fmtNum(data.handle_c, 1)} °C, settling near ~${fmtNum(forecast.steady_state_c, 1)} °C — ` +
           `below the ${fmtNum(model.trip_c, 0)} °C alert-40 threshold.`);
+        if (forecast.sustainable_max_a && forecast.sustainable_max_a < model.ref_current_a) {
+          lines.push(`At today's ambient the highest rate that stays under it is ~${fmtNum(forecast.sustainable_max_a, 0)} A.`);
+        }
       }
       lines.push(forecast.basis === "trajectory"
         ? "Based on the handle's temperature trajectory over the last few minutes."
@@ -1139,8 +1142,14 @@ async function viewLive(root) {
         `${io.segments} idle segments over ${io.days} days, ±${fmtNum(io.ambient_se_c, 1)} °C).`
       : ` Idle-offset model is the built-in seed from one install (±${fmtNum(io.ambient_se_c, 1)} °C on handle-derived ambient); ` +
         "a stationary sensor posting to /api/ambient calibrates it here automatically.";
+    // The current law is a prior (I²) until this install's own fits span
+    // enough current to measure it; say which one every forecast rests on.
+    const expNote = model.current_exp_fits > 0
+      ? ` Heat rise scales as I^${fmtNum(model.current_exp, 2)} here (fitted across ${model.current_exp_fits} free-running ` +
+        "sessions; the I² prior over-reads how much lower currents cool the handle)."
+      : "";
     const modelNote = `Model: τ ≈ ${fmtNum(model.tau_min, 1)} min, +${fmtNum(model.rise_ref_c, 0)} °C at ${fmtNum(model.ref_current_a, 0)} A — ` +
-      (model.fitted ? `fitted from ${model.tau_fits} recorded session ramp${model.tau_fits === 1 ? "" : "s"}.` + priorNote
+      (model.fitted ? `fitted from ${model.tau_fits} recorded session ramp${model.tau_fits === 1 ? "" : "s"}.` + priorNote + expNote
                 : "defaults from one verified install, used until this charger has fits of its own; refits automatically as sessions accumulate.") +
       (drift && !drift.drifting && !drift.lead ? ` Heat rise stable across ${drift.n} free-running fitted sessions` +
         `${drift.off_current_n ? ` (${drift.off_current_n} off-current session${drift.off_current_n === 1 ? "" : "s"} excluded)` : ""}.` : "") +

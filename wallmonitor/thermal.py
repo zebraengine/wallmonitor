@@ -185,6 +185,21 @@ REF_CURRENT_A = 48.0  # rise_ref_c is normalized to this charge current
 DEFAULT_TAU_MIN = 12.0
 DEFAULT_RISE_REF_C = 36.0
 
+# How heat rise scales with charge current: rise(I) = rise_ref * (I/48)^n.
+# Joule heating alone says n = 2, and that is the prior. Real handles read
+# lower: part of the rise is current-independent (the charger's own
+# electronics, cable heat soak) and convection stiffens as the handle warms,
+# so measured plateaus fall off more gently than I^2 as current drops. On one
+# install a 32 A probe settled 4 C above what n = 2 predicted, and every
+# forecast at an off-reference current inherited that error — including the
+# cap the amp controller was told to restore to. The exponent is therefore
+# fitted per install from free-running fits once they span enough current
+# to identify it, and stays at the prior until they do.
+DEFAULT_CURRENT_EXP = 2.0
+CURRENT_EXP_MIN_FITS = 4
+CURRENT_EXP_MIN_SPAN_A = 6.0
+CURRENT_EXP_RANGE = (1.0, 2.5)
+
 # Fit acceptance gates: a segment must actually contain a thermal ramp and
 # the exponential must describe it well, or it teaches the model nothing.
 MIN_SEGMENT_S = 480.0
@@ -268,10 +283,21 @@ class ThermalParams:
     tau_fits: int = 0
     rise_fits: int = 0
     fit_rmse_c: float | None = None
+    current_exp: float = DEFAULT_CURRENT_EXP
+    current_exp_fits: int = 0
+    current_exp_se: float | None = None
 
     @property
     def fitted(self) -> bool:
         return self.tau_fits > 0 and self.rise_fits > 0
+
+    def rise_at(self, current_a: float) -> float:
+        """Steady-state rise above ambient at a charge current."""
+        return self.rise_ref_c * (current_a / REF_CURRENT_A) ** self.current_exp
+
+    def current_for_rise(self, rise_c: float) -> float:
+        """The charge current whose steady-state rise is rise_c — rise_at inverted."""
+        return REF_CURRENT_A * (rise_c / self.rise_ref_c) ** (1.0 / self.current_exp)
 
     # How far a fitted value may sit from the default before the dashboard
     # says the priors were a poor fit for this install. A heuristic, not a
@@ -315,6 +341,9 @@ class ThermalParams:
             "fit_rmse_c": round(self.fit_rmse_c, 3) if self.fit_rmse_c is not None else None,
             "fitted": self.fitted,
             "prior_deviation": self.prior_deviation(),
+            "current_exp": round(self.current_exp, 2),
+            "current_exp_fits": self.current_exp_fits,
+            "current_exp_se": round(self.current_exp_se, 2) if self.current_exp_se is not None else None,
         }
 
 
@@ -734,7 +763,9 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
                     ambient_end = None  # refit failed gates; fall back
             rise = None
             if ambient is not None:
-                rise = (t_inf - ambient) * (REF_CURRENT_A / i_med) ** 2
+                # Normalized with the I^2 prior here; fit_history re-normalizes
+                # every fit with the install's own exponent once it has one.
+                rise = (t_inf - ambient) * (REF_CURRENT_A / i_med) ** DEFAULT_CURRENT_EXP
                 if not (RISE_RANGE_C[0] <= rise <= RISE_RANGE_C[1]):
                     rise = None
             sag_a = _current_sag_a(prefix)
@@ -744,6 +775,7 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
                     "start_ts": seg[0][0],
                     "tau_min": round(tau_s / 60.0, 2),
                     "rise_ref_c": round(rise, 2) if rise is not None else None,
+                    "rise_c": round(t_inf - ambient, 2) if rise is not None else None,
                     "rmse_c": round(rmse, 3),
                     "current_a": round(i_med, 1),
                     "current_sag_a": round(sag_a, 2),
@@ -766,11 +798,51 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
     return fits
 
 
+def _fit_current_exponent(fits: list[dict]) -> tuple[float, int, float | None]:
+    """The exponent n in rise = rise_ref * (I/48)^n, from free-running fits:
+    (n, fits used, standard error). The prior with no fits used when the
+    history cannot identify it — too few free-running fits, or all at one
+    current, where any n explains the data equally well.
+
+    Log-log least squares: ln(rise) = ln(rise_ref) + n * ln(I/48). Only
+    free-running windows count — a regulated window's plateau is lower for a
+    reason that has nothing to do with current, and those windows cluster at
+    high current, which would bend n downward for the wrong reason."""
+    points = [
+        (math.log(fit["current_a"] / REF_CURRENT_A), math.log(fit["rise_c"]))
+        for fit in fits
+        if fit.get("rise_c") is not None and fit["rise_c"] > 0
+        and fit.get("current_a") and fit.get("free_plateau", True)
+    ]
+    if len(points) < CURRENT_EXP_MIN_FITS:
+        return DEFAULT_CURRENT_EXP, 0, None
+    currents = [REF_CURRENT_A * math.exp(x) for x, _ in points]
+    if max(currents) - min(currents) < CURRENT_EXP_MIN_SPAN_A:
+        return DEFAULT_CURRENT_EXP, 0, None
+    result = _ols([y for _, y in points], [[1.0, x] for x, _ in points])
+    if result is None:
+        return DEFAULT_CURRENT_EXP, 0, None
+    beta, se, _resid, _dof = result
+    exponent = min(CURRENT_EXP_RANGE[1], max(CURRENT_EXP_RANGE[0], beta[1]))
+    return exponent, len(points), se[1]
+
+
 def fit_history(db: Database, now: float, lookback_days: float = 120.0,
                 fits: list[dict] | None = None) -> ThermalParams:
-    """Aggregate per-session fits into model parameters; defaults where thin."""
+    """Aggregate per-session fits into model parameters; defaults where thin.
+
+    Fits the install's current exponent first and re-normalizes every fit's
+    rise_ref_c with it, in place — so the fits handed on to the API and the
+    degradation watch, and the rise_ref_c median taken here, all share one
+    current law. With the I^2 prior, off-reference fits carry a bias that the
+    watch's current term then has to absorb; with a fitted exponent that
+    term has nothing left to explain."""
     if fits is None:
         fits = fit_sessions(db, now, lookback_days)
+    exponent, exp_fits, exp_se = _fit_current_exponent(fits)
+    for fit in fits:
+        if fit.get("rise_c") is not None and fit.get("current_a"):
+            fit["rise_ref_c"] = round(fit["rise_c"] * (REF_CURRENT_A / fit["current_a"]) ** exponent, 2)
     taus = [fit["tau_min"] for fit in fits]
     rises = [fit["rise_ref_c"] for fit in fits if fit["rise_ref_c"] is not None]
     rmses = [fit["rmse_c"] for fit in fits]
@@ -780,6 +852,9 @@ def fit_history(db: Database, now: float, lookback_days: float = 120.0,
         tau_fits=len(taus),
         rise_fits=len(rises),
         fit_rmse_c=median(rmses) if rmses else None,
+        current_exp=exponent,
+        current_exp_fits=exp_fits,
+        current_exp_se=exp_se,
     )
 
 
@@ -1155,21 +1230,36 @@ def _minutes_to_trip(t_now: float, t_inf: float, tau_min: float) -> float | None
 SUGGEST_MARGIN_C = 2.0  # keep the suggested current's steady state this far under the trip
 
 
-def suggest_max_current(ambient_c: float, params: ThermalParams) -> float | None:
+def sustainable_max_current(ambient_c: float, params: ThermalParams) -> float | None:
     """Highest charge current whose steady-state handle temp stays safely
-    below the trip point at the given ambient — the alternative to letting
-    the charger fold back to a blunt 50%. Vehicles take whole amps, so the
-    value is floored. None when even a minimal rate would trip (or when no
-    cap is needed at all, i.e. full rate is already safe)."""
+    below the trip point at the given ambient, capped at the reference rate
+    (the Gen 3's own maximum, and as far as the model is validated). Vehicles
+    take whole amps, so the value is floored. None when even the J1772
+    minimum would trip.
+
+    Reported on every forecast so the amp controller can restore straight to
+    this rather than climb toward full rate in steps: one move to the
+    model's answer, with the trajectory and its confidence guard left to
+    trim the last amp or two. Worked from a measured ambient when a sensor
+    is reporting — see predict() for why the trajectory-implied one is only
+    the fallback."""
     headroom = TRIP_HANDLE_C - SUGGEST_MARGIN_C - ambient_c
     if headroom <= 0:
         return None
-    amps = math.floor(REF_CURRENT_A * math.sqrt(headroom / params.rise_ref_c))
+    amps = math.floor(params.current_for_rise(headroom))
     if amps < 6:  # J1772 floor — below this the vehicle won't charge anyway
         return None
-    if amps >= REF_CURRENT_A:
-        return None  # full rate is safe; no cap to suggest
-    return float(amps)
+    return float(min(amps, REF_CURRENT_A))
+
+
+def suggest_max_current(ambient_c: float, params: ThermalParams) -> float | None:
+    """The sustainable current as a *cap suggestion*: the alternative to
+    letting the charger fold back to a blunt 50%. None when no cap is needed
+    (full rate is already safe) or when even a minimal rate would trip."""
+    amps = sustainable_max_current(ambient_c, params)
+    if amps is None or amps >= REF_CURRENT_A:
+        return None
+    return amps
 
 
 def _project_t_inf(window: list[tuple[float, float]], tau_min: float) -> tuple[float, float | None]:
@@ -1222,8 +1312,8 @@ def _recent_steady_ambient(recent: list[dict], params: ThermalParams) -> float |
     mid-session current change resets the live trajectory window — but the
     buffer usually still holds an earlier steady run (this session's stretch
     before the change, or the previous session's tail). Its projected steady
-    state at that run's current implies the ambient, which the I^2 model then
-    rescales to the present current.
+    state at that run's current implies the ambient, which the current law
+    then rescales to the present current.
     """
     runs: list[list[dict]] = [[]]
     for sample in recent:
@@ -1244,7 +1334,7 @@ def _recent_steady_ambient(recent: list[dict], params: ThermalParams) -> float |
         window = [(sample["ts"], sample["handle_temp_c"]) for sample in run]
         t_inf, _se = _project_t_inf(window, params.tau_min)
         run_current = median(sample["vehicle_current_a"] for sample in run)
-        ambient = t_inf - params.rise_ref_c * (run_current / REF_CURRENT_A) ** 2
+        ambient = t_inf - params.rise_at(run_current)
         if -30.0 <= ambient <= TRIP_HANDLE_C:
             return ambient
     return None
@@ -1304,10 +1394,10 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
             forecast["steady_state_se_c"] = round(max(t_inf_se, 0.1), 2) if t_inf_se is not None else None
         else:
             # Too early at this current for a slope: model from ambient and
-            # the present current scaled by I^2. Ambient comes from the LAN
-            # sensor when one is reporting, else the idle stretch before the
-            # session, or — when sessions run back-to-back and there was
-            # none — from the newest steady run in the buffer.
+            # the present current through the install's current law. Ambient
+            # comes from the LAN sensor when one is reporting, else the idle
+            # stretch before the session, or — when sessions run back-to-back
+            # and there was none — from the newest steady run in the buffer.
             measured = _latest_measured_ambient(db, now)
             ambient, source = measured if measured is not None else (None, None)
             if ambient is None:
@@ -1325,7 +1415,7 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
                     gap_reason = "warming_up"
                 out["forecast"] = {"basis": "insufficient", "will_trip": None, "reason": gap_reason}
                 return out
-            t_inf = ambient + params.rise_ref_c * (current / REF_CURRENT_A) ** 2
+            t_inf = ambient + params.rise_at(current)
             forecast["basis"] = "model"
             forecast["ambient_source"] = source
             # A model-basis plateau is only as good as its ambient: a sensor
@@ -1336,19 +1426,31 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
         # below the handle is real, not noise — it's what cooling toward a
         # lower equilibrium looks like after a current cut or a derate.
         minutes = _minutes_to_trip(last["handle_temp_c"], t_inf, tau_min)
+        # Ambient implied by the steady state at this current: today's
+        # conditions read back through the model. Accurate near the
+        # reference current, where most fits are; at a low current it
+        # carries the current law's extrapolation error, and that error
+        # returns doubled when rescaled to a high current. So the sustainable
+        # current is worked from a measured ambient whenever a sensor is
+        # reporting — interpolation inside the fitted data rather than a
+        # round trip to 32 A and back (on one install, after a 32 A probe,
+        # the implied route named 47 A; the measured one 44 A, which held).
+        implied_ambient = t_inf - params.rise_at(current)
+        measured = _latest_measured_ambient(db, now)
+        sustain_ambient, sustain_source = measured if measured is not None else (implied_ambient, "implied")
         forecast.update(
             {
                 "steady_state_c": round(t_inf, 1),
                 "will_trip": minutes is not None,
                 "minutes_to_trip": round(minutes, 1) if minutes is not None else None,
                 "trip_ts": last["ts"] + minutes * 60.0 if minutes is not None else None,
+                "sustainable_max_a": sustainable_max_current(sustain_ambient, params),
+                "sustainable_ambient_source": sustain_source,
             }
         )
         if minutes is not None:
-            # Ambient implied by the steady state at this current; from it,
-            # the highest cap that avoids the trip (and the 50% foldback).
-            ambient = t_inf - params.rise_ref_c * (current / REF_CURRENT_A) ** 2
-            forecast["suggested_max_a"] = suggest_max_current(ambient, params)
+            # The highest cap that avoids the trip (and the 50% foldback).
+            forecast["suggested_max_a"] = suggest_max_current(implied_ambient, params)
         out["forecast"] = forecast
         return out
 
@@ -1381,6 +1483,7 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
             "trip_ts": None,
             "safe_ambient_max_c": round(TRIP_HANDLE_C - params.rise_ref_c, 1),
             "suggested_max_a": suggest_max_current(ambient, params) if minutes is not None else None,
+            "sustainable_max_a": sustainable_max_current(ambient, params),
         }
         return out
 
