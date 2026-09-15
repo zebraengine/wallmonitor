@@ -21,14 +21,24 @@ the trip point before a fresh trajectory window could confirm and act again.
 
 **Restoring up is the risky direction** — it's what pushes the equilibrium
 back toward the trip point — so it stays conservative on every axis: only
-``trajectory`` basis (this session's own proven data, never ``model``), only
-one ``--restore-step-a`` at a time rather than snapping straight back to
-``--normal-amps``, and never while the handle is still within
-``--restore-margin-c`` of the trip point even if the trajectory reads clear.
-The same 2026-08-03 session showed why: capping straight back to 48A the
-moment a trajectory read clear, twice, immediately restarted the climb both
-times, converting a caught derate into three near-misses before the third
-one wasn't caught in time.
+``trajectory`` basis (this session's own proven data, never ``model``), never
+while the handle is still within ``--restore-margin-c`` of the trip point
+even if the trajectory reads clear, and never straight back to
+``--normal-amps`` on trust. The same 2026-08-03 session showed why: capping
+straight back to 48A the moment a trajectory read clear, twice, immediately
+restarted the climb both times, converting a caught derate into three
+near-misses before the third one wasn't caught in time.
+
+Where it restores *to* is the server's ``sustainable_max_a``: the highest
+current whose modelled plateau stays under the trip point at today's ambient
+(the LAN sensor when one reports, else the ambient the live trajectory
+implies). One move there, then the trajectory and the confidence guard trim
+the last amp or two. The alternative — climbing
+``--restore-step-a`` at a time — resets the trajectory window at every rung
+and took half an hour to find the same number. The model is trusted once per
+session: after a quick reversal it has already been wrong about today, and
+the climb falls back to single ``--restore-step-a`` steps (and to that ladder
+entirely against a server that doesn't report the field).
 
 Earlier live testing (2026-08-01, a full 48A session) is why ``hypothetical``
 basis is never trusted at all: it leans on the historical per-install
@@ -43,8 +53,7 @@ with the vehicle using the least-privilege ``CHARGING_MANAGER`` role.
 A cap fully lifts three ways, in order of how eagerly they should fire:
 1. the trajectory forecast reports ``will_trip: false`` for
    ``--confirm-ticks`` consecutive polls *and* the handle has real margin
-   below the trip point, stepped up ``--restore-step-a`` at a time — see
-   above;
+   below the trip point, restored to the sustainable current — see above;
 2. the charging session ends (``state`` leaves ``charging``) — the normal,
    expected end of any cap, restored immediately since there's no more
    climb to protect against;
@@ -346,8 +355,8 @@ def _decide_thermal(thermal: dict, state: State, cfg: Config) -> tuple[Action, S
         )
 
     # Restore path: deliberately narrower than the cap path. Only
-    # `trajectory` basis (never `model`), only a step at a time, gated on
-    # real thermal margin, and backed off exponentially after repeated
+    # `trajectory` basis (never `model`), never on trust to full rate, gated
+    # on real thermal margin, and backed off exponentially after repeated
     # quick reversals — see the module docstring for the incidents that
     # justify every one of these guards.
     if basis == "trajectory" and will_trip is False:
@@ -382,7 +391,16 @@ def _decide_thermal(thermal: dict, state: State, cfg: Config) -> tuple[Action, S
                         f"(need {cfg.restore_margin_c:g}C): holding {state.cap_value:g}A"
                     ),
                 )
-            next_value = min(cfg.normal_amps, state.cap_value + cfg.restore_step_a)
+            # One move to the model's sustainable current when the server
+            # reports one, instead of a 2 A ladder that resets the trajectory
+            # window at every rung. The model is trusted once per session:
+            # after a quick reversal it has already been wrong about this
+            # session, so the climb falls back to single steps.
+            step_value = state.cap_value + cfg.restore_step_a
+            sustainable = forecast.get("sustainable_max_a")
+            jump = isinstance(sustainable, (int, float)) and state.restore_attempts == 0
+            next_value = min(cfg.normal_amps, max(step_value, float(sustainable)) if jump else step_value)
+            how = "jumping" if jump and next_value > step_value else "stepping up"
             step_state = replace(next_state, clear_streak=0, last_step_up_ts=now_ts)
             if next_value >= cfg.normal_amps:
                 final_state = replace(step_state, capped=False, cap_value=None)
@@ -396,7 +414,7 @@ def _decide_thermal(thermal: dict, state: State, cfg: Config) -> tuple[Action, S
                 Action("cap", next_value),
                 final_state,
                 (
-                    f"trajectory clear, {margin_c:.1f}C of margin: stepping up to {next_value:g}A "
+                    f"trajectory clear, {margin_c:.1f}C of margin: {how} to {next_value:g}A "
                     f"(still under {cfg.normal_amps:g}A)"
                 ),
             )
@@ -470,17 +488,37 @@ def _apply_probe(
             return Action("none"), new_state, "probe holding (no timestamp to age it against)"
         held_min = (now_ts - prev.probe_started_ts) / 60.0
         if held_min >= cfg.probe_hold_min:
+            done = replace(
+                new_state, probe_started_ts=None, last_probe_ts=now_ts, clear_streak=0, trip_streak=0
+            )
+            # The probe's own plateau is the best measurement of today's
+            # conditions the session will ever have, and the server has
+            # already turned it into the sustainable current. Go there.
+            # Snapping to normal_amps instead, on a day the model already
+            # knew full rate would trip, cost a 32 -> 48 -> 42 A oscillation.
+            sustainable = (thermal.get("forecast") or {}).get("sustainable_max_a")
+            if isinstance(sustainable, (int, float)) and sustainable < cfg.normal_amps:
+                target = float(sustainable)
+                if target <= cfg.probe_amps:
+                    return (
+                        Action("none"),
+                        replace(done, capped=True, cap_value=cfg.probe_amps),
+                        (
+                            f"probe complete: held {cfg.probe_amps:g}A for {held_min:.0f}min; "
+                            f"sustainable {target:g}A is no higher, holding"
+                        ),
+                    )
+                return (
+                    Action("cap", target),
+                    replace(done, capped=True, cap_value=target, last_step_up_ts=now_ts),
+                    (
+                        f"probe complete: held {cfg.probe_amps:g}A for {held_min:.0f}min, "
+                        f"restoring to the sustainable {target:g}A"
+                    ),
+                )
             return (
                 Action("restore", cfg.normal_amps),
-                replace(
-                    new_state,
-                    probe_started_ts=None,
-                    last_probe_ts=now_ts,
-                    capped=False,
-                    cap_value=None,
-                    clear_streak=0,
-                    trip_streak=0,
-                ),
+                replace(done, capped=False, cap_value=None),
                 (
                     f"probe complete: held {cfg.probe_amps:g}A for {held_min:.0f}min, "
                     f"restoring to {cfg.normal_amps:g}A"
@@ -643,8 +681,9 @@ def main(argv: list[str] | None = None) -> int:
         "--restore-step-a",
         type=float,
         default=2.0,
-        help="raise the cap by at most this much per confirmed-clear cycle, "
-        "instead of snapping straight back to --normal-amps (default %(default)s)",
+        help="raise the cap by this much per confirmed-clear cycle when the server reports no "
+        "sustainable current, or after the model has already been wrong once this session "
+        "(default %(default)s)",
     )
     parser.add_argument(
         "--restore-margin-c",

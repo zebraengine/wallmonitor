@@ -335,7 +335,8 @@ def _seed_idle(db, t_from, t_to, ambient_c, dt=10.0):
 
 def _seed_thermal_session(db, start_ts, ambient_c, tau_s=720.0, rise_ref_c=36.0,
                           amps=48.6, charge_s=1500.0, dt=10.0,
-                          ambient_end_c=None, cooldown_s=0.0, sag_to_a=None):
+                          ambient_end_c=None, cooldown_s=0.0, sag_to_a=None,
+                          current_exp=2.0):
     """Idle lead-in plus a charging ramp that follows the first-order model.
 
     With ambient_end_c set, ambient drifts linearly across the charge (the
@@ -353,7 +354,7 @@ def _seed_thermal_session(db, start_ts, ambient_c, tau_s=720.0, rise_ref_c=36.0,
     _seed_idle(db, start_ts - 1800, start_ts, ambient_c, dt)
     sid = db.start_session(start_ts)
     t0_temp = thermal.idle_handle_c(ambient_c)
-    rise_at = rise_ref_c * (amps / thermal.REF_CURRENT_A) ** 2
+    rise_at = rise_ref_c * (amps / thermal.REF_CURRENT_A) ** current_exp
     integrate = ambient_end_c is not None or sag_to_a is not None
     temp = t0_temp
     ts = start_ts
@@ -370,7 +371,7 @@ def _seed_thermal_session(db, start_ts, ambient_c, tau_s=720.0, rise_ref_c=36.0,
         if integrate:
             ambient_now = ambient_c if ambient_end_c is None else \
                 ambient_c + (ambient_end_c - ambient_c) * elapsed
-            rise_now = rise_ref_c * (amps_now / thermal.REF_CURRENT_A) ** 2
+            rise_now = rise_ref_c * (amps_now / thermal.REF_CURRENT_A) ** current_exp
             temp += dt * ((ambient_now + rise_now - temp) / tau_s)
         ts += dt
     db.close_session(sid, start_ts + charge_s, "vehicle_disconnected")
@@ -392,6 +393,43 @@ async def test_thermal_fit_recovers_model(db):
     assert params.fitted and params.tau_fits == 1 and params.rise_fits == 1
     assert abs(params.tau_min - 12.0) < 1.5
     assert abs(params.rise_ref_c - 36.0) < 3.0
+    # One current cannot identify how rise scales with current: the prior stands.
+    assert params.current_exp == thermal.DEFAULT_CURRENT_EXP and params.current_exp_fits == 0
+
+
+async def test_thermal_fits_the_current_exponent_from_a_current_spread(db):
+    # A handle whose rise falls off more gently than I^2 as current drops
+    # (part of the heat is current-independent). Seeded with n = 1.5 at
+    # three currents; the fitter must recover n rather than assume 2, and
+    # re-normalize every fit's rise_ref_c with it so the 48 A number comes
+    # out the same from every current.
+    now = time.time()
+    for i, amps in enumerate((48.6, 32.0, 40.0, 48.6, 32.0, 40.0)):
+        _seed_thermal_session(db, now - (7 - i) * 7200, ambient_c=25.0, amps=amps, current_exp=1.5)
+    fits = thermal.fit_sessions(db, now)
+    params = thermal.fit_history(db, now, fits=fits)
+    assert params.current_exp_fits == 6
+    assert abs(params.current_exp - 1.5) < 0.15
+    assert params.current_exp_se is not None and params.current_exp_se < 0.15
+    assert abs(params.rise_ref_c - 36.0) < 2.0
+    for fit in fits:
+        assert abs(fit["rise_ref_c"] - 36.0) < 2.5, fit
+    # Under the I^2 prior the same 32 A windows would have read ~5 C high.
+    low = [fit for fit in fits if fit["current_a"] < 33.0]
+    assert all(fit["rise_c"] * (48.0 / fit["current_a"]) ** 2 > 40.0 for fit in low)
+
+
+def test_thermal_sustainable_current_follows_the_fitted_exponent():
+    square = thermal.ThermalParams(rise_ref_c=36.0, current_exp=2.0)
+    gentle = thermal.ThermalParams(rise_ref_c=36.0, current_exp=1.5)
+    # 40 C ambient leaves 23 C of headroom under trip minus margin.
+    assert thermal.sustainable_max_current(40.0, square) == 38.0
+    assert thermal.sustainable_max_current(40.0, gentle) == 35.0
+    # Cool enough for full rate: sustainable saturates at the reference
+    # current, and there is no cap to suggest.
+    assert thermal.sustainable_max_current(20.0, square) == 48.0
+    assert thermal.suggest_max_current(20.0, square) is None
+    assert thermal.suggest_max_current(40.0, gentle) == 35.0
 
 
 async def test_thermal_predict_charging_trajectory(db):
@@ -410,6 +448,8 @@ async def test_thermal_predict_charging_trajectory(db):
     # Seeded ambient 35.4 C implies a ~42 A cap avoids the trip entirely.
     assert forecast["suggested_max_a"] is not None
     assert abs(forecast["suggested_max_a"] - 42.0) <= 1.0
+    # ...and that same number is what a restore should aim for.
+    assert forecast["sustainable_max_a"] == forecast["suggested_max_a"]
 
 
 async def test_thermal_predict_cooling_after_current_cut(db):
@@ -443,6 +483,11 @@ async def test_thermal_predict_cooling_after_current_cut(db):
     assert out["state"] == "charging"
     forecast = out["forecast"]
     assert forecast["basis"] == "trajectory"
+    # No trip predicted, so no cap is *suggested* — but the sustainable
+    # current is reported regardless: it is what a restore climbs back to.
+    assert forecast.get("suggested_max_a") is None
+    assert isinstance(forecast["sustainable_max_a"], float)
+    assert 30.0 < forecast["sustainable_max_a"] < 48.0
     assert forecast["will_trip"] is False
     # Cooling toward ~49 C while the handle still reads ~56 C.
     assert forecast["steady_state_c"] < out["handle_c"] - 3.0

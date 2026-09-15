@@ -34,12 +34,25 @@ reality. `model` and `trajectory` are trusted, but **not symmetrically**:
   alert 40 fired inside exactly that gap during live testing.
 - **Restoring up is the risky direction** (it's what pushes the equilibrium
   back toward the trip point), so it stays conservative on every axis: only
-  `trajectory` basis, one `--restore-step-a` at a time rather than snapping
-  straight back to `--normal-amps`, and never while the handle is within
-  `--restore-margin-c` of the trip point even if the trajectory reads clear.
-  Snapping straight back to full current, twice, immediately restarted the
-  climb both times during live testing — turning a caught derate into
-  repeated near-misses before a third one wasn't caught in time.
+  `trajectory` basis, never straight back to `--normal-amps` on trust, and
+  never while the handle is within `--restore-margin-c` of the trip point
+  even if the trajectory reads clear. Snapping straight back to full
+  current, twice, immediately restarted the climb both times during live
+  testing — turning a caught derate into repeated near-misses before a
+  third one wasn't caught in time.
+- **Where it restores *to* is the model's answer, in one move.** The server
+  reports `sustainable_max_a` on every forecast: the highest current whose
+  modelled plateau stays under the trip point at today's ambient (the LAN
+  sensor when one reports, else the ambient the live trajectory implies —
+  the sensor is preferred because a plateau measured at a low current
+  carries the current law's extrapolation error, and it comes back doubled
+  when rescaled to a high one). The daemon restores straight to that (or to full rate
+  when that is what it says), and lets the trajectory and the confidence
+  guard trim the last amp or two. It used to climb `--restore-step-a` at a
+  time instead — but every rung resets the trajectory window, so a climb
+  from 32 A took half an hour to find the same number. The model is trusted
+  once per session: after a quick reversal it has already been wrong about
+  today, and the climb falls back to single `--restore-step-a` steps.
 
 Either direction needs a signal held for `--confirm-ticks` consecutive polls
 (default 3) before acting — a single noisy fit can't flip a real amp change.
@@ -81,8 +94,8 @@ untrustworthy forecast is. As a window matures its SE shrinks, and the
 guard relaxes tick by tick on its own.
 
 A cap fully lifts three ways: the trajectory forecast reports the risk has
-passed *and* the handle has real thermal margin (stepped up gradually, see
-above), the charging session ends (restored immediately — no more climb to
+passed *and* the handle has real thermal margin (restored to the
+sustainable current, see above), the charging session ends (restored immediately — no more climb to
 protect against), or — a safety net — a new session starts while the
 daemon's on-disk state still says "capped" from a run that never saw its
 session close out (crash, restart, etc.). That last case always restores
@@ -125,7 +138,11 @@ sudo ./deploy/install-derate-amp-control.sh --tesla-ble http://<esp32-host> --pr
 
 Once every `--probe-interval-days` (default 30), the first charging session
 to come along is held at `--probe-amps` for `--probe-hold-min` (default 40)
-minutes, then released. Pick a current low enough that neither this daemon
+minutes, then restored to the sustainable current its own plateau implies —
+the probe is the best measurement of today's conditions the session will
+get, so its end is the one moment a restore target is most trustworthy.
+(Releasing to full rate instead, on a day the model already knew full rate
+would trip, produced a 32 → 48 → 42 A oscillation.) Pick a current low enough that neither this daemon
 nor the vehicle wants to reduce it — on a 48 A install where foldback starts
 around 61 °C, 32 A plateaus near 53 °C with room to spare. Hold it for more
 than ~3x the install's time constant (`model.tau_min` in `/api/thermal`) so

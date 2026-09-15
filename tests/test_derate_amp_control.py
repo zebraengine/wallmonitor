@@ -58,6 +58,9 @@ def _thermal(
     steady_state_se_c: float | None = None,
     fit_rmse_c: float | None = 0.3,
     trip_c: float = 65.0,
+    # Absent by default: the ladder is the behavior against a server that
+    # doesn't report a sustainable current, and most tests pin that.
+    sustainable: float | None = None,
 ):
     return {
         "state": state,
@@ -72,6 +75,7 @@ def _thermal(
             "suggested_max_a": suggested,
             "steady_state_c": steady_state_c,
             "steady_state_se_c": steady_state_se_c,
+            "sustainable_max_a": sustainable,
         },
     }
 
@@ -173,6 +177,54 @@ def test_restore_steps_up_gradually_instead_of_snapping_to_full():
     # Each further step needs its OWN confirm cycle, not a free ride.
     action, state, _ = dac.decide(clear, state, cfg)
     assert action.kind == "none" and state.clear_streak == 1 and state.cap_value == 42.0
+
+
+def test_restore_jumps_to_the_sustainable_current_in_one_move():
+    # 2026-09-14: climbing 2 A at a time from a 32 A probe would have taken
+    # ~30 min to find the 44 A the model could name at once — every rung
+    # resets the trajectory window. With the server reporting a sustainable
+    # current, the first confirmed-clear restore goes straight there.
+    cfg = _cfg(confirm_ticks=1, restore_step_a=2.0, restore_margin_c=3.0)
+    state = dac.State(capped=True, cap_value=32.0, last_session_state="charging")
+    clear = _thermal(will_trip=False, mtt=None, suggested=None, handle_c=50.0, sustainable=44.0)
+    action, state, reason = dac.decide(clear, state, cfg)
+    assert action.kind == "cap" and action.value == 44.0
+    assert state.capped and state.cap_value == 44.0 and state.last_step_up_ts == clear["ts"]
+    assert "jumping to 44A" in reason
+
+
+def test_restore_jump_to_normal_amps_fully_lifts():
+    cfg = _cfg(confirm_ticks=1, restore_step_a=2.0, restore_margin_c=3.0)
+    state = dac.State(capped=True, cap_value=32.0, last_session_state="charging")
+    clear = _thermal(will_trip=False, mtt=None, suggested=None, handle_c=50.0, sustainable=48.0)
+    action, state, reason = dac.decide(clear, state, cfg)
+    assert action.kind == "restore" and action.value == 48.0
+    assert not state.capped and "fully restoring" in reason
+
+
+def test_restore_never_jumps_below_a_ladder_step():
+    # The trajectory is the measurement; if it reads clear with margin, a
+    # model that says "you are already at the limit" doesn't get to hold
+    # the cap where it is. The old single step is the floor for progress.
+    cfg = _cfg(confirm_ticks=1, restore_step_a=2.0, restore_margin_c=3.0)
+    state = dac.State(capped=True, cap_value=40.0, last_session_state="charging")
+    clear = _thermal(will_trip=False, mtt=None, suggested=None, handle_c=50.0, sustainable=39.0)
+    action, state, reason = dac.decide(clear, state, cfg)
+    assert action.kind == "cap" and action.value == 42.0
+    assert "stepping up to 42A" in reason
+
+
+def test_restore_falls_back_to_the_ladder_after_a_quick_reversal():
+    # The model is trusted once per session. A jump that got capped again
+    # is the model having been wrong about today; the next climb crawls.
+    cfg = _cfg(confirm_ticks=1, restore_step_a=2.0, restore_margin_c=3.0)
+    state = dac.State(capped=True, cap_value=40.0, last_session_state="charging", restore_attempts=1)
+    clear = _thermal(will_trip=False, mtt=None, suggested=None, handle_c=50.0, sustainable=46.0)
+    action, state, _ = dac.decide(clear, state, cfg)
+    assert action.kind == "none"  # backoff: 1 * 2^1 = 2 confirming polls now
+    action, state, reason = dac.decide(clear, state, cfg)
+    assert action.kind == "cap" and action.value == 42.0
+    assert "stepping up" in reason
 
 
 def test_restore_fully_lifts_once_the_step_reaches_normal_amps():
@@ -530,6 +582,8 @@ def test_probe_holds_against_the_restore_path():
 
 
 def test_probe_completes_after_the_hold_and_restores():
+    # No sustainable current from the server (older wallmonitor): release
+    # to full rate as before.
     held = dac.State(
         last_session_state="charging", capped=True, cap_value=32.0,
         probe_started_ts=1_000_000.0 - 41 * 60,
@@ -539,6 +593,45 @@ def test_probe_completes_after_the_hold_and_restores():
     assert "probe complete" in reason
     assert new.probe_started_ts is None and new.last_probe_ts == 1_000_000.0
     assert not new.capped
+
+
+def test_probe_completes_to_the_sustainable_current():
+    # 2026-09-14, first live probe: released to 48 A on a day the idle
+    # forecast had already said full rate would trip, so the controller had
+    # to cap again 3.5 min later (32 -> 48 -> 42 A). The probe's own plateau
+    # is the best measurement of the day; its end goes straight to the
+    # current that plateau implies is sustainable.
+    held = dac.State(
+        last_session_state="charging", capped=True, cap_value=32.0,
+        probe_started_ts=1_000_000.0 - 41 * 60,
+    )
+    action, new, reason = dac.decide(_thermal(will_trip=False, sustainable=44.0), held, _probe_cfg())
+    assert action.kind == "cap" and action.value == 44.0
+    assert "probe complete" in reason and "sustainable 44A" in reason
+    assert new.capped and new.cap_value == 44.0
+    assert new.probe_started_ts is None and new.last_probe_ts == 1_000_000.0
+    # Counts as a step-up, so a cap soon after is a quick reversal and backs off.
+    assert new.last_step_up_ts == 1_000_000.0
+
+
+def test_probe_completes_holding_when_nothing_higher_is_sustainable():
+    held = dac.State(
+        last_session_state="charging", capped=True, cap_value=32.0,
+        probe_started_ts=1_000_000.0 - 41 * 60,
+    )
+    action, new, reason = dac.decide(_thermal(will_trip=False, sustainable=30.0), held, _probe_cfg())
+    assert action.kind == "none"
+    assert new.capped and new.cap_value == 32.0 and "holding" in reason
+    assert new.probe_started_ts is None and new.last_probe_ts == 1_000_000.0
+
+
+def test_probe_completes_to_full_rate_when_that_is_sustainable():
+    held = dac.State(
+        last_session_state="charging", capped=True, cap_value=32.0,
+        probe_started_ts=1_000_000.0 - 41 * 60,
+    )
+    action, new, _ = dac.decide(_thermal(will_trip=False, sustainable=48.0), held, _probe_cfg())
+    assert action.kind == "restore" and action.value == 48.0 and not new.capped
 
 
 def test_safety_cap_below_probe_current_wins_and_abandons_the_probe():

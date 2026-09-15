@@ -23,6 +23,17 @@ the trip happens.
   the default has a standing cost — the fitter judges a charge's window
   against the default τ, so only charges of ~22 min or more at steady
   current teach the model there.
+- **How rise scales with current is fitted too.** Joule heating says rise
+  ∝ I², and that is the prior — but a real handle carries heat that does
+  not scale with current (the charger's own electronics, cable heat soak),
+  so measured plateaus fall off more gently as current drops. On one
+  install a 32 A probe settled 4 °C above what I² predicted, and every
+  forecast at an off-reference current inherited the error — including
+  the current the amp controller was told to restore to. Once the
+  free-running fits span ≥ 6 A of current, the exponent *n* in
+  rise = rise₄₈ · (I/48)ⁿ is fitted by log-log regression (`current_exp`
+  in `/api/thermal`, with its standard error), every fit's `rise_ref_c` is
+  re-normalized with it, and the model note says so.
 - **The charger is its own thermometer.** Idle, the handle sits ~1–2 °C above
   ambient (an ambient-dependent offset), so ambient can be read without any
   extra sensor. The offset model ships as a seed from one install and is
@@ -165,7 +176,7 @@ coefficient. The reported Δ is that slope times the observed span.
 It did once compare a recent median against a baseline median, and that
 asks the wrong question. "Are the last few fits higher?" is answered for
 you by anything that moved with the calendar: a garage that cooled between
-the two halves, or a vehicle capped to a lower current whose (48/I)²
+the two halves, or a vehicle capped to a lower current whose (48/I)ⁿ
 normalization then lifts every recent fit at once. On one install the
 split reported **+7.2 °C with a 95 % CI of [5.4, 9.1]** — "statistically
 confirmed" — for a connector whose rise, regressed on time with ambient and
@@ -223,10 +234,11 @@ row. More sessions either confirm it or dissolve it.
   typical and pooled the operating current out of its own comparison).
 - **Pooled across a wide current band when the fits are clean.**
   Ambient-bracketed fits join from a wider band, and the regression's own
-  current term then *adjusts* them: residual error in the I² normalization
-  lands on that coefficient instead of masquerading as a trend. On the
-  install above that coefficient read −0.99 °C per amp, which is the whole
-  of the phantom +7.2 °C. The band is wide enough on purpose to admit a
+  current term then *adjusts* them: residual error in the current
+  normalization lands on that coefficient instead of masquerading as a
+  trend. On the install above, under the I² prior, that coefficient read
+  −0.99 °C per amp, which is the whole of the phantom +7.2 °C — and is
+  what the fitted exponent now removes at the source. The band is wide enough on purpose to admit a
   [calibration probe](amp-control.md#the-calibration-probe).
 - **Never only stale sessions.** If none of the newest few free-running
   charges make it into the comparison, the install has moved to a current
