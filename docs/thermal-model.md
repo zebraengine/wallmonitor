@@ -179,18 +179,50 @@ current from each ambient on offer under each current law, with the scored
 session left out of the fit. Errors are predicted minus actual; negative is
 optimistic, the direction that trips the charger.
 
-What it showed on the first run, over 74 sessions (40 runs long enough to
-score): the model-basis forecast was optimistic by **3–4 °C** on median and
-by more than 2 °C four times in five; the mature trajectory forecast by
-about 1 °C; every cross-current method by 2.5–5 °C at a step-down. The
-error grows with ambient — about 1 °C on mild days, 3–5 °C above 30 °C —
-which is the same ambient coefficient the degradation watch's regression
-had been reporting (0.35 °C/°C) and that the confidence interval alone did
-not make convincing. The sensor reads the garage air; the handle's
-environment runs hotter than the air by an amount that grows with the
-heat. The fitted current exponent beat the I² prior everywhere it was
-scored, and the whole-run τ ran 1–2 min longer than the 30-minute fit
-windows' 11.25, which is where the trajectory's residual optimism comes
+**The history is not a neutral sample, and the tool has to say so.** The
+current and the ambient a run happened at were chosen by the controller
+and by the charger, on the strength of this same model, and that
+contaminates the truths three ways. The charger trims current as the
+handle nears the trip point and then *holds* it there, so a run whose
+current sagged has a plateau that is a setpoint, not an equilibrium —
+those are excluded and counted (20 of the 52 long-enough runs on one
+install). A run whose true plateau lay above the trip point tripped,
+folded back and ended before it could become truth — so the clean tables
+censor exactly the optimistic errors that matter, and every run that
+tripped is listed instead with what each method predicted for it. And
+because the controller caps on hot days, *hot* and *low current* arrive
+together in the data, so an ambient effect and a current-law error wear
+the same signature.
+
+The correction for the censoring is to score every free-running run that
+was cut short — capped, tripped, or simply ended after at least one time
+constant — against **its own trajectory projection**, with the
+projection's standard error reported alongside. The projection needs no
+ambient and no current law, so it is an independent reading of where the
+run was heading, and the hot-day full-rate population lives almost
+entirely in that table.
+
+What it showed, once corrected, on 74 sessions: the first pass — clean
+truths only — read the model-basis forecast as optimistic by 3–4 °C, worst
+on hot days, and an ambient term fitted to that would have "fixed" it. The
+de-censored pass reversed the finding. At full-rate cold starts, hot days
+included, the model is **unbiased** (+0.3 °C median from the sensor,
+|median| 0.7, none optimistic by more than 2 °C; +0.7 from the idle
+proxy over 18 runs). The optimism is a **history effect**: a step-down
+right after a hot full-rate run reads 2.8–3.6 °C optimistic from the
+sensor, because the cable and connector are still heat-soaked from the
+run before, and the previous run's trajectory-implied ambient — which
+carries that state — cuts it to 0.7–1.4 °C. That is why caps are worked
+from the implied ambient and restores from the sensor, and why the
+[degradation watch](#the-confounder-the-fits-cant-remove) reads an
+"ambient coefficient" on an install whose hot days are also its
+heaviest-charging days. A model with a second, slow time constant for the
+cable would carry the effect properly; it needs designed data — probes at
+one current with a cold cable and a warm one — not more of the history.
+
+The fitted current exponent beat the I² prior in every de-censored cell
+below 48 A, and the whole-run τ ran 1–2 min longer than the 30-minute fit
+windows', which is where the mature trajectory's residual 1 °C comes
 from.
 
 ## Degradation watch

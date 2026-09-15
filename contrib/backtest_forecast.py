@@ -26,8 +26,26 @@ Two questions, scored separately:
 
 Ground truth is the plateau observed in a run that held its current for at
 least --observe-tau time constants: an exponential fitted to the whole run
-with tau free, the same fit the model's own parameters come from. Shorter
-runs are still inputs (they imply an ambient) but never truth.
+with tau free, the same fit the model's own parameters come from (or, with
+--truth last, the handle's own final minutes). Shorter runs are still
+inputs (they imply an ambient) but never truth.
+
+The history is not a neutral sample, and the tool says so rather than
+pretending. The charger trims current itself as the handle nears the trip
+point and then holds it there, so a plateau from a run whose current
+sagged is a setpoint, not an equilibrium: those runs are excluded from
+truth and counted. A run whose true plateau lay above the trip point
+tripped, folded back and ended, so it never lasted long enough to become
+truth: that censors exactly the optimistic errors this tool exists to
+find. Two things are done about it. Every run that tripped is listed with
+what each method predicted for it — a prediction under the trip point is a
+miss the tables cannot show. And every free-running run that was cut short
+(capped, tripped, or simply ended) after at least one time constant is
+scored against its own trajectory projection, with that projection's
+standard error reported alongside, as a proxy truth: the projection needs
+no ambient and no current law, so it is an independent reading of where
+the run was heading. The hot-day full-rate population lives almost
+entirely in that table.
 
 Errors are predicted minus actual. Negative is optimistic — the handle ran
 hotter than promised — which is the direction that trips the charger.
@@ -62,6 +80,8 @@ PROBE_MIN_S = 1800.0
 HOT_AMBIENT_C = 29.0
 WARM_START_C = 3.0  # handle this far above its idle level at a session's first run
 BUCKETS_MIN = ((2, 5), (5, 10), (10, 20))
+PROXY_MIN_TAU = 1.0  # a cut-short run is projected only once it has run this long
+PROXY_MAX_SE_C = 1.5  # ...and only if the projection is this sure of itself
 
 
 @dataclass
@@ -86,6 +106,11 @@ class Run:
     kind: str = ""  # cold_start | warm_start | step_down | step_up
     probe: bool = False
     hot: bool = False
+    sag_a: float = 0.0
+    free: bool = True  # current held flat end to end: the plateau is the connector's own equilibrium
+    tripped: bool = False  # alert 40 raised inside this run: its plateau was above the trip point
+    projected_c: float | None = None  # proxy truth for a cut-short run: its own trajectory projection
+    projected_se_c: float | None = None
 
     @property
     def span_s(self) -> float:
@@ -113,6 +138,7 @@ class BoundaryScore:
     to_a: float
     actual_c: float
     predictions: dict[str, float]  # "<ambient>/<law>" -> predicted plateau
+    se_c: float | None = None  # set when actual_c is a projection rather than an observation
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +178,13 @@ def observe_plateau(run: Run, tau_min: float, observe_tau: float, truth: str) ->
     samples = run.samples
     span = run.span_s
     run.max_c = max(temp for _, temp in samples)
+    if not run.free or run.tripped:
+        # A regulated run's plateau is a setpoint the charger chose; a run
+        # that tripped has a plateau above the trip point that was never
+        # observed. Neither is a truth the forecast can be scored against —
+        # both are counted, because leaving them out silently censors
+        # exactly the optimistic errors this tool exists to find.
+        return
     tail = [temp for ts, temp in samples if samples[-1][0] - ts <= 180.0]
     run.last_c = median(tail) if tail else None
     fit = thermal._fit_exponential(samples)
@@ -166,6 +199,23 @@ def observe_plateau(run: Run, tau_min: float, observe_tau: float, truth: str) ->
             run.plateau_c = fit[1]
     elif span >= (observe_tau + 2.0) * tau_min * 60.0 and run.last_c is not None:
         run.plateau_c = run.last_c
+
+
+def project_cut_short(run: Run, tau_min: float) -> None:
+    """Proxy truth for a run that ended before its plateau: where its own
+    trajectory was heading, with the projection's standard error. Only for
+    free-running runs — a regulated run's trajectory flattens because the
+    current fell — that ran at least PROXY_MIN_TAU and project with an SE
+    under PROXY_MAX_SE_C. A run that tripped qualifies: the projection is
+    the plateau it would have reached had the charger let it."""
+    if run.plateau_c is not None or not run.free or run.span_s < PROXY_MIN_TAU * tau_min * 60.0:
+        return
+    if len(run.samples) < thermal.TRAJECTORY_MIN_SAMPLES:
+        return
+    t_inf, se = thermal._project_t_inf(run.samples, tau_min)
+    if se is None or se > PROXY_MAX_SE_C:
+        return
+    run.projected_c, run.projected_se_c = t_inf, se
 
 
 def params_without(fits: list[dict], sid: int, current_exp: float | None = None) -> thermal.ThermalParams:
@@ -204,7 +254,14 @@ def build_runs(db: Database, sess: dict, params: thermal.ThermalParams, observe_
             current_a=median(row["vehicle_current_a"] for row in raw), samples=samples,
             handle_start_c=samples[0][1],
         )
+        run.sag_a = thermal._current_sag_a(raw)
+        run.free = thermal._free_plateau(raw, run.sag_a)
+        run.tripped = any(
+            alert.get("alert") == "40" and run.start_ts <= alert["first_ts"] <= run.end_ts + 60
+            for alert in db.alerts_range(run.start_ts, run.end_ts + 60)
+        )
         observe_plateau(run, params.tau_min, observe_tau, truth)
+        project_cut_short(run, params.tau_min)
         measured = thermal._measured_ambient(db, run.start_ts - thermal.MEASURED_AMBIENT_WINDOW_S, run.start_ts + 60)
         run.sensor_ambient_c = measured[0] if measured is not None else None
         if index == 0:
@@ -250,32 +307,39 @@ def score_ticks(run: Run, params: thermal.ThermalParams) -> list[TickScore]:
     return scores
 
 
-def score_boundary(run: Run, prev: Run | None, laws: dict[str, thermal.ThermalParams]) -> BoundaryScore | None:
-    """What each ambient, under each current law, would have predicted for
-    the plateau at this run's current, from what was known when it started."""
-    if run.plateau_c is None:
-        return None
+def predictions_for(run: Run, prev: Run | None, laws: dict[str, thermal.ThermalParams]) -> dict[str, float]:
+    """What each ambient, under each current law, predicts for the plateau
+    at this run's current, from what was known when it started."""
     ambients: dict[str, float] = {}
     if run.sensor_ambient_c is not None:
         ambients["sensor"] = run.sensor_ambient_c
     if prev is None:
         if run.idle_ambient_c is not None:
             ambients["idle"] = run.idle_ambient_c
-    else:
-        if prev.implied_ambient_c is not None:
-            ambients["implied"] = prev.implied_ambient_c
-            if run.sensor_ambient_c is not None:
-                ambients["warmer"] = max(run.sensor_ambient_c, prev.implied_ambient_c)
-    if not ambients:
-        return None
-    predictions = {
+    elif prev.implied_ambient_c is not None:
+        ambients["implied"] = prev.implied_ambient_c
+        if run.sensor_ambient_c is not None:
+            ambients["warmer"] = max(run.sensor_ambient_c, prev.implied_ambient_c)
+    return {
         f"{name}/{law}": ambient + params.rise_at(run.current_a)
         for name, ambient in ambients.items()
         for law, params in laws.items()
     }
+
+
+def score_boundary(run: Run, prev: Run | None, laws: dict[str, thermal.ThermalParams]) -> BoundaryScore | None:
+    """The cross-current prediction at this run's start against what the
+    run reached — its observed plateau, or for a cut-short run its own
+    projection (flagged by se_c)."""
+    actual, se = (run.plateau_c, None) if run.plateau_c is not None else (run.projected_c, run.projected_se_c)
+    if actual is None:
+        return None
+    predictions = predictions_for(run, prev, laws)
+    if not predictions:
+        return None
     return BoundaryScore(
         run.session_id, run.kind, run.probe, run.hot,
-        prev.current_a if prev is not None else None, run.current_a, run.plateau_c, predictions,
+        prev.current_a if prev is not None else None, run.current_a, actual, predictions, se,
     )
 
 
@@ -298,16 +362,46 @@ def _stats(errors: list[float]) -> str:
 STATS_HEADER = f"{'n':>5} {'bias':>6} {'|med|':>6} {'|p90|':>6} {'opt':>5}"
 
 
+def _boundary_table(boundaries: list[BoundaryScore], kinds: list[str], with_se: bool = False) -> None:
+    methods = sorted({m for b in boundaries for m in b.predictions})
+    groups: list[tuple[str, list[BoundaryScore]]] = [(kind, [b for b in boundaries if b.kind == kind]) for kind in kinds]
+    groups += [("probe", [b for b in boundaries if b.probe]), ("hot", [b for b in boundaries if b.hot]),
+               ("all", boundaries)]
+    for label, group in groups:
+        if not group:
+            continue
+        se_note = f", projection SE median {median(b.se_c for b in group):.2f} C" if with_se else ""
+        print(f"  {label} ({len(group)} changes{se_note})          {STATS_HEADER}")
+        for method in methods:
+            errors = [b.predictions[method] - b.actual_c for b in group if method in b.predictions]
+            if errors:
+                print(f"    {method:<14} {_stats(errors)}")
+
+
 def report(runs: list[Run], ticks: list[TickScore], boundaries: list[BoundaryScore],
-           params: thermal.ThermalParams, observe_tau: float) -> None:
+           params: thermal.ThermalParams, observe_tau: float,
+           trip_predictions: dict[tuple[int, int], dict[str, float]]) -> None:
     observed = [run for run in runs if run.plateau_c is not None]
     print(
         f"model: tau {params.tau_min:.2f} min, rise {params.rise_ref_c:.1f} C at {thermal.REF_CURRENT_A:g} A, "
         f"n = {params.current_exp:.2f} ({params.current_exp_fits} fits)"
     )
+    long_enough = [run for run in runs if run.span_s >= observe_tau * params.tau_min * 60.0]
+    regulated = [run for run in long_enough if not run.free]
+    tripped = [run for run in runs if run.tripped]
+    projected = [run for run in runs if run.projected_c is not None]
     print(
         f"runs: {len(runs)} steady-current runs in {len({run.session_id for run in runs})} sessions; "
-        f"{len(observed)} held >= {observe_tau:g} tau and are scored as truth"
+        f"{len(long_enough)} held >= {observe_tau:g} tau, of which {len(observed)} are scored as truth"
+    )
+    print(
+        f"  not truth: {len(regulated)} regulated (current sagged > {thermal.FREE_CURRENT_SAG_FRAC:.1%} — the "
+        f"charger chose that plateau); {len(tripped)} runs tripped (plateau above {thermal.TRIP_HANDLE_C:g} C, "
+        f"never observed)"
+    )
+    print(
+        f"  proxy truth: {len(projected)} free-running runs cut short after >= {PROXY_MIN_TAU:g} tau, scored "
+        f"against their own projection (SE <= {PROXY_MAX_SE_C:g} C) in the last table"
     )
     kinds = sorted({run.kind for run in observed})
     print("  by kind:", ", ".join(f"{kind} {sum(1 for r in observed if r.kind == kind)}" for kind in kinds),
@@ -337,18 +431,25 @@ def report(runs: list[Run], ticks: list[TickScore], boundaries: list[BoundarySco
     print("   ambient: sensor = LAN/car sensor at the change; implied = previous run's trajectory through the")
     print("   current law; warmer = max(sensor, implied); idle = handle before the session (session start only)")
     print("   law: I2 = the I^2 prior; n = the install's fitted exponent, scored session left out")
-    methods = sorted({m for b in boundaries for m in b.predictions})
-    groups: list[tuple[str, list[BoundaryScore]]] = [(kind, [b for b in boundaries if b.kind == kind]) for kind in kinds]
-    groups += [("probe", [b for b in boundaries if b.probe]), ("hot", [b for b in boundaries if b.hot]),
-               ("all", boundaries)]
-    for label, group in groups:
-        if not group:
-            continue
-        print(f"  {label} ({len(group)} changes)          {STATS_HEADER}")
-        for method in methods:
-            errors = [b.predictions[method] - b.actual_c for b in group if method in b.predictions]
-            if errors:
-                print(f"    {method:<14} {_stats(errors)}")
+    clean = [b for b in boundaries if b.se_c is None]
+    proxy = [b for b in boundaries if b.se_c is not None]
+    _boundary_table(clean, kinds)
+    if tripped:
+        print()
+        print("== Runs that tripped: what each method predicted for a plateau that was in fact above the trip point")
+        print("   (a prediction under 65 C is an optimistic miss the tables above cannot show)")
+        for run in tripped:
+            preds = trip_predictions.get((run.session_id, run.index), {})
+            summary = ", ".join(f"{m} {v:.1f}" for m, v in sorted(preds.items()))
+            print(f"  s{run.session_id:<4} run{run.index} {run.kind:<10} {run.current_a:5.1f}A "
+                  f"{run.span_s / 60:4.0f}min max {run.max_c:.1f} | {summary or 'no ambient known'}")
+    if proxy:
+        print()
+        print("== Cut-short runs: the same prediction against the run's own trajectory projection (proxy truth)")
+        print("   These are the runs the controller capped or the charger tripped — the population the clean")
+        print("   tables cannot contain. The projection needs no ambient and no current law.")
+        proxy_kinds = sorted({b.kind for b in proxy})
+        _boundary_table(proxy, proxy_kinds, with_se=True)
     print()
 
 
@@ -379,6 +480,7 @@ def main(argv: list[str] | None = None) -> int:
     runs: list[Run] = []
     ticks: list[TickScore] = []
     boundaries: list[BoundaryScore] = []
+    trip_predictions: dict[tuple[int, int], dict[str, float]] = {}
     for sess in sessions:
         laws = {
             "n": params_without(fits, sess["id"]),
@@ -386,10 +488,13 @@ def main(argv: list[str] | None = None) -> int:
         }
         session_runs = build_runs(db, sess, laws["n"], args.observe_tau, idle_model, args.truth)
         for index, run in enumerate(session_runs):
+            prev = session_runs[index - 1] if index else None
             ticks.extend(score_ticks(run, laws["n"]))
-            boundary = score_boundary(run, session_runs[index - 1] if index else None, laws)
+            boundary = score_boundary(run, prev, laws)
             if boundary is not None:
                 boundaries.append(boundary)
+            if run.tripped:
+                trip_predictions[(run.session_id, run.index)] = predictions_for(run, prev, laws)
             if args.verbose:
                 fmt = lambda value: f"{value:5.1f}" if value is not None else "    -"  # noqa: E731
                 print(
@@ -397,12 +502,14 @@ def main(argv: list[str] | None = None) -> int:
                     f"{run.span_s / 60:5.0f}min handle {run.handle_start_c:5.1f} -> last {fmt(run.last_c)} "
                     f"max {fmt(run.max_c)} | fit {fmt(run.fit_c)} (tau {fmt(run.fit_tau_min)}) "
                     f"30min-fit {fmt(run.window_c)} | truth {fmt(run.plateau_c)} | "
-                    f"sensor {fmt(run.sensor_ambient_c)} implied {fmt(run.implied_ambient_c)}"
+                    f"sensor {fmt(run.sensor_ambient_c)} implied {fmt(run.implied_ambient_c)} sag {run.sag_a:+.1f}"
                     f"{' probe' if run.probe else ''}{' hot' if run.hot else ''}"
+                    f"{'' if run.free else ' REGULATED'}{' TRIPPED' if run.tripped else ''}"
+                    f"{f' proj {run.projected_c:.1f}±{run.projected_se_c:.2f}' if run.projected_c is not None else ''}"
                 )
         runs.extend(session_runs)
 
-    report(runs, ticks, boundaries, params, args.observe_tau)
+    report(runs, ticks, boundaries, params, args.observe_tau, trip_predictions)
     if args.json:
         with open(args.json, "w") as fh:
             json.dump(
