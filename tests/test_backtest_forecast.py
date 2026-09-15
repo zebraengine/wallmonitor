@@ -103,6 +103,27 @@ def test_backtest_scores_a_cold_start_and_a_step_down(db, tmp_path, capsys):
     assert {m.split("/")[0] for m in start[0]["predictions"]} == {"sensor", "idle"}
 
 
+def test_backtest_tags_probe_runs_from_the_controller_event(db, tmp_path, capsys):
+    now = time.time()
+    for i in range(4):
+        _seed(db, now - (8 - i) * 7200, ambient_c=25.0, steps=[(48.6, 2400)])
+    start = now - 7200
+    sid = _seed(db, start, ambient_c=25.0, steps=[(48.6, 2700), (32.0, 2700)])
+    db.add_event(start + 2700 - 20, "amp_capped", {
+        "to_a": 32.0, "reason": "calibration probe due (warm cable): capping to 32A for 40min",
+        "probe": {"amps": 32.0, "cable": "warm"},
+    })
+    out = tmp_path / "bt.json"
+    assert bt.main(["--db", str(tmp_path / "test.db"), "--json", str(out)]) == 0
+    import json
+    data = json.loads(out.read_text())
+    step = [r for r in data["runs"] if r["session_id"] == sid and r["kind"] == "step_down"]
+    assert len(step) == 1 and step[0]["probe"] is True and step[0]["probe_cable"] == "warm"
+    assert "probe 32A warm" in capsys.readouterr().out
+    # The full-rate run before it is not a probe.
+    assert not [r for r in data["runs"] if r["session_id"] == sid and r["kind"] == "cold_start"][0]["probe"]
+
+
 def test_split_runs_drops_ramp_samples_and_splits_on_a_current_change():
     def row(i, amps, closed=1):
         return {"ts": 1000.0 + 2.0 * i, "contactor_closed": closed, "vehicle_current_a": amps, "handle_temp_c": 30.0}

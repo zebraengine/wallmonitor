@@ -371,4 +371,7 @@ thing that stops the regression from separating a cap from a trend.
 The [amp controller](amp-control.md#the-calibration-probe) automates it —
 `--probe-amps 32` — because the component that moves charge current is the
 one that can hold it still on purpose. Without the controller, setting the
-vehicle's charge limit by hand once a month does the same job.
+vehicle's charge limit by hand once a month does the same job. A [probe
+plan](amp-control.md#a-probe-plan) — two currents, each with a cold cable
+and a warm one — is the designed experiment the
+[backtest](#measuring-the-forecast) asked for.

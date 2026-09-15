@@ -19,6 +19,8 @@ import importlib.util
 import pathlib
 import sys
 
+import pytest
+
 spec = importlib.util.spec_from_file_location(
     "derate_amp_control",
     pathlib.Path(__file__).parent.parent / "contrib" / "derate_amp_control.py",
@@ -670,6 +672,142 @@ def test_probe_does_not_start_from_a_lower_thermal_cap():
     assert new.probe_started_ts is None
 
 
+def _plan_cfg(**kw):
+    kw.setdefault("probe_amps", (32.0, 40.0))
+    kw.setdefault("probe_cable", ("cold", "warm"))
+    kw.setdefault("probe_replicates", 2)
+    kw.setdefault("probe_plan_interval_days", 7.0)
+    kw.setdefault("probe_interval_days", 30.0)
+    kw.setdefault("probe_hold_min", 40.0)
+    kw.setdefault("probe_cold_gap_h", 4.0)
+    kw.setdefault("probe_warm_min", 30.0)
+    return _cfg(**kw)
+
+
+def _simulate(cfg, days, session_min=120, sessions_per_day=1, start_state=None, capped_at=None):
+    """Walk decide() through `days` of daily charging sessions, 30 s ticks,
+    the car following every cap instantly and a clear, cool forecast
+    throughout (sustainable = full rate). Returns (probe starts as
+    [(day, minute_into_session, amps, cable)], final state)."""
+    t0 = 1_000_000.0
+    # A fresh state file knows no previous charge, so day 0 could never be
+    # cold-cable; give the daemon a last charge 12 h before the timeline.
+    state = start_state or dac.State(last_charging_ts=t0 - 12 * 3600)
+    starts = []
+    for day in range(days):
+        for n in range(sessions_per_day):
+            begin = t0 + day * 86400 + n * (24 * 3600 / sessions_per_day)
+            # an idle tick shortly before charging begins
+            _, state, _ = dac.decide(_thermal(state="idle", ts=begin - 60, current_a=0.0), state, cfg)
+            ts = begin
+            while ts < begin + session_min * 60:
+                if capped_at is not None:
+                    current = capped_at
+                    state = dac.replace(state, capped=True, cap_value=capped_at) if not state.probe_started_ts else state
+                else:
+                    current = state.cap_value if state.capped and state.cap_value else cfg.normal_amps
+                snap = _thermal(will_trip=False, mtt=None, suggested=None, handle_c=45.0, ts=ts,
+                                current_a=current, sustainable=cfg.normal_amps)
+                action, state, reason = dac.decide(snap, state, cfg)
+                if action.probe is not None:
+                    starts.append((day, round((ts - begin) / 60), action.probe["amps"], action.probe["cable"]))
+                ts += 30.0
+            _, state, _ = dac.decide(_thermal(state="idle", ts=ts + 60, current_a=0.0), state, cfg)
+    return starts, state
+
+
+def test_probe_plan_visits_every_condition_least_replicated_first_then_goes_monthly():
+    starts, state = _simulate(_plan_cfg(), days=85)
+    # Weekly while collecting: cold probes open a session, warm ones wait
+    # for 30 min at full rate in the same session; then two of each and the
+    # cadence relaxes to monthly, cycling from the top of the plan again.
+    assert [(d, a, c) for d, _, a, c in starts] == [
+        (0, 32.0, "cold"), (7, 32.0, "warm"), (14, 40.0, "cold"), (21, 40.0, "warm"),
+        (28, 32.0, "cold"), (35, 32.0, "warm"), (42, 40.0, "cold"), (49, 40.0, "warm"),
+        (79, 32.0, "cold"),
+    ]
+    assert all(m == 0 for _, m, _, c in starts if c == "cold")
+    assert all(m == 30 for _, m, _, c in starts if c == "warm")
+    assert len(state.probes_done) == 9
+    assert {(p["amps"], p["cable"]) for p in state.probes_done[:8]} == {
+        (32.0, "cold"), (32.0, "warm"), (40.0, "cold"), (40.0, "warm")}
+    assert not state.capped  # every probe restored afterwards
+
+
+def test_probe_cold_needs_a_long_gap_since_the_last_charge():
+    # Sessions two hours apart never let the cable cool: a cold-only plan
+    # starts nothing, however overdue it gets.
+    busy = dac.State(last_charging_ts=1_000_000.0 - 3600)
+    starts, _ = _simulate(_plan_cfg(probe_cable=("cold",)), days=21, session_min=60, sessions_per_day=12,
+                          start_state=busy)
+    assert starts == []
+    # A fresh state file knows no previous charge: the first session cannot
+    # be called cold, the second can.
+    starts, _ = _simulate(_plan_cfg(probe_cable=("cold",)), days=2, start_state=dac.State())
+    assert [(d, m) for d, m, _, _ in starts] == [(1, 0)]
+    # ...and a daemon upgraded mid-session does not know when it began.
+    mid = dac.State(last_session_state="charging", last_charging_ts=1_000_000.0 - 30)
+    action, new, _ = dac.decide(_thermal(will_trip=False, ts=1_000_000.0), mid, _plan_cfg(probe_cable=("cold",)))
+    assert action.probe is None and new.charging_since_ts is None
+
+
+def test_probe_warm_needs_full_rate_uncapped_first():
+    # With a thermal cap standing the current is not full rate, so a
+    # warm-only plan cannot start; the restore path is not blocked by the
+    # wait either.
+    starts, _ = _simulate(_plan_cfg(probe_cable=("warm",)), days=8, capped_at=40.0)
+    assert starts == []
+    # Uncapped, it starts exactly at the warm threshold and never at the session's opening.
+    starts, _ = _simulate(_plan_cfg(probe_cable=("warm",)), days=8)
+    assert [(d, m) for d, m, _, _ in starts] == [(0, 30), (7, 30)]
+
+
+def test_probe_waits_for_the_condition_that_needs_it_most_unless_overdue():
+    cfg = _plan_cfg(probe_amps=(32.0,))
+    done = [{"ts": 1.0, "amps": 32.0, "cable": "cold"}] * 2  # cold has its replicates, warm has none
+    last_charge = 1_000_000.0 - 12 * 3600
+    fresh = dac.State(probes_done=done, last_probe_ts=1_000_000.0 - 8 * 86400, last_charging_ts=last_charge)
+    starts, _ = _simulate(cfg, days=1, start_state=fresh)
+    assert [(m, c) for _, m, _, c in starts] == [(30, "warm")]  # cold was eligible at minute 0 and was passed over
+    # Fifteen days since the last probe — more than twice the plan interval
+    # — and the slot goes to whatever is eligible now.
+    overdue = dac.State(probes_done=done, last_probe_ts=1_000_000.0 - 15 * 86400, last_charging_ts=last_charge)
+    starts, _ = _simulate(cfg, days=1, start_state=overdue)
+    assert [(m, c) for _, m, _, c in starts] == [(0, "cold")]
+
+
+def test_probe_single_current_any_cable_keeps_the_monthly_cadence():
+    # The pre-plan configuration: one current, whenever due. The plan
+    # interval and the replicate count must not touch it.
+    starts, _ = _simulate(_probe_cfg(probe_replicates=2, probe_plan_interval_days=7.0), days=45)
+    assert [(d, c) for d, _, _, c in starts] == [(0, "any"), (30, "any")]
+
+
+def test_probe_one_per_session():
+    # A 3 h session with a 32 A cold probe complete at 40 min: the warm
+    # condition becomes eligible later in the same session and must wait
+    # for the next one.
+    starts, _ = _simulate(_plan_cfg(probe_amps=(32.0,)), days=2, session_min=180)
+    assert [(d, c) for d, _, _, c in starts] == [(0, "cold")]  # day 1 is inside the 7-day interval
+
+
+def test_probe_start_event_carries_its_condition():
+    action = dac.Action("cap", 40.0, probe={"amps": 40.0, "cable": "warm"})
+    kind, detail = dac.event_for(action, "calibration probe due (warm cable)", _thermal(), dac.State())
+    assert kind == "amp_capped" and detail["probe"] == {"amps": 40.0, "cable": "warm"}
+    _, plain = dac.event_for(dac.Action("cap", 44.0), "trip", _thermal(), dac.State())
+    assert "probe" not in plain
+
+
+def test_probe_cli_parses_a_plan_and_rejects_a_bad_one(capsys):
+    unreachable = ["--tesla-ble", "http://127.0.0.1:1", "--wallmonitor", "http://127.0.0.1:1", "--dry-run"]
+    assert dac.main(["--probe-amps", "32,40", "--probe-cable", "cold,warm", *unreachable]) == 0
+    assert "cannot reach wallmonitor" in capsys.readouterr().err
+    for bad in (["--probe-cable", "any,cold"], ["--probe-cable", "hot"], ["--probe-amps", "32,x"], ["--probe-amps", "60"]):
+        with pytest.raises(SystemExit):
+            dac.main([*bad, *unreachable])
+
+
 def test_probe_state_survives_an_old_state_file(tmp_path):
     # A daemon upgrade reads state written before the probe existed. It must
     # default the new fields rather than crash — and a probe must then be
@@ -684,3 +822,11 @@ def test_probe_state_survives_an_old_state_file(tmp_path):
     # and the round-trip back to disk keeps the new fields
     dac.save_state(str(path), dac.State(probe_started_ts=1.0, last_probe_ts=2.0))
     assert dac.load_state(str(path)).last_probe_ts == 2.0
+    # A hold in progress recorded before the plan existed carries no
+    # current; that daemon had exactly one, and the hold continues at it.
+    path.write_text('{"capped": true, "cap_value": 32.0, "last_session_state": "charging", '
+                    '"probe_started_ts": 999000.0}')
+    state = dac.load_state(str(path))
+    assert state.probes_done == [] and state.probe_amps is None
+    action, new, reason = dac.decide(_thermal(will_trip=False), state, _probe_cfg())
+    assert action.kind == "none" and "probe holding 32A" in reason and new.cap_value == 32.0
