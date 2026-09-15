@@ -31,9 +31,11 @@ near-misses before the third one wasn't caught in time.
 
 Where it restores *to* is the server's ``sustainable_max_a``: the highest
 current whose modelled plateau stays under the trip point at today's ambient
-(the LAN sensor when one reports, else the ambient the live trajectory
-implies). One move there, then the trajectory and the confidence guard trim
-the last amp or two. The alternative — climbing
+(whichever of the LAN sensor and the live trajectory says the handle has
+less headroom — the sensor misses a cable still warm from the last charge,
+the trajectory misreads ambient at a current far from the fits). One move
+there, then the trajectory and the confidence guard trim the last amp or
+two. The alternative — climbing
 ``--restore-step-a`` at a time — resets the trajectory window at every rung
 and took half an hour to find the same number. The model is trusted once per
 session: after a quick reversal it has already been wrong about today, and

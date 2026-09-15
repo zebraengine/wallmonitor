@@ -471,6 +471,32 @@ async def test_thermal_predict_charging_trajectory(db):
     assert abs(forecast["suggested_max_a"] - 42.0) <= 1.0
     # ...and that same number is what a restore should aim for.
     assert forecast["sustainable_max_a"] == forecast["suggested_max_a"]
+    assert forecast["sustainable_ambient_source"] == "implied"
+
+
+async def test_thermal_sustainable_uses_whichever_ambient_leaves_less_headroom(db):
+    # 2026-09-14, twice in one evening. A sensor reading cooler than the
+    # handle behaves (cable and wall still warm from the previous charge)
+    # would have named 48 A against a correct 46; two hours earlier the
+    # trajectory-implied ambient at the end of a 32 A probe (the current
+    # law extrapolated to its limit) would have named 47 against a correct
+    # 44. Neither source is trusted over the other: the warmer one wins.
+    now = time.time()
+    start = now - 600
+    _seed_thermal_session(db, start, ambient_c=35.4, charge_s=600.0)
+    params = thermal.ThermalParams()
+    # Sensor says the garage is cooler than the handle's trajectory implies.
+    db.insert_ambient(now - 60, 28.0)
+    forecast = thermal.predict(db, now, params)["forecast"]
+    assert forecast["basis"] == "trajectory"
+    assert forecast["sustainable_ambient_source"] == "implied"
+    assert abs(forecast["sustainable_max_a"] - 42.0) <= 1.0
+    # Sensor says it is warmer than the trajectory implies: the sensor wins.
+    db.insert_ambient(now - 30, 38.0)
+    forecast = thermal.predict(db, now, params)["forecast"]
+    assert forecast["sustainable_ambient_source"] == "measured"
+    assert forecast["sustainable_max_a"] == thermal.sustainable_max_current(38.0, params)
+    assert forecast["sustainable_max_a"] < 42.0
 
 
 async def test_thermal_predict_cooling_after_current_cut(db):

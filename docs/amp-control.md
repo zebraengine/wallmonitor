@@ -42,11 +42,15 @@ reality. `model` and `trajectory` are trusted, but **not symmetrically**:
   third one wasn't caught in time.
 - **Where it restores *to* is the model's answer, in one move.** The server
   reports `sustainable_max_a` on every forecast: the highest current whose
-  modelled plateau stays under the trip point at today's ambient (the LAN
-  sensor when one reports, else the ambient the live trajectory implies —
-  the sensor is preferred because a plateau measured at a low current
-  carries the current law's extrapolation error, and it comes back doubled
-  when rescaled to a high one). The daemon restores straight to that (or to full rate
+  modelled plateau stays under the trip point at today's ambient. Two
+  ambients are on offer and each is optimistic in its own situation — the
+  LAN sensor reads the air but not a cable and wall still warm from the
+  previous charge (on one restart it said 25.6 °C while the handle behaved
+  like 28.7), and the ambient the live trajectory implies carries the
+  current law's extrapolation error at a low current, doubled on the way
+  back up (after a 32 A probe it named 47 A where 44 held) — so the one
+  that leaves the handle less headroom is used. The daemon restores
+  straight to that (or to full rate
   when that is what it says), and lets the trajectory and the confidence
   guard trim the last amp or two. It used to climb `--restore-step-a` at a
   time instead — but every rung resets the trajectory window, so a climb

@@ -1252,9 +1252,9 @@ def sustainable_max_current(ambient_c: float, params: ThermalParams) -> float | 
     Reported on every forecast so the amp controller can restore straight to
     this rather than climb toward full rate in steps: one move to the
     model's answer, with the trajectory and its confidence guard left to
-    trim the last amp or two. Worked from a measured ambient when a sensor
-    is reporting — see predict() for why the trajectory-implied one is only
-    the fallback."""
+    trim the last amp or two. predict() works it from whichever of the
+    sensor's ambient and the trajectory-implied one leaves less headroom —
+    each is optimistic in its own situation."""
     headroom = TRIP_HANDLE_C - SUGGEST_MARGIN_C - ambient_c
     if headroom <= 0:
         return None
@@ -1439,17 +1439,21 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
         # lower equilibrium looks like after a current cut or a derate.
         minutes = _minutes_to_trip(last["handle_temp_c"], t_inf, tau_min)
         # Ambient implied by the steady state at this current: today's
-        # conditions read back through the model. Accurate near the
-        # reference current, where most fits are; at a low current it
-        # carries the current law's extrapolation error, and that error
-        # returns doubled when rescaled to a high current. So the sustainable
-        # current is worked from a measured ambient whenever a sensor is
-        # reporting — interpolation inside the fitted data rather than a
-        # round trip to 32 A and back (on one install, after a 32 A probe,
-        # the implied route named 47 A; the measured one 44 A, which held).
+        # conditions read back through the model. Each ambient the
+        # sustainable current could be worked from is wrong in its own
+        # direction, so it is worked from whichever leaves the handle less
+        # headroom. The implied one carries the current law's extrapolation
+        # error at a low current, and that error returns doubled when
+        # rescaled to a high one (after a 32 A probe it named 47 A; the
+        # sensor's 30.3 C named 44 A, which held). The sensor reads the air,
+        # not the cable and wall still warm from the previous charge (on a
+        # restart 1.7 h after a long charge the sensor said 25.6 C and the
+        # handle behaved like 28.7 C: 48 A against a correct 46 A).
         implied_ambient = t_inf - params.rise_at(current)
         measured = _latest_measured_ambient(db, now)
-        sustain_ambient, sustain_source = measured if measured is not None else (implied_ambient, "implied")
+        sustain_ambient, sustain_source = implied_ambient, "implied"
+        if measured is not None and measured[0] > implied_ambient:
+            sustain_ambient, sustain_source = measured
         forecast.update(
             {
                 "steady_state_c": round(t_inf, 1),
