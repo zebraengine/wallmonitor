@@ -19,10 +19,10 @@ Two questions, scored separately:
    session start, what would the plateau at the *new* current have been
    predicted as from each ambient on offer — the LAN sensor, the ambient the
    previous run's trajectory implies, the warmer of the two, the idle handle
-   before the session — under each current law: the I^2 prior and the
-   install's fitted exponent, fitted with the scored session left out. This
-   is the number a restore, or the end of a calibration probe, is decided
-   on.
+   before the session — under each current law: the I^2 prior, the
+   install's fitted exponent, and the fitted exponent with the ambient
+   term, each fitted with the scored session left out. This is the number
+   a restore, or the end of a calibration probe, is decided on.
 
 Ground truth is the plateau observed in a run that held its current for at
 least --observe-tau time constants: an exponential fitted to the whole run
@@ -168,29 +168,19 @@ def observe_plateau(run: Run, tau_min: float, observe_tau: float, truth: str) ->
         run.plateau_c = run.last_c
 
 
-def params_without(fits: list[dict], sid: int, current_exp: float | None = None) -> thermal.ThermalParams:
-    """Model parameters from every fit but the scored session's own —
-    tau, the current exponent (or a forced one), and rise_ref under it."""
-    others = [fit for fit in fits if fit["session_id"] != sid]
-    if current_exp is None:
-        current_exp, exp_fits, exp_se = thermal._fit_current_exponent(others)
-    else:
-        exp_fits, exp_se = 0, None
-    taus = [fit["tau_min"] for fit in others]
-    rises = [
-        fit["rise_c"] * (thermal.REF_CURRENT_A / fit["current_a"]) ** current_exp
-        for fit in others
-        if fit.get("rise_c") is not None
-    ]
-    return thermal.ThermalParams(
-        tau_min=median(taus) if taus else thermal.DEFAULT_TAU_MIN,
-        rise_ref_c=median(rises) if rises else thermal.DEFAULT_RISE_REF_C,
-        tau_fits=len(taus),
-        rise_fits=len(rises),
-        current_exp=current_exp,
-        current_exp_fits=exp_fits,
-        current_exp_se=exp_se,
-    )
+LAWS = {
+    # name -> (exponent pinned?, ambient_coef pinned?) — None means fitted
+    "I2": dict(exponent=thermal.DEFAULT_CURRENT_EXP, ambient_coef=thermal.DEFAULT_AMBIENT_COEF),
+    "n": dict(ambient_coef=thermal.DEFAULT_AMBIENT_COEF),
+    "n+k": dict(),
+}
+
+
+def params_without(fits: list[dict], sid: int, **law) -> thermal.ThermalParams:
+    """Model parameters from every fit but the scored session's own, under a
+    current law with the given terms pinned (see LAWS)."""
+    others = [dict(fit) for fit in fits if fit["session_id"] != sid]
+    return thermal.params_from_fits(others, **law)
 
 
 def build_runs(db: Database, sess: dict, params: thermal.ThermalParams, observe_tau: float,
@@ -211,7 +201,7 @@ def build_runs(db: Database, sess: dict, params: thermal.ThermalParams, observe_
             run.idle_ambient_c = thermal._ambient_before(db, sess["start_ts"], idle_model)
         if len(samples) >= thermal.TRAJECTORY_MIN_SAMPLES:
             t_inf, _se = thermal._project_t_inf(samples, params.tau_min)
-            run.implied_ambient_c = t_inf - params.rise_at(run.current_a)
+            run.implied_ambient_c = params.ambient_from_plateau(t_inf, run.current_a)
         run.probe = run.current_a <= PROBE_CURRENT_FRAC * thermal.REF_CURRENT_A and run.span_s >= PROBE_MIN_S
         ambient_for_hot = run.sensor_ambient_c if run.sensor_ambient_c is not None else run.idle_ambient_c
         run.hot = ambient_for_hot is not None and ambient_for_hot >= HOT_AMBIENT_C
@@ -235,7 +225,7 @@ def score_ticks(run: Run, params: thermal.ThermalParams) -> list[TickScore]:
     scores: list[TickScore] = []
     t0 = run.start_ts
     model_sensor = (
-        run.sensor_ambient_c + params.rise_at(run.current_a) if run.sensor_ambient_c is not None else None
+        params.plateau_at(run.current_a, run.sensor_ambient_c) if run.sensor_ambient_c is not None else None
     )
     tick = FIRST_TICK_S
     while tick <= min(LAST_TICK_S, run.span_s):
@@ -269,7 +259,7 @@ def score_boundary(run: Run, prev: Run | None, laws: dict[str, thermal.ThermalPa
     if not ambients:
         return None
     predictions = {
-        f"{name}/{law}": ambient + params.rise_at(run.current_a)
+        f"{name}/{law}": params.plateau_at(run.current_a, ambient)
         for name, ambient in ambients.items()
         for law, params in laws.items()
     }
@@ -302,8 +292,9 @@ def report(runs: list[Run], ticks: list[TickScore], boundaries: list[BoundarySco
            params: thermal.ThermalParams, observe_tau: float) -> None:
     observed = [run for run in runs if run.plateau_c is not None]
     print(
-        f"model: tau {params.tau_min:.2f} min, rise {params.rise_ref_c:.1f} C at {thermal.REF_CURRENT_A:g} A, "
-        f"n = {params.current_exp:.2f} ({params.current_exp_fits} fits)"
+        f"model: tau {params.tau_min:.2f} min, rise {params.rise_ref_c:.1f} C at {thermal.REF_CURRENT_A:g} A "
+        f"and {thermal.AMBIENT_REF_C:g} C, n = {params.current_exp:.2f}, k = {params.ambient_coef:+.3f} C/C "
+        f"({params.current_exp_fits} fits)"
     )
     print(
         f"runs: {len(runs)} steady-current runs in {len({run.session_id for run in runs})} sessions; "
@@ -336,7 +327,8 @@ def report(runs: list[Run], ticks: list[TickScore], boundaries: list[BoundarySco
     print("== Cross-current prediction: plateau at the new current, from what was known at the change")
     print("   ambient: sensor = LAN/car sensor at the change; implied = previous run's trajectory through the")
     print("   current law; warmer = max(sensor, implied); idle = handle before the session (session start only)")
-    print("   law: I2 = the I^2 prior; n = the install's fitted exponent, scored session left out")
+    print("   law: I2 = the I^2 prior; n = fitted exponent; n+k = fitted exponent and ambient term;")
+    print("   each fitted with the scored session left out")
     methods = sorted({m for b in boundaries for m in b.predictions})
     groups: list[tuple[str, list[BoundaryScore]]] = [(kind, [b for b in boundaries if b.kind == kind]) for kind in kinds]
     groups += [("probe", [b for b in boundaries if b.probe]), ("hot", [b for b in boundaries if b.hot]),
@@ -380,13 +372,10 @@ def main(argv: list[str] | None = None) -> int:
     ticks: list[TickScore] = []
     boundaries: list[BoundaryScore] = []
     for sess in sessions:
-        laws = {
-            "n": params_without(fits, sess["id"]),
-            "I2": params_without(fits, sess["id"], current_exp=thermal.DEFAULT_CURRENT_EXP),
-        }
-        session_runs = build_runs(db, sess, laws["n"], args.observe_tau, idle_model, args.truth)
+        laws = {name: params_without(fits, sess["id"], **pins) for name, pins in LAWS.items()}
+        session_runs = build_runs(db, sess, laws["n+k"], args.observe_tau, idle_model, args.truth)
         for index, run in enumerate(session_runs):
-            ticks.extend(score_ticks(run, laws["n"]))
+            ticks.extend(score_ticks(run, laws["n+k"]))
             boundary = score_boundary(run, session_runs[index - 1] if index else None, laws)
             if boundary is not None:
                 boundaries.append(boundary)

@@ -96,7 +96,7 @@ def test_backtest_scores_a_cold_start_and_a_step_down(db, tmp_path, capsys):
     for method, predicted in step[0]["predictions"].items():
         assert abs(predicted - step[0]["actual_c"]) < 1.5, (method, predicted, step[0]["actual_c"])
     assert {m.split("/")[0] for m in step[0]["predictions"]} == {"sensor", "implied", "warmer"}
-    assert {m.split("/")[1] for m in step[0]["predictions"]} == {"I2", "n"}
+    assert {m.split("/")[1] for m in step[0]["predictions"]} == {"I2", "n", "n+k"}
     # ...and the session start is scored from the sensor and the idle handle.
     start = [b for b in data["boundaries"] if b["session_id"] == sid and b["kind"] == "cold_start"]
     assert len(start) == 1 and start[0]["from_a"] is None

@@ -199,6 +199,21 @@ DEFAULT_CURRENT_EXP = 2.0
 CURRENT_EXP_MIN_FITS = 4
 CURRENT_EXP_MIN_SPAN_A = 6.0
 CURRENT_EXP_RANGE = (1.0, 2.5)
+CURRENT_EXP_GRID_STEP = 0.02
+
+# The rise also grows with ambient: rise(I, a) = rise_ref * (I/48)^n +
+# k * (a - 25). The sensor reads the garage air, and the handle's
+# environment runs hotter than the air by an amount that scales with the
+# heat — sun on the wall, a heat-soaked structure and cable. Backtested over
+# 74 sessions with k = 0, the model-basis forecast was optimistic by ~1 C on
+# mild days and 3-5 C above 30 C, in 79% of ticks by more than 2 C, and the
+# degradation watch's regression had been reporting the same slope
+# (0.35 C/C) as an "ambient coefficient" for weeks. So it is a model term,
+# fitted from the same free-running fits once they span enough ambient,
+# and rise_ref_c means the rise at 48 A and 25 C.
+AMBIENT_REF_C = 25.0
+DEFAULT_AMBIENT_COEF = 0.0
+AMBIENT_COEF_MIN_SPREAD_C = 4.0
 
 # Fit acceptance gates: a segment must actually contain a thermal ramp and
 # the exponential must describe it well, or it teaches the model nothing.
@@ -220,7 +235,12 @@ RISE_RANGE_C = (10.0, 80.0)
 # scales with the same tau estimate (PREFIX_SPAN_TAU) so a slow-tau install
 # is not starved of fits by a fixed cap it can never clear.
 MIN_SPAN_TAU = 1.8
-PREFIX_SPAN_TAU = 2.5
+# The fit window runs to 4 tau (was 2.5, which the 30 min floor made moot at
+# a typical tau). Whole-run fits over the recorded history read tau 1-2 min
+# longer than the 30 min windows did, and that gap is where the trajectory
+# forecast's residual optimism came from: a window that ends at 2.7 tau has
+# seen 93% of the rise and still trades a little tau for a little rise.
+PREFIX_SPAN_TAU = 4.0
 PREFIX_SPAN_MIN_S = 1800.0
 # A steady run that ends within its first minute did not end; the ramp-up
 # was still wobbling. Vehicles overshoot on the way to a cap: one session
@@ -294,18 +314,35 @@ class ThermalParams:
     current_exp: float = DEFAULT_CURRENT_EXP
     current_exp_fits: int = 0
     current_exp_se: float | None = None
+    ambient_coef: float = DEFAULT_AMBIENT_COEF
+    ambient_coef_se: float | None = None
 
     @property
     def fitted(self) -> bool:
         return self.tau_fits > 0 and self.rise_fits > 0
 
-    def rise_at(self, current_a: float) -> float:
-        """Steady-state rise above ambient at a charge current."""
-        return self.rise_ref_c * (current_a / REF_CURRENT_A) ** self.current_exp
+    def rise_at(self, current_a: float, ambient_c: float = AMBIENT_REF_C) -> float:
+        """Steady-state rise above ambient at a charge current and ambient."""
+        return (
+            self.rise_ref_c * (current_a / REF_CURRENT_A) ** self.current_exp
+            + self.ambient_coef * (ambient_c - AMBIENT_REF_C)
+        )
+
+    def plateau_at(self, current_a: float, ambient_c: float) -> float:
+        return ambient_c + self.rise_at(current_a, ambient_c)
+
+    def ambient_from_plateau(self, plateau_c: float, current_a: float) -> float:
+        """plateau_at inverted: the ambient at which this current settles here."""
+        base = self.rise_ref_c * (current_a / REF_CURRENT_A) ** self.current_exp
+        return (plateau_c - base + self.ambient_coef * AMBIENT_REF_C) / (1.0 + self.ambient_coef)
 
     def current_for_rise(self, rise_c: float) -> float:
-        """The charge current whose steady-state rise is rise_c — rise_at inverted."""
+        """The charge current whose current-dependent rise is rise_c."""
         return REF_CURRENT_A * (rise_c / self.rise_ref_c) ** (1.0 / self.current_exp)
+
+    def safe_ambient_max_c(self) -> float:
+        """The ambient above which a full-rate charge settles at the trip point."""
+        return (TRIP_HANDLE_C - self.rise_ref_c + self.ambient_coef * AMBIENT_REF_C) / (1.0 + self.ambient_coef)
 
     # How far a fitted value may sit from the default before the dashboard
     # says the priors were a poor fit for this install. A heuristic, not a
@@ -352,6 +389,9 @@ class ThermalParams:
             "current_exp": round(self.current_exp, 2),
             "current_exp_fits": self.current_exp_fits,
             "current_exp_se": round(self.current_exp_se, 2) if self.current_exp_se is not None else None,
+            "ambient_coef": round(self.ambient_coef, 3),
+            "ambient_coef_se": round(self.ambient_coef_se, 3) if self.ambient_coef_se is not None else None,
+            "ambient_ref_c": AMBIENT_REF_C,
         }
 
 
@@ -810,51 +850,105 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
     return fits
 
 
-def _fit_current_exponent(fits: list[dict]) -> tuple[float, int, float | None]:
-    """The exponent n in rise = rise_ref * (I/48)^n, from free-running fits:
-    (n, fits used, standard error). The prior with no fits used when the
-    history cannot identify it — too few free-running fits, or all at one
-    current, where any n explains the data equally well.
+@dataclass(frozen=True)
+class CurrentLaw:
+    """How rise depends on current and ambient: rise = rise_ref * (I/48)^n
+    + k * (ambient - 25), with how many fits identified it and the standard
+    error of each fitted term (None for a term held at its prior)."""
 
-    Log-log least squares: ln(rise) = ln(rise_ref) + n * ln(I/48). Only
-    free-running windows count — a regulated window's plateau is lower for a
-    reason that has nothing to do with current, and those windows cluster at
-    high current, which would bend n downward for the wrong reason."""
+    exponent: float = DEFAULT_CURRENT_EXP
+    ambient_coef: float = DEFAULT_AMBIENT_COEF
+    fits: int = 0
+    exponent_se: float | None = None
+    ambient_coef_se: float | None = None
+
+
+def _fit_current_law(fits: list[dict], exponent: float | None = None,
+                     ambient_coef: float | None = None) -> CurrentLaw:
+    """Fit n and k from free-running fits; either can be pinned instead.
+
+    n is profiled over a grid: for each n the rise is linear in rise_ref
+    and k, so ordinary least squares gives both and the n with the smallest
+    residual wins. Its standard error comes from the curvature of the
+    residual sum of squares at the optimum. A term is only fitted when the
+    history moved enough to identify it — >= CURRENT_EXP_MIN_SPAN_A of
+    current for n, >= AMBIENT_COEF_MIN_SPREAD_C of ambient for k — and
+    stays at its prior otherwise. Only free-running windows count: a
+    regulated window's plateau is lower for a reason that has nothing to do
+    with current or ambient, and those windows cluster at high current on
+    hot days, which would bend both terms for the wrong reason."""
     points = [
-        (math.log(fit["current_a"] / REF_CURRENT_A), math.log(fit["rise_c"]))
+        (fit["current_a"], fit["ambient_c"], fit["rise_c"])
         for fit in fits
-        if fit.get("rise_c") is not None and fit["rise_c"] > 0
-        and fit.get("current_a") and fit.get("free_plateau", True)
+        if fit.get("rise_c") is not None and fit["rise_c"] > 0 and fit.get("current_a")
+        and fit.get("ambient_c") is not None and fit.get("free_plateau", True)
     ]
+    pinned = CurrentLaw(
+        exponent=DEFAULT_CURRENT_EXP if exponent is None else exponent,
+        ambient_coef=DEFAULT_AMBIENT_COEF if ambient_coef is None else ambient_coef,
+    )
     if len(points) < CURRENT_EXP_MIN_FITS:
-        return DEFAULT_CURRENT_EXP, 0, None
-    currents = [REF_CURRENT_A * math.exp(x) for x, _ in points]
-    if max(currents) - min(currents) < CURRENT_EXP_MIN_SPAN_A:
-        return DEFAULT_CURRENT_EXP, 0, None
-    result = _ols([y for _, y in points], [[1.0, x] for x, _ in points])
-    if result is None:
-        return DEFAULT_CURRENT_EXP, 0, None
-    beta, se, _resid, _dof = result
-    exponent = min(CURRENT_EXP_RANGE[1], max(CURRENT_EXP_RANGE[0], beta[1]))
-    return exponent, len(points), se[1]
+        return pinned
+    currents = [current for current, _, _ in points]
+    ambients = [ambient for _, ambient, _ in points]
+    rises = [rise for _, _, rise in points]
+    fit_n = exponent is None and max(currents) - min(currents) >= CURRENT_EXP_MIN_SPAN_A
+    fit_k = ambient_coef is None and max(ambients) - min(ambients) >= AMBIENT_COEF_MIN_SPREAD_C
+    if not fit_n and not fit_k:
+        return pinned
+    k_pinned = pinned.ambient_coef
+
+    def solve(n: float) -> tuple[list[float], list[float], float, int] | None:
+        # With k pinned its contribution is moved to the left-hand side.
+        y = rises if fit_k else [rise - k_pinned * (ambient - AMBIENT_REF_C) for ambient, rise in zip(ambients, rises)]
+        design = [
+            [(current / REF_CURRENT_A) ** n] + ([ambient - AMBIENT_REF_C] if fit_k else [])
+            for current, ambient in zip(currents, ambients)
+        ]
+        return _ols(y, design)
+
+    if not fit_n:
+        result = solve(pinned.exponent)
+        if result is None:
+            return pinned
+        beta, se, _resid, _dof = result
+        return CurrentLaw(pinned.exponent, beta[1], len(points), None, se[1])
+
+    steps = int(round((CURRENT_EXP_RANGE[1] - CURRENT_EXP_RANGE[0]) / CURRENT_EXP_GRID_STEP))
+    grid = [CURRENT_EXP_RANGE[0] + i * CURRENT_EXP_GRID_STEP for i in range(steps + 1)]
+    solved = [(n, solve(n)) for n in grid]
+    candidates = [(n, result) for n, result in solved if result is not None]
+    if not candidates:
+        return pinned
+    best_index = min(range(len(candidates)), key=lambda i: candidates[i][1][2])
+    n, (beta, se, resid_sd, dof) = candidates[best_index]
+    n_se = None
+    if 0 < best_index < len(candidates) - 1:
+        # SSE(n) is locally quadratic; Var(n) = 2 sigma^2 / SSE''(n).
+        sse = [candidates[i][1][2] ** 2 * dof for i in (best_index - 1, best_index, best_index + 1)]
+        curvature = (sse[0] - 2 * sse[1] + sse[2]) / CURRENT_EXP_GRID_STEP**2
+        if curvature > 0:
+            n_se = math.sqrt(2 * resid_sd**2 / curvature)
+    return CurrentLaw(n, beta[1] if fit_k else k_pinned, len(points), n_se, se[1] if fit_k else None)
 
 
-def fit_history(db: Database, now: float, lookback_days: float = 120.0,
-                fits: list[dict] | None = None) -> ThermalParams:
-    """Aggregate per-session fits into model parameters; defaults where thin.
+def params_from_fits(fits: list[dict], exponent: float | None = None,
+                     ambient_coef: float | None = None) -> ThermalParams:
+    """Model parameters from per-segment fits; defaults where thin.
 
-    Fits the install's current exponent first and re-normalizes every fit's
-    rise_ref_c with it, in place — so the fits handed on to the API and the
-    degradation watch, and the rise_ref_c median taken here, all share one
-    current law. With the I^2 prior, off-reference fits carry a bias that the
-    watch's current term then has to absorb; with a fitted exponent that
-    term has nothing left to explain."""
-    if fits is None:
-        fits = fit_sessions(db, now, lookback_days)
-    exponent, exp_fits, exp_se = _fit_current_exponent(fits)
+    Fits the current law first (either term can be pinned, for comparing
+    laws) and re-normalizes every fit's rise_ref_c under it, in place — so
+    the fits handed on to the API and the degradation watch, and the
+    rise_ref_c median taken here, all share one law. Under the I^2, k = 0
+    prior, off-reference and hot-day fits carry a bias that the watch's
+    current and ambient terms then have to absorb; under the fitted law
+    those terms have nothing left to explain."""
+    law = _fit_current_law(fits, exponent, ambient_coef)
     for fit in fits:
         if fit.get("rise_c") is not None and fit.get("current_a"):
-            fit["rise_ref_c"] = round(fit["rise_c"] * (REF_CURRENT_A / fit["current_a"]) ** exponent, 2)
+            ambient = fit.get("ambient_c")
+            adjusted = fit["rise_c"] - (law.ambient_coef * (ambient - AMBIENT_REF_C) if ambient is not None else 0.0)
+            fit["rise_ref_c"] = round(adjusted * (REF_CURRENT_A / fit["current_a"]) ** law.exponent, 2)
     taus = [fit["tau_min"] for fit in fits]
     rises = [fit["rise_ref_c"] for fit in fits if fit["rise_ref_c"] is not None]
     rmses = [fit["rmse_c"] for fit in fits]
@@ -864,10 +958,20 @@ def fit_history(db: Database, now: float, lookback_days: float = 120.0,
         tau_fits=len(taus),
         rise_fits=len(rises),
         fit_rmse_c=median(rmses) if rmses else None,
-        current_exp=exponent,
-        current_exp_fits=exp_fits,
-        current_exp_se=exp_se,
+        current_exp=law.exponent,
+        current_exp_fits=law.fits,
+        current_exp_se=law.exponent_se,
+        ambient_coef=law.ambient_coef,
+        ambient_coef_se=law.ambient_coef_se,
     )
+
+
+def fit_history(db: Database, now: float, lookback_days: float = 120.0,
+                fits: list[dict] | None = None) -> ThermalParams:
+    """Aggregate per-session fits into model parameters; defaults where thin."""
+    if fits is None:
+        fits = fit_sessions(db, now, lookback_days)
+    return params_from_fits(fits)
 
 
 # ---------------- degradation watch ----------------
@@ -1255,7 +1359,7 @@ def sustainable_max_current(ambient_c: float, params: ThermalParams) -> float | 
     trim the last amp or two. Worked from a measured ambient when a sensor
     is reporting — see predict() for why the trajectory-implied one is only
     the fallback."""
-    headroom = TRIP_HANDLE_C - SUGGEST_MARGIN_C - ambient_c
+    headroom = TRIP_HANDLE_C - SUGGEST_MARGIN_C - ambient_c - params.ambient_coef * (ambient_c - AMBIENT_REF_C)
     if headroom <= 0:
         return None
     amps = math.floor(params.current_for_rise(headroom))
@@ -1346,7 +1450,7 @@ def _recent_steady_ambient(recent: list[dict], params: ThermalParams) -> float |
         window = [(sample["ts"], sample["handle_temp_c"]) for sample in run]
         t_inf, _se = _project_t_inf(window, params.tau_min)
         run_current = median(sample["vehicle_current_a"] for sample in run)
-        ambient = t_inf - params.rise_at(run_current)
+        ambient = params.ambient_from_plateau(t_inf, run_current)
         if -30.0 <= ambient <= TRIP_HANDLE_C:
             return ambient
     return None
@@ -1427,7 +1531,7 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
                     gap_reason = "warming_up"
                 out["forecast"] = {"basis": "insufficient", "will_trip": None, "reason": gap_reason}
                 return out
-            t_inf = ambient + params.rise_at(current)
+            t_inf = params.plateau_at(current, ambient)
             forecast["basis"] = "model"
             forecast["ambient_source"] = source
             # A model-basis plateau is only as good as its ambient: a sensor
@@ -1447,7 +1551,7 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
         # reporting — interpolation inside the fitted data rather than a
         # round trip to 32 A and back (on one install, after a 32 A probe,
         # the implied route named 47 A; the measured one 44 A, which held).
-        implied_ambient = t_inf - params.rise_at(current)
+        implied_ambient = params.ambient_from_plateau(t_inf, current)
         measured = _latest_measured_ambient(db, now)
         sustain_ambient, sustain_source = measured if measured is not None else (implied_ambient, "implied")
         forecast.update(
@@ -1485,7 +1589,7 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
         out["ambient_se_c"] = 0.3 if measured is not None else idle_model.ambient_se_c
         out["ambient_stable"] = stable
         # Hypothetical: a full-rate session started right now.
-        t_inf = ambient + params.rise_ref_c
+        t_inf = params.plateau_at(REF_CURRENT_A, ambient)
         minutes = _minutes_to_trip(last["handle_temp_c"], t_inf, tau_min)
         out["forecast"] = {
             "basis": "hypothetical",
@@ -1493,7 +1597,7 @@ def predict(db: Database, now: float, params: ThermalParams) -> dict:
             "will_trip": minutes is not None,
             "minutes_to_trip": round(minutes, 1) if minutes is not None else None,
             "trip_ts": None,
-            "safe_ambient_max_c": round(TRIP_HANDLE_C - params.rise_ref_c, 1),
+            "safe_ambient_max_c": round(params.safe_ambient_max_c(), 1),
             "suggested_max_a": suggest_max_current(ambient, params) if minutes is not None else None,
             "sustainable_max_a": sustainable_max_current(ambient, params),
         }

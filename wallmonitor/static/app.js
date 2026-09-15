@@ -1145,8 +1145,10 @@ async function viewLive(root) {
     // The current law is a prior (I²) until this install's own fits span
     // enough current to measure it; say which one every forecast rests on.
     const expNote = model.current_exp_fits > 0
-      ? ` Heat rise scales as I^${fmtNum(model.current_exp, 2)} here (fitted across ${model.current_exp_fits} free-running ` +
-        "sessions; the I² prior over-reads how much lower currents cool the handle)."
+      ? ` Heat rise scales as I^${fmtNum(model.current_exp, 2)} here` +
+        (model.ambient_coef ? ` and grows ${fmtNum(model.ambient_coef, 2)} °C per °C of ambient above ${fmtNum(model.ambient_ref_c, 0)} °C` : "") +
+        ` (fitted across ${model.current_exp_fits} free-running sessions; the I² prior over-reads how much lower currents ` +
+        "cool the handle, and the garage air under-reads how hot the handle's surroundings run on a hot day)."
       : "";
     const modelNote = `Model: τ ≈ ${fmtNum(model.tau_min, 1)} min, +${fmtNum(model.rise_ref_c, 0)} °C at ${fmtNum(model.ref_current_a, 0)} A — ` +
       (model.fitted ? `fitted from ${model.tau_fits} recorded session ramp${model.tau_fits === 1 ? "" : "s"}.` + priorNote + expNote

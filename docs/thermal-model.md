@@ -31,9 +31,22 @@ the trip happens.
   forecast at an off-reference current inherited the error — including
   the current the amp controller was told to restore to. Once the
   free-running fits span ≥ 6 A of current, the exponent *n* in
-  rise = rise₄₈ · (I/48)ⁿ is fitted by log-log regression (`current_exp`
-  in `/api/thermal`, with its standard error), every fit's `rise_ref_c` is
-  re-normalized with it, and the model note says so.
+  rise = rise₄₈ · (I/48)ⁿ is fitted (`current_exp` in `/api/thermal`, with
+  its standard error), every fit's `rise_ref_c` is re-normalized with it,
+  and the model note says so.
+- **And so is how it scales with ambient.** The sensor reads the garage
+  air; the handle's environment runs hotter than the air by an amount that
+  grows with the heat — sun on the wall, a heat-soaked structure and cable.
+  [Backtested](#measuring-the-forecast) over 74 sessions, a model without
+  that term was optimistic by ~1 °C on mild days and 3–5 °C above 30 °C.
+  So the rise carries an ambient term, k · (ambient − 25 °C), fitted
+  jointly with *n* once the free-running fits span ≥ 4 °C of ambient
+  (`ambient_coef`, with its standard error; `rise_ref_c` is the rise at
+  48 A *and* 25 °C). On the install above k = 0.25 °C/°C. The
+  [degradation watch](#the-confounder-the-fits-cant-remove) had been
+  reporting the same slope as an unexplained "ambient coefficient" for
+  weeks; with the term in the model, that coefficient reads ~0 and the
+  watch is checking the model rather than doing its job for it.
 - **The charger is its own thermometer.** Idle, the handle sits ~1–2 °C above
   ambient (an ambient-dependent offset), so ambient can be read without any
   extra sensor. The offset model ships as a seed from one install and is
@@ -179,19 +192,34 @@ current from each ambient on offer under each current law, with the scored
 session left out of the fit. Errors are predicted minus actual; negative is
 optimistic, the direction that trips the charger.
 
-What it showed on the first run, over 74 sessions (40 runs long enough to
-score): the model-basis forecast was optimistic by **3–4 °C** on median and
-by more than 2 °C four times in five; the mature trajectory forecast by
-about 1 °C; every cross-current method by 2.5–5 °C at a step-down. The
-error grows with ambient — about 1 °C on mild days, 3–5 °C above 30 °C —
-which is the same ambient coefficient the degradation watch's regression
-had been reporting (0.35 °C/°C) and that the confidence interval alone did
-not make convincing. The sensor reads the garage air; the handle's
-environment runs hotter than the air by an amount that grows with the
-heat. The fitted current exponent beat the I² prior everywhere it was
-scored, and the whole-run τ ran 1–2 min longer than the 30-minute fit
-windows' 11.25, which is where the trajectory's residual optimism comes
-from.
+What it showed on its first run, over 74 sessions: the model-basis
+forecast was optimistic by **3–4 °C** on median and by more than 2 °C four
+times in five; every cross-current method by 2.5–5 °C at a step-down. The
+error grew with ambient — about 1 °C on mild days, 3–5 °C above 30 °C —
+which was the same ambient coefficient the degradation watch's regression
+had been reporting (0.35 °C/°C) and that its confidence interval alone had
+not made convincing. And the whole-run τ ran 1–2 min longer than the
+30-minute fit windows' 11.25, which is where the trajectory's residual
+optimism came from.
+
+Two model changes followed, each scored by the tool before it shipped: the
+ambient term above, and fit windows of 4 τ instead of 30 min. Before →
+after, as (whole-run-fit truth / model-free truth):
+
+| | bias, °C | optimistic by > 2 °C |
+|---|---|---|
+| model basis, in-run | −3.3 / −3.7 → **−2.1 / −1.2** | 79 % / 80 % → **52 % / 20 %** |
+| trajectory, 10–20 min in | −1.0 / −0.6 → −0.6 / +0.4 | 31 % / 31 % → 21 % / 18 % |
+| step-down, from the sensor | −4.6 / −4.0 → **−2.2 / −1.3** | 92 % / 100 % → **64 % / 20 %** |
+| probe end, from the sensor | −3.8 / −3.9 → **−0.6 / −0.8** | 67 % / 100 % → **0 % / 0 %** |
+
+The remaining optimism at a step-down (1–2 °C) is a history effect no
+static ambient carries: the cable is still warm from the higher current
+that preceded it. The `SUGGEST_MARGIN_C` of 2 °C covers the median of it.
+The same run settled a rule the anecdotes could not: at a step-down the
+sensor's ambient beats the one the previous run's trajectory implies, and
+"the warmer of the two" ties the sensor within 0.1 °C — so the sensor is
+used, and nothing cleverer.
 
 ## Degradation watch
 
