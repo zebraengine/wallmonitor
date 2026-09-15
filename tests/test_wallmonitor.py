@@ -419,6 +419,27 @@ async def test_thermal_fits_the_current_exponent_from_a_current_spread(db):
     assert all(fit["rise_c"] * (48.0 / fit["current_a"]) ** 2 > 40.0 for fit in low)
 
 
+def test_steady_prefix_restarts_after_a_ramp_up_overshoot():
+    # 2026-09-14, first live calibration probe: the car overshot toward 48 A
+    # for two samples while the 32 A cap was taking effect, then held 32.5 A
+    # for forty minutes. The prefix ended at the overshoot, four samples in,
+    # and the whole window was lost.
+    def samples(currents):
+        return [
+            {"ts": 1000.0 + 2.0 * i, "contactor_closed": 1, "vehicle_current_a": amps, "handle_temp_c": 32.0}
+            for i, amps in enumerate(currents)
+        ]
+
+    ramp = [6.1, 14.6, 23.9, 31.1, 32.6, 32.7, 32.9, 37.6, 43.3] + [32.5] * 600
+    prefix = thermal._steady_current_prefix(samples(ramp))
+    assert len(prefix) == 600 and prefix[0]["vehicle_current_a"] == 32.5
+    # A current change once the run has settled still ends it (a derate, a
+    # cap): the leniency is for the first minute only.
+    settled = [32.5] * 400 + [44.0] * 100
+    prefix = thermal._steady_current_prefix(samples(settled))
+    assert len(prefix) == 400 and prefix[-1]["vehicle_current_a"] == 32.5
+
+
 def test_thermal_sustainable_current_follows_the_fitted_exponent():
     square = thermal.ThermalParams(rise_ref_c=36.0, current_exp=2.0)
     gentle = thermal.ThermalParams(rise_ref_c=36.0, current_exp=1.5)

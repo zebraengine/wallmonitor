@@ -222,6 +222,14 @@ RISE_RANGE_C = (10.0, 80.0)
 MIN_SPAN_TAU = 1.8
 PREFIX_SPAN_TAU = 2.5
 PREFIX_SPAN_MIN_S = 1800.0
+# A steady run that ends within its first minute did not end; the ramp-up
+# was still wobbling. Vehicles overshoot on the way to a cap: one session
+# read 32.6, 32.7, 32.9, 37.6, 43.3 and then 32.5 A for forty minutes — the
+# two overshoot samples being the car heading for 48 A in the seconds
+# before the amp controller's probe cap took effect — and ending the run at
+# the overshoot kept a four-sample window and lost the real one. Every
+# probe lands mid-ramp, so every probe would have been lost the same way.
+PREFIX_SETTLE_S = 60.0
 
 # The steady-prefix band (10% of the reference current) is wide enough to
 # hide a substantial current reduction: 48.6 A trimmed to 44.7 A never
@@ -383,7 +391,10 @@ def _steady_current_prefix(samples: list[dict], max_span_s: float = PREFIX_SPAN_
     its samples at the reduced current, and a whole-session median would put
     the initial full-rate ramp — the part with the thermal signal — outside
     the band. Leading samples still ramping up to the plateau are skipped
-    rather than treated as the end of the run.
+    rather than treated as the end of the run, and a run that leaves the
+    band within PREFIX_SETTLE_S of starting is discarded and restarted
+    rather than ended: that is the ramp overshooting, not a steady run
+    ending.
     """
     charging = [
         sample
@@ -404,9 +415,10 @@ def _steady_current_prefix(samples: list[dict], max_span_s: float = PREFIX_SPAN_
         if prefix and sample["ts"] - prefix[-1]["ts"] > SEGMENT_SPLIT_GAP_S:
             break  # a charging gap: the next samples belong to a later segment
         if abs(sample["vehicle_current_a"] - i_ref) > band:
-            if prefix:
+            if prefix and sample["ts"] - prefix[0]["ts"] >= PREFIX_SETTLE_S:
                 break  # the steady run ended (derate or charge stop)
-            continue  # still ramping up to the plateau
+            prefix = []  # still ramping up, or the ramp overshot: start over
+            continue
         prefix.append(sample)
         if sample["ts"] - prefix[0]["ts"] > max_span_s:  # the ramp lives in the first few tau
             break
