@@ -160,6 +160,39 @@ alert-40 raise to within seconds.
 `/api/thermal` returns the fitted model, the live forecast, every
 per-segment fit, and the drift verdict.
 
+## Measuring the forecast
+
+Every change to the model is judged against the whole recorded history, not
+against the incident that prompted it:
+
+```bash
+uv run python contrib/backtest_forecast.py --db /path/to/wallmonitor.db
+```
+
+The tool splits every session into steady-current runs, takes the plateau
+each long-enough run actually reached as truth (an exponential fitted over
+the whole run, or with `--truth last` the handle's own final minutes — the
+two bracket the answer), and scores two things against it: the live
+forecast tick by tick as the current holds, and — at every current change
+and session start — the plateau that would have been predicted at the new
+current from each ambient on offer under each current law, with the scored
+session left out of the fit. Errors are predicted minus actual; negative is
+optimistic, the direction that trips the charger.
+
+What it showed on the first run, over 74 sessions (40 runs long enough to
+score): the model-basis forecast was optimistic by **3–4 °C** on median and
+by more than 2 °C four times in five; the mature trajectory forecast by
+about 1 °C; every cross-current method by 2.5–5 °C at a step-down. The
+error grows with ambient — about 1 °C on mild days, 3–5 °C above 30 °C —
+which is the same ambient coefficient the degradation watch's regression
+had been reporting (0.35 °C/°C) and that the confidence interval alone did
+not make convincing. The sensor reads the garage air; the handle's
+environment runs hotter than the air by an amount that grows with the
+heat. The fitted current exponent beat the I² prior everywhere it was
+scored, and the whole-run τ ran 1–2 min longer than the 30-minute fit
+windows' 11.25, which is where the trajectory's residual optimism comes
+from.
+
 ## Degradation watch
 
 The same per-segment fits feed a trend. Rising heat at unchanged current
