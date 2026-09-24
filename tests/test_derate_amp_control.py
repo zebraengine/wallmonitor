@@ -16,6 +16,7 @@ rather than an answer, so it is treated as a trip signal instead of being
 trusted."""
 
 import importlib.util
+import json
 import pathlib
 import sys
 
@@ -830,3 +831,88 @@ def test_probe_state_survives_an_old_state_file(tmp_path):
     assert state.probes_done == [] and state.probe_amps is None
     action, new, reason = dac.decide(_thermal(will_trip=False), state, _probe_cfg())
     assert action.kind == "none" and "probe holding 32A" in reason and new.cap_value == 32.0
+
+
+def _probe_events(start_ts, amps=32.0, cable="cold", next_after_min=41.0, next_reason="probe complete"):
+    events = [{"ts": start_ts, "kind": "amp_capped",
+               "detail": json.dumps({"to_a": amps, "reason": "calibration probe due", "probe": {"amps": amps, "cable": cable}})}]
+    if next_after_min is not None:
+        events.append({"ts": start_ts + next_after_min * 60, "kind": "amp_restored",
+                       "detail": json.dumps({"to_a": 48.0, "reason": next_reason})})
+    return events
+
+
+def test_probe_history_rebuilt_from_events_keeps_the_plan_on_cadence():
+    # The 2026-09-24 incident: a reboot cleared /tmp three days after a
+    # 32 A cold probe, and the next session probed 32 A cold again. Rebuilt
+    # from the event log, that session is not due; a week on, the plan moves
+    # to a condition with no replicates rather than repeating the first.
+    t0 = 1_000_000.0
+    last_charge = t0 - 12 * 3600
+    for days_ago, expected in ((3, []), (7, [(30, 32.0, "warm")])):
+        session_start = t0 - days_ago * 86400
+        sessions = [{"start_ts": session_start - 5, "end_ts": session_start + 14 * 3600}]
+        done, last = dac.probe_history_from_events(_probe_events(session_start + 45), sessions, t0 - 3600, _plan_cfg())
+        assert done == [{"ts": session_start + 45 + 2400, "amps": 32.0, "cable": "cold"}]
+        assert last == session_start - 5  # anchored at the plug-in, as decide() anchors it
+        state = dac.State(probes_done=done, last_probe_ts=last, probe_history_checked=True, last_charging_ts=last_charge)
+        starts, _ = _simulate(_plan_cfg(), days=1, start_state=state)
+        assert [(m, a, c) for _, m, a, c in starts] == expected
+
+
+def test_probe_history_counts_only_holds_that_ran_their_full_length():
+    cfg = _plan_cfg()
+    now = 2_000_000.0
+    abandoned = _probe_events(1_000_000.0, next_after_min=12.0, next_reason="session ended: restoring normal rate")
+    # a probe that ends on a sustainable current no higher than its own logs nothing at completion
+    silent = _probe_events(1_100_000.0, amps=40.0, cable="warm", next_after_min=None)
+    legacy = [{"ts": 1_200_000.0, "kind": "amp_capped",
+               "detail": {"to_a": 32.0, "reason": "calibration probe due: capping to 32A for 40min"}},
+              {"ts": 1_200_000.0 + 2460, "kind": "amp_restored", "detail": None}]
+    thermal_cap = [{"ts": 1_300_000.0, "kind": "amp_capped", "detail": json.dumps({"to_a": 44.0, "reason": "plateau"})}]
+    events = list(reversed(abandoned + silent + legacy + thermal_cap))  # the API returns newest first
+    done, last = dac.probe_history_from_events(events, [], now, cfg)
+    assert [(p["amps"], p["cable"]) for p in done] == [(40.0, "warm"), (32.0, "any")]
+    assert last == 1_200_000.0  # no session known: anchored at the start itself
+    # ...but a probe still inside its hold is not yet complete
+    done, last = dac.probe_history_from_events(silent, [], 1_100_000.0 + 600, cfg)
+    assert done == [] and last is None
+
+
+def test_main_rebuilds_an_empty_probe_history_once(tmp_path, monkeypatch, capsys):
+    state_file = tmp_path / "state.json"
+    args = ["--tesla-ble", "http://127.0.0.1:1", "--wallmonitor", "http://wm", "--state-file", str(state_file),
+            "--probe-amps", "32,40", "--probe-cable", "cold,warm"]
+    snap = _thermal(will_trip=False, ts=1_000_000.0, current_a=48.0)
+    monkeypatch.setattr(dac, "fetch_thermal", lambda url: snap)
+    calls = []
+
+    def recovered(url, state, cfg, now_ts):
+        calls.append(url)
+        return dac.replace(state, probes_done=[{"ts": 1.0, "amps": 32.0, "cable": "cold"}],
+                           last_probe_ts=snap["ts"] - 3 * 86400, probe_history_checked=True)
+
+    monkeypatch.setattr(dac, "recover_probe_history", recovered)
+    assert dac.main(args) == 0
+    assert calls == ["http://wm"] and "rebuilt from the event log: 1" in capsys.readouterr().out
+    assert dac.load_state(str(state_file)).probe_history_checked
+    dac.main(args)
+    assert len(calls) == 1  # never again once checked
+
+
+def test_main_holds_the_plan_when_the_history_cannot_be_rebuilt(tmp_path, monkeypatch, capsys):
+    # Brand-new state with a cold session starting: without the fallback
+    # this is exactly the tick that would probe off-cadence.
+    state_file = tmp_path / "state.json"
+    dac.save_state(str(state_file), dac.State(last_charging_ts=1_000_000.0 - 12 * 3600))
+    monkeypatch.setattr(dac, "fetch_thermal", lambda url: _thermal(will_trip=False, ts=1_000_000.0, current_a=48.0))
+
+    def unreachable(*a):
+        raise dac.urllib.error.URLError("refused")
+
+    monkeypatch.setattr(dac, "recover_probe_history", unreachable)
+    args = ["--tesla-ble", "http://127.0.0.1:1", "--wallmonitor", "http://wm", "--state-file", str(state_file),
+            "--probe-amps", "32", "--probe-cable", "cold", "--dry-run"]
+    assert dac.main(args) == 0
+    out = capsys.readouterr()
+    assert "no probe this tick" in out.err and "would cap" not in out.out

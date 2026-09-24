@@ -15,6 +15,10 @@
 #   sudo ./install-derate-amp-control.sh --tesla-ble http://<esp32-host> --probe-amps 32,40 --probe-cable cold,warm
 #   sudo ./install-derate-amp-control.sh --uninstall
 #
+# State (the active cap, debounce streaks, the probe plan's progress) lives
+# in /var/lib/derate-amp-control/state.json unless --state-file says
+# otherwise; the daemon's own default is under /tmp, which a reboot clears.
+#
 # The ESP32 host/IP lands only in the local systemd unit — never commit it.
 # The paired device should be configured with the least-privilege
 # CHARGING_MANAGER role; this script has no opinion on that, it only talks
@@ -40,6 +44,8 @@ PROBE_INTERVAL_DAYS=""
 PROBE_PLAN_INTERVAL_DAYS=""
 PROBE_REPLICATES=""
 PROBE_HOLD_MIN=""
+STATE_DIR="/var/lib/${SERVICE_NAME}"
+LEGACY_STATE_FILE="/tmp/derate_amp_control.state.json"
 STATE_FILE=""
 INTERVAL="30"
 DRY_RUN="0"
@@ -111,7 +117,8 @@ DAEMON_ARGS="--tesla-ble ${TESLA_BLE} --wallmonitor ${WALLMONITOR}"
 [[ -n "$PROBE_PLAN_INTERVAL_DAYS" ]] && DAEMON_ARGS+=" --probe-plan-interval-days ${PROBE_PLAN_INTERVAL_DAYS}"
 [[ -n "$PROBE_REPLICATES" ]] && DAEMON_ARGS+=" --probe-replicates ${PROBE_REPLICATES}"
 [[ -n "$PROBE_HOLD_MIN" ]] && DAEMON_ARGS+=" --probe-hold-min ${PROBE_HOLD_MIN}"
-[[ -n "$STATE_FILE" ]] && DAEMON_ARGS+=" --state-file ${STATE_FILE}"
+[[ -z "$STATE_FILE" ]] && STATE_FILE="${STATE_DIR}/state.json"
+DAEMON_ARGS+=" --state-file ${STATE_FILE}"
 [[ "$DRY_RUN" == "1" ]] && DAEMON_ARGS+=" --dry-run"
 [[ -n "$EXTRA_ARGS" ]] && DAEMON_ARGS+=" ${EXTRA_ARGS}"
 
@@ -122,6 +129,7 @@ DAEMON_ARGS="--tesla-ble ${TESLA_BLE} --wallmonitor ${WALLMONITOR}"
   echo "[Service]"
   echo "Type=oneshot"
   echo "User=${RUN_USER}"
+  echo "StateDirectory=${SERVICE_NAME}"
   echo "ExecStart=/usr/bin/env python3 ${DAEMON} ${DAEMON_ARGS}"
 } > "$UNIT_PATH"
 
@@ -136,6 +144,15 @@ DAEMON_ARGS="--tesla-ble ${TESLA_BLE} --wallmonitor ${WALLMONITOR}"
   echo "[Install]"
   echo "WantedBy=timers.target"
 } > "$TIMER_PATH"
+
+# Carry an existing install's state over from /tmp, so the move does not
+# itself reset the probe plan (the daemon would rebuild it from the event
+# log, but the active cap and streaks would be lost mid-session).
+install -d -o "$RUN_USER" -m 0755 "$STATE_DIR"
+if [[ "$STATE_FILE" != "$LEGACY_STATE_FILE" && -f "$LEGACY_STATE_FILE" && ! -e "$STATE_FILE" ]]; then
+  install -o "$RUN_USER" -m 0644 "$LEGACY_STATE_FILE" "$STATE_FILE"
+  echo "moved state from ${LEGACY_STATE_FILE} to ${STATE_FILE}"
+fi
 
 systemctl daemon-reload
 systemctl enable --now "${SERVICE_NAME}.timer"
