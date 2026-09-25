@@ -106,6 +106,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass, field, fields, replace
@@ -200,6 +201,11 @@ class State:
     probe_cable: str | None = None
     probe_session_ts: float | None = None
     probes_done: list[dict] = field(default_factory=list)
+    # Whether an empty probe history has been rebuilt from wallmonitor's
+    # event log. A lost state file (a reboot clearing /tmp, a reinstall)
+    # otherwise reads as "never probed": the next session probes at once,
+    # off-cadence, and repeats the first condition of the plan.
+    probe_history_checked: bool = False
     # Session bookkeeping the cable conditions are judged on: the last tick
     # seen charging (so the gap before a session is known), when this
     # session's charging began, that gap, and how long the current has held
@@ -694,6 +700,66 @@ def _cable_status(
     return "impossible"
 
 
+def probe_history_from_events(
+    events: list[dict], sessions: list[dict], now_ts: float, cfg: Config
+) -> tuple[list[dict], float | None]:
+    """Rebuild (probes_done, last_probe_ts) from wallmonitor's amp events.
+
+    Every probe start is logged as an amp_capped event carrying
+    detail.probe (older ones only say "calibration probe" in the reason);
+    completion is not always logged — a probe that ends on a sustainable
+    current no higher than its own holds silently. So a probe counts as
+    completed when the controller's next amp event, or now if there is
+    none yet, comes at least a full hold after its start: an abandoned
+    probe (a lower thermal cap, an unplug restoring normal rate) always
+    logs something sooner. The cadence anchor is the plug-in time of the
+    probe's session, as decide() anchors it; a few minutes earlier than the
+    daemon's own charging start, which only ever makes the next one due
+    sooner, never a cold slot too late."""
+    amp_events = []
+    for event in events:
+        detail = event.get("detail")
+        if isinstance(detail, str):
+            try:
+                detail = json.loads(detail)
+            except ValueError:
+                detail = None
+        amp_events.append((float(event["ts"]), event.get("kind"), detail if isinstance(detail, dict) else {}))
+    amp_events.sort(key=lambda item: item[0])
+
+    done: list[dict] = []
+    last_anchor = None
+    hold_s = cfg.probe_hold_min * 60.0
+    for i, (ts, kind, detail) in enumerate(amp_events):
+        if kind != "amp_capped":
+            continue
+        probe = detail.get("probe")
+        if isinstance(probe, dict):
+            amps, cable = float(probe.get("amps") or 0.0), probe.get("cable") or "any"
+        elif "calibration probe" in (detail.get("reason") or ""):
+            amps, cable = float(detail.get("to_a") or 0.0), "any"
+        else:
+            continue
+        end_ts = amp_events[i + 1][0] if i + 1 < len(amp_events) else now_ts
+        if end_ts - ts < hold_s - 60.0:  # 60 s: the log stamps on receipt, the hold clock on the tick
+            continue
+        done.append({"ts": ts + hold_s, "amps": amps, "cable": cable})
+        anchor = next(
+            (float(s["start_ts"]) for s in sessions
+             if s.get("start_ts") is not None and s["start_ts"] <= ts and (s.get("end_ts") is None or ts <= s["end_ts"])),
+            ts,
+        )
+        last_anchor = anchor if last_anchor is None else max(last_anchor, anchor)
+    return done[-PROBE_LOG_KEEP:], last_anchor
+
+
+def needs_probe_history(state: State, cfg: Config) -> bool:
+    return (
+        bool(cfg.probe_amps) and not state.probe_history_checked and state.probe_started_ts is None
+        and state.last_probe_ts is None and not state.probes_done
+    )
+
+
 def decide(thermal: dict, state: State, cfg: Config) -> tuple[Action, State, str]:
     """What to do, the state to persist, and why: the derate decision with
     the calibration probe layered over it."""
@@ -709,6 +775,22 @@ def fetch_thermal(base_url: str) -> dict:
     """One /api/thermal snapshot — the sole input decide() ever sees."""
     with urllib.request.urlopen(f"{base_url}/api/thermal", timeout=10) as resp:
         return json.load(resp)
+
+
+def recover_probe_history(base_url: str, state: State, cfg: Config, now_ts: float) -> State:
+    """An empty probe history, refilled from wallmonitor's event log (see
+    probe_history_from_events). A year back is far longer than any plan
+    takes to collect; the cadence after that only needs the latest probe."""
+    since = now_ts - 400 * 86400
+    query = f"from={since:.0f}&to={now_ts:.0f}"
+    with urllib.request.urlopen(
+        f"{base_url}/api/events?{query}&kinds=amp_capped,amp_restored,amp_adjust_failed", timeout=10
+    ) as resp:
+        events = json.load(resp).get("events") or []
+    with urllib.request.urlopen(f"{base_url}/api/sessions?{query}", timeout=10) as resp:
+        sessions = json.load(resp).get("sessions") or []
+    done, last_probe_ts = probe_history_from_events(events, sessions, now_ts, cfg)
+    return replace(state, probes_done=done, last_probe_ts=last_probe_ts, probe_history_checked=True)
 
 
 def set_charging_amps(tesla_ble_url: str, amps: float) -> None:
@@ -868,7 +950,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--state-file",
         default="/tmp/derate_amp_control.state.json",
-        help="remembers cap state and debounce streaks between runs",
+        help=(
+            "remembers cap state, debounce streaks and the probe plan's progress between runs; the "
+            "default is cleared on reboot, so the installer points this at /var/lib (default: %(default)s)"
+        ),
     )
     parser.add_argument(
         "--probe-amps",
@@ -970,6 +1055,15 @@ def main(argv: list[str] | None = None) -> int:
         probe_warm_min=args.probe_warm_min,
     )
     state = load_state(args.state_file)
+    if needs_probe_history(state, cfg):
+        try:
+            state = recover_probe_history(args.wallmonitor, state, cfg, time.time())
+            print(f"probe history rebuilt from the event log: {len(state.probes_done)} completed")
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            # Without the history a probe would look overdue; hold the plan
+            # this tick rather than restart it. Thermal capping is unaffected.
+            print(f"warn: cannot rebuild probe history ({exc}); no probe this tick", file=sys.stderr)
+            cfg = replace(cfg, probe_amps=())
 
     try:
         thermal = fetch_thermal(args.wallmonitor)
