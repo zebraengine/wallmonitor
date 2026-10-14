@@ -102,6 +102,16 @@ def test_front_load_drops_once_to_the_target_when_the_handle_nears_the_plateau()
     assert peak < MODEL["trip_c"] - sac.Config().soak_margin_c
 
 
+def test_a_cool_prior_does_not_buy_an_amp_the_live_reading_takes_back():
+    # The same cable, but the ambient prior reads 8 C under it. The fused
+    # estimate sits between the two; judged on it alone, the step-up rule
+    # offered 43 A at minute 24 and the step-down rule, on the stretch's own
+    # reading, took it back 30 s later.
+    moves, _peak, state = _closed_loop(theta=33.0, prior=25.0, minutes=120)
+    assert [(kind, amps) for _minute, kind, amps in moves] == [("cap", 42.0)]
+    assert state.k_extra == 0.0  # no reversal to back off from
+
+
 def test_a_long_stretch_is_one_reading_not_one_per_tick():
     # 40 minutes at one current: the stretch must never be banked as finished.
     ticks = [(30.0 * i, 50.0, 48.7, 60.0) for i in range(1, 81)]
