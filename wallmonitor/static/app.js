@@ -244,11 +244,11 @@ function timeTickFormat(ts, spanS) {
 }
 
 /* scatterChart(box, {series: [{name, color, points: [[x, y, title?]]}],
-   xLabel, height, digits}) — numeric x axis (not time), one dot per point.
+   xLabel, height, digits, zeroBase}) — numeric x axis (not time), one dot per point.
    Used where the relationship between two measured quantities is the story
    (e.g. fitted heat rise vs window ambient), not their history. */
 // scatterChart(box, {series: [{name, color, points: [[x, y, meta]]}], xLabel,
-// height?, digits?, tip(meta, dataset) -> Node[]}) — numeric x axis, nearest-
+// height?, digits?, zeroBase?, tip(meta, dataset) -> Node[]}) — numeric x axis, nearest-
 // dot tooltip (custom content via opts.tip). Rebuilt from scratch per call.
 function scatterChart(box, opts) {
   box.style.minHeight = `${opts.height || 210}px`;
@@ -267,7 +267,8 @@ function scatterChart(box, opts) {
     return;
   }
   const xt = niceTicks(Math.min(...allPts.map((p) => p[0])), Math.max(...allPts.map((p) => p[0])), 6);
-  const yt = niceTicks(Math.min(...allPts.map((p) => p[1])), Math.max(...allPts.map((p) => p[1])), 4);
+  const yLo = Math.min(...allPts.map((p) => p[1]));
+  const yt = niceTicks(opts.zeroBase ? Math.min(0, yLo) : yLo, Math.max(...allPts.map((p) => p[1])), 4);
   const xOf = (value) => margin.left + ((value - xt.min) / (xt.max - xt.min || 1)) * pw;
   const yOf = (value) => margin.top + ph - ((value - yt.min) / (yt.max - yt.min || 1)) * ph;
   const root = svg("svg", { viewBox: `0 0 ${width} ${height}`, width, height });
@@ -1222,7 +1223,7 @@ async function viewLive(root) {
     }
     lineChart(fcast.box, {
       series,
-      unit: "°C", digits: 1, xFrom, xTo: projecting ? now + FORECAST_FUTURE_S : now, height: 210,
+      unit: "°C", digits: 1, zeroBase: true, xFrom, xTo: projecting ? now + FORECAST_FUTURE_S : now, height: 210,
       refLines: [
         { value: HANDLE_TRIP_C, label: `${HANDLE_TRIP_C}°C handle → alert 40 derate` },
         { value: HANDLE_CLEAR_C, label: `${HANDLE_CLEAR_C}°C → clears`, below: true },
@@ -1499,7 +1500,7 @@ async function viewSessionDetail(root, id) {
         gap: FORECAST_GAP_S, points: firmPts });
     }
     lineChart(temp.box, {
-      series: tempSeries, unit: "°C", digits: 1, xFrom, xTo, height: 190,
+      series: tempSeries, unit: "°C", digits: 1, zeroBase: true, xFrom, xTo, height: 190,
       refLines: [
         { value: HANDLE_TRIP_C, label: `${HANDLE_TRIP_C}°C handle → alert 40 derate` },
         { value: PCBA_THROTTLE_C, label: `≈${PCBA_THROTTLE_C}°C PCBA throttle (approx.)` },
@@ -1762,7 +1763,7 @@ async function viewAlerts(root, rangeKey = "7d") {
     const calMarks = ((calEvents && calEvents.events) || []).map((ev) => ({ ts: ev.ts, label: "idle-offset recalibrated" }));
     lineChart(rise.box, {
       series: [{ name: "Rise (°C)", color: colors.s1, points: fits.map((fit) => [fit.start_ts, fit.rise_ref_c]) }],
-      unit: "°C", digits: 1, height: 180, vlines: calMarks,
+      unit: "°C", digits: 1, zeroBase: true, height: 180, vlines: calMarks,
     });
     if (drift) {
       // The verdict carries its own uncertainty — a slope from a handful of
@@ -1895,7 +1896,7 @@ async function viewAlerts(root, rangeKey = "7d") {
         { name: "start-only ambient", color: colors.s3,
           points: fits.filter((fit) => fit.ambient_drift_c == null && fit.ambient_c != null).map(fitPoint) },
       ],
-      height: 210,
+      height: 210, zeroBase: true,
       tip: (fit) => {
         const nodes = [el("div", { class: "tt-time" }, `Session ${fit.session_id} · ${fmtDT(fit.start_ts)}`)];
         nodes.push(ttRow("heat rise", `+${fmtNum(fit.rise_ref_c, 1)} °C @ 48 A`));
