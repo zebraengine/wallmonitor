@@ -673,6 +673,18 @@ def test_probe_does_not_start_from_a_lower_thermal_cap():
     assert new.probe_started_ts is None
 
 
+def test_thermal_cap_outranks_starting_a_probe():
+    # A probe is due and nothing is holding, but this tick's forecast calls
+    # for a real cap. The cap is what gets applied; the probe does not start
+    # on the same tick and its slot is not consumed.
+    due = dac.State(last_session_state="charging", trip_streak=2)
+    action, new, reason = dac.decide(_thermal(will_trip=True, mtt=5.0, suggested=44.0), due, _probe_cfg())
+    assert (action.kind, action.value) == ("cap", 44.0)
+    assert action.probe is None and "probe" not in reason
+    assert new.capped and new.cap_value == 44.0
+    assert new.probe_started_ts is None and new.last_probe_ts is None
+
+
 def _plan_cfg(**kw):
     kw.setdefault("probe_amps", (32.0, 40.0))
     kw.setdefault("probe_cable", ("cold", "warm"))
@@ -790,6 +802,12 @@ def test_probe_one_per_session():
     # for the next one.
     starts, _ = _simulate(_plan_cfg(probe_amps=(32.0,)), days=2, session_min=180)
     assert [(d, c) for d, _, _, c in starts] == [(0, "cold")]  # day 1 is inside the 7-day interval
+    # Above, the 7-day interval is what holds the warm probe back. With an
+    # interval shorter than the session the next probe is due again at
+    # minute 60 and warm is eligible at minute 70: only the one-per-session
+    # rule is left to stop it.
+    starts, _ = _simulate(_plan_cfg(probe_amps=(32.0,), probe_plan_interval_days=1 / 24), days=1, session_min=180)
+    assert [(m, c) for _, m, _, c in starts] == [(0, "cold")]
 
 
 def test_probe_start_event_carries_its_condition():
@@ -916,3 +934,50 @@ def test_main_holds_the_plan_when_the_history_cannot_be_rebuilt(tmp_path, monkey
     assert dac.main(args) == 0
     out = capsys.readouterr()
     assert "no probe this tick" in out.err and "would cap" not in out.out
+
+
+def _apply_setup(tmp_path, monkeypatch, ble_error=None):
+    """main() one confirming poll short of a thermal cap, with the BLE write
+    and the event post recorded in call order instead of sent."""
+    state_file = tmp_path / "state.json"
+    before = dac.State(last_session_state="charging", trip_streak=9)
+    dac.save_state(str(state_file), before)
+    monkeypatch.setattr(dac, "fetch_thermal", lambda url: _thermal(will_trip=True, mtt=5.0, suggested=44.0))
+    calls = []
+
+    def set_amps(url, amps):
+        # what is on disk at the moment of the write, to pin the ordering
+        calls.append(("ble", url, amps, dac.load_state(str(state_file)).capped))
+        if ble_error is not None:
+            raise ble_error
+
+    monkeypatch.setattr(dac, "set_charging_amps", set_amps)
+    monkeypatch.setattr(dac, "post_event", lambda url, kind, detail: calls.append(("event", url, kind, detail)))
+    args = ["--tesla-ble", "http://ble", "--wallmonitor", "http://wm", "--state-file", str(state_file)]
+    return args, state_file, before, calls
+
+
+def test_main_applies_a_cap_then_saves_state_then_records_the_event(tmp_path, monkeypatch, capsys):
+    args, state_file, _before, calls = _apply_setup(tmp_path, monkeypatch)
+    assert dac.main(args) == 0
+    ble, event = calls
+    # The cap was not on disk yet when the charger was written to.
+    assert ble == ("ble", "http://ble", 44.0, False)
+    saved = dac.load_state(str(state_file))
+    assert saved.capped and saved.cap_value == 44.0
+    assert event[:3] == ("event", "http://wm", "amp_capped") and event[3]["to_a"] == 44.0
+    assert "cap applied: 44A" in capsys.readouterr().out
+
+
+def test_main_leaves_state_alone_when_the_ble_write_fails(tmp_path, monkeypatch, capsys):
+    # The car is still drawing full rate; a state file that says "capped at
+    # 44 A" would make the next tick reason from a cap that never happened.
+    args, state_file, before, calls = _apply_setup(
+        tmp_path, monkeypatch, ble_error=dac.urllib.error.URLError("bridge unreachable"))
+    assert dac.main(args) == 1
+    assert dac.load_state(str(state_file)) == before
+    ble, event = calls
+    assert ble[:3] == ("ble", "http://ble", 44.0)
+    assert event[:3] == ("event", "http://wm", "amp_adjust_failed")
+    assert event[3]["attempted"] == "cap" and event[3]["to_a"] == 44.0 and "bridge unreachable" in event[3]["error"]
+    assert "failed to cap charging_amps to 44A" in capsys.readouterr().err

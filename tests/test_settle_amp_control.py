@@ -6,6 +6,7 @@ hotter than the session's average (the whole-history run: seven trips
 without it), and the handle outranking the estimate near the trip."""
 
 import importlib.util
+import math
 import pathlib
 import sys
 
@@ -65,15 +66,40 @@ def test_front_load_holds_full_rate_while_the_handle_is_cold():
     assert state.frontloading
 
 
+def _closed_loop(theta, prior, minutes, cfg=None, start_handle=30.0):
+    """Run decide() against a handle that answers its commands: one time
+    constant toward theta + rise(I), the car drawing 0.6 A over the cap, and
+    a trajectory forecast (the true plateau) from two minutes into each
+    stretch. Returns ([(minute, kind, amps)], peak handle, final state)."""
+    cfg = cfg or sac.Config()
+    state = sac.State(last_session_state="idle")
+    handle, command, stretch_ticks = start_handle, cfg.normal_amps, 0
+    moves, peak = [], handle
+    for i in range(1, int(minutes * 2) + 1):
+        current = command + 0.6
+        plateau = theta + sac._rise(MODEL, current)
+        handle = plateau + (handle - plateau) * math.exp(-30.0 / TAU_S)
+        peak = max(peak, handle)
+        stretch_ticks += 1
+        steady = plateau if stretch_ticks >= 4 else None
+        action, state, _why = sac.decide(_thermal(30.0 * i, handle, current, steady, prior), state, cfg)
+        if action.kind != "none":
+            moves.append((i / 2, action.kind, action.value))
+            command, stretch_ticks = action.value, 0
+    return moves, peak, state
+
+
 def test_front_load_drops_once_to_the_target_when_the_handle_nears_the_plateau():
-    # Plateau 70 C at 48.7 A => theta ~33; the handle crosses the drop point.
-    ticks = [(30.0 * i, 30.0 + 1.2 * i, 48.7, 70.0 if i >= 4 else None) for i in range(1, 40)]
-    actions, state = _run(ticks)
-    caps = [action for action in actions if action.kind == "cap"]
-    assert len(caps) >= 1
+    # Effective ambient 33 C: full rate would settle at 69.7 C. Open loop
+    # (a handle that keeps climbing whatever is commanded) this scenario ends
+    # in a run of emergency cuts, which says nothing about the planned drop;
+    # the handle has to follow the cap for "once" to mean anything.
+    moves, peak, state = _closed_loop(theta=33.0, prior=31.0, minutes=120)
+    # One move in two hours, and it is the largest whole amp that fits:
+    # 42 A settles at 63.1 C, 43 A would settle at 64.2 C.
+    assert [(kind, amps) for _minute, kind, amps in moves] == [("cap", 42.0)]
     assert not state.frontloading
-    # The first move is a real drop, several amps, not a 1 A nibble.
-    assert caps[0].value <= 45.0
+    assert peak < MODEL["trip_c"] - sac.Config().soak_margin_c
 
 
 def test_a_long_stretch_is_one_reading_not_one_per_tick():
