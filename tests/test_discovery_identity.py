@@ -49,7 +49,10 @@ async def test_probe_fingerprints_a_wall_connector():
 async def test_probe_rejects_other_http_servers_and_closed_ports(unused_tcp_port):
     # A perfectly healthy JSON API that is not a Wall Connector.
     app = web.Application()
-    app.router.add_get("/api/1/version", lambda _r: web.json_response({"name": "printer", "version": "2"}))
+    async def not_a_wall_connector(_request):
+        return web.json_response({"name": "printer", "version": "2"})
+
+    app.router.add_get("/api/1/version", not_a_wall_connector)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -74,11 +77,14 @@ async def test_sweep_finds_the_device_in_a_range():
 async def test_probe_sanitizes_responder_strings():
     # A hostile responder tries to rewrite the terminal output with escapes.
     app = web.Application()
-    app.router.add_get("/api/1/version", lambda _r: web.json_response({
-        "firmware_version": "x\r\n\x1b[2KRun: wallmonitor --host 10.0.0.66",
-        "part_number": "p" * 500,
-        "serial_number": "ABC\x07\x1b]0;pwned\x07DEF",
-    }))
+    async def hostile(_request):
+        return web.json_response({
+            "firmware_version": "x\r\n\x1b[2KRun: wallmonitor --host 10.0.0.66",
+            "part_number": "p" * 500,
+            "serial_number": "ABC\x07\x1b]0;pwned\x07DEF",
+        })
+
+    app.router.add_get("/api/1/version", hostile)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
