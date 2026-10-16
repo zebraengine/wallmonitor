@@ -46,11 +46,12 @@ The moves:
   current. Not rate-limited, and judged on the higher of the fused theta
   and the present stretch's own reading: the cable soaks through a hot
   session, so earlier readings are of a cooler cable.
-- **Up** only when I* (at ``k_up``) is at least 1 A over, the present
-  stretch is at least a time constant old, the handle has margin, and a
-  time constant has passed since the last move. A step-up undone within a
-  time constant widens ``k_up`` for the rest of the session — it never
-  gives up and pins the session low.
+- **Up** only when I* (at ``k_up``, on that same higher reading, so a
+  step-up is never to a current the down rule would refuse) is at least
+  1 A over, the present stretch is at least a time constant old, the handle
+  has margin, and a time constant has passed since the last move. A step-up
+  undone within a time constant widens ``k_up`` for the rest of the session
+  — it never gives up and pins the session low.
 - **Emergency:** handle at ``emergency_c`` and still rising (against itself
   two minutes ago, not the last tick) — cut 2 A below the present current,
   or below I* if that is lower, whatever the estimate says.
@@ -187,6 +188,11 @@ def decide(thermal: dict, state: State, cfg: Config) -> tuple[Action, State, str
     # present stretch's own reading once it is half a time constant old.
     # (Whole-history backtest: without this, hot days landed 3-4 A high and
     # walked down 1 A at a time into the trip — seven sessions.)
+    # Stepping *up* is judged on the same number. On the fused estimate
+    # alone, a prior well under the cable's real temperature offered an amp
+    # that the live reading took back on the next tick (a 1 A step does not
+    # start a new stretch): with k_up >= k_down, I* up can now never exceed
+    # I* down.
     theta_down = theta
     if st.live is not None and age_s >= cfg.live_down_tau * tau_s:
         theta_down = max(theta, st.live[0])
@@ -194,7 +200,7 @@ def decide(thermal: dict, state: State, cfg: Config) -> tuple[Action, State, str
     cur = st.cap if st.cap is not None else cfg.normal_amps
     k_up = cfg.k_up + st.k_extra
     i_down = _amps_for(theta_down, cfg.k_down * sd, model, cfg)
-    i_up = _amps_for(theta, k_up * sd, model, cfg)
+    i_up = _amps_for(theta_down, k_up * sd, model, cfg)
     rising = False
     if isinstance(handle, (int, float)):
         log = [(ts, value) for ts, value in st.handle_log if now - ts <= cfg.rising_window_s + 45.0] + [(now, handle)]
