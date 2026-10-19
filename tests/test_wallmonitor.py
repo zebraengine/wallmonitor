@@ -2,6 +2,7 @@
 
 import asyncio
 import math
+import threading
 import time
 from statistics import median
 
@@ -9,6 +10,7 @@ import aiohttp
 import pytest
 
 from wallmonitor import thermal
+from wallmonitor import web as web_module
 from wallmonitor.config import Config
 from wallmonitor.db import Database
 from wallmonitor.poller import EventBus, Poller
@@ -1670,6 +1672,35 @@ async def test_thermal_api_endpoint(db):
         assert body["forecast"]["will_trip"] is False
     finally:
         await client.close()
+
+
+async def test_thermal_api_serves_stale_fit_while_refitting(db, monkeypatch):
+    # The history fit can take tens of seconds and the amp controller polls
+    # with a 10 s timeout: a stale fit is served at once while one refit
+    # runs in the background, instead of every poll waiting on it.
+    app = make_app(db, EventBus(), None)
+    async with TestClient(TestServer(app)) as client:
+        assert (await client.get("/api/thermal")).status == 200  # cold: waits for the first fit
+        release, finished, calls = threading.Event(), threading.Event(), []
+        real = thermal.fit_sessions
+
+        def slow_fit(*args, **kwargs):
+            calls.append(1)
+            release.wait(10)
+            try:
+                return real(*args, **kwargs)
+            finally:
+                finished.set()
+
+        monkeypatch.setattr(thermal, "fit_sessions", slow_fit)
+        monkeypatch.setattr(web_module, "THERMAL_REFIT_S", 0.0)  # every request finds it stale
+        t0 = time.monotonic()
+        for _ in range(3):
+            assert (await client.get("/api/thermal")).status == 200
+        assert time.monotonic() - t0 < 2.0, "the stale fit is served without waiting"
+        assert len(calls) == 1, "one background refit, not one per request"
+        release.set()
+        await asyncio.to_thread(finished.wait, 10)
 
 
 async def test_backoff_on_unreachable_host(db, unused_tcp_port):
