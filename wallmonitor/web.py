@@ -228,7 +228,7 @@ def make_app(db: Database, bus: EventBus, poller: Poller | None) -> web.Applicat
     # Model parameters change only as new sessions land, so the (SQLite-heavy)
     # history fit is cached; the live prediction is computed on every call.
     # The fit covers the whole drift lookback and takes tens of seconds on a
-    # long history (27 s for 72 fits on one mini-PC), while the amp
+    # long history (27 s for 72 fits on a 4-core Intel N100), while the amp
     # controller polls with a 10 s timeout. So a stale fit is served at once
     # and refitted in the background; only a cold cache or ?refit waits.
     thermal_fit: dict = {"params": None, "fits": [], "ts": 0.0, "idle_offset": None, "task": None}
