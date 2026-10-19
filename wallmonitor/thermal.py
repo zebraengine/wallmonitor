@@ -276,6 +276,14 @@ TRAJECTORY_MIN_SPAN_S = 120.0
 # this split segments; each segment's opening ramp is a fit candidate.
 SEGMENT_SPLIT_GAP_S = 300.0
 MAX_SEGMENTS_PER_SESSION = 4
+# The forecast's tau, rise and current exponent come from the newest this
+# many sessions; the degradation watch uses every session in the lookback.
+# The cap predates any scoring. Lifting it for the forecast was backtested
+# (one install, 114 sessions): the median tau fell 11.5 -> 11.25 min and the
+# in-run trajectory forecast at cold starts moved 0.4-0.5 C optimistic,
+# the direction that trips the charger, for small gains elsewhere. So the
+# forecast keeps it until a deliberate window is scored on its own.
+FORECAST_SESSIONS = 40
 
 
 @dataclass
@@ -677,12 +685,22 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
     back as the handle warmed, so the fitted plateau is a setpoint it held
     rather than the connector's own equilibrium. Such fits still serve the
     forecast — they describe what the handle actually did — but the
-    degradation watch compares only free-running ones."""
+    degradation watch compares only free-running ones.
+
+    Every session in the lookback is fitted, not just the newest few. The
+    degradation watch regresses on whatever this returns, so a count cap
+    makes its baseline whatever happened ~40 charges ago: on one install a
+    single odd week at the edge of a 40-session window read as +8 °C of
+    confirmed drift, where the full history since the verified anchor was
+    flat (-0.04 °C over 80 days). The time window, not a session count,
+    decides what the baseline is. Fits from the newest FORECAST_SESSIONS
+    carry forecast=True; only those teach the forecast (forecast_fits)."""
     sessions = [
         session
         for session in db.sessions_range(now - lookback_days * 86400, now)
         if session.get("end_ts") and (session.get("charging_s") or 0) >= MIN_SEGMENT_S
-    ][:40]
+    ]
+    forecast_ids = {session["id"] for session in sessions[:FORECAST_SESSIONS]}
     fits: list[dict] = []
     idle_model = load_idle_offset(db)
     for sess in sessions:
@@ -784,6 +802,7 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
             fits.append(
                 {
                     "session_id": sess["id"],
+                    "forecast": sess["id"] in forecast_ids,
                     "start_ts": seg[0][0],
                     "tau_min": round(tau_s / 60.0, 2),
                     "rise_ref_c": round(rise, 2) if rise is not None else None,
@@ -808,6 +827,12 @@ def fit_sessions(db: Database, now: float, lookback_days: float = 120.0) -> list
             )
     fits.sort(key=lambda fit: fit["start_ts"])
     return fits
+
+
+def forecast_fits(fits: list[dict]) -> list[dict]:
+    """The fits the forecast's parameters come from: the newest
+    FORECAST_SESSIONS sessions' (see there for why not all of them)."""
+    return [fit for fit in fits if fit.get("forecast", True)]
 
 
 def _fit_current_exponent(fits: list[dict]) -> tuple[float, int, float | None]:
@@ -848,16 +873,21 @@ def fit_history(db: Database, now: float, lookback_days: float = 120.0,
     degradation watch, and the rise_ref_c median taken here, all share one
     current law. With the I^2 prior, off-reference fits carry a bias that the
     watch's current term then has to absorb; with a fitted exponent that
-    term has nothing left to explain."""
+    term has nothing left to explain.
+
+    The parameters, exponent included, come from forecast_fits only; the
+    re-normalization reaches every fit, so the watch's older fits share the
+    forecast's current law too."""
     if fits is None:
         fits = fit_sessions(db, now, lookback_days)
-    exponent, exp_fits, exp_se = _fit_current_exponent(fits)
+    recent = forecast_fits(fits)
+    exponent, exp_fits, exp_se = _fit_current_exponent(recent)
     for fit in fits:
         if fit.get("rise_c") is not None and fit.get("current_a"):
             fit["rise_ref_c"] = round(fit["rise_c"] * (REF_CURRENT_A / fit["current_a"]) ** exponent, 2)
-    taus = [fit["tau_min"] for fit in fits]
-    rises = [fit["rise_ref_c"] for fit in fits if fit["rise_ref_c"] is not None]
-    rmses = [fit["rmse_c"] for fit in fits]
+    taus = [fit["tau_min"] for fit in recent]
+    rises = [fit["rise_ref_c"] for fit in recent if fit["rise_ref_c"] is not None]
+    rmses = [fit["rmse_c"] for fit in recent]
     return ThermalParams(
         tau_min=median(taus) if taus else DEFAULT_TAU_MIN,
         rise_ref_c=median(rises) if rises else DEFAULT_RISE_REF_C,

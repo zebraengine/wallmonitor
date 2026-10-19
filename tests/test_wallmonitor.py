@@ -1300,6 +1300,29 @@ async def test_thermal_drift_ambient_confound_caps_verdict_at_lead(db):
     assert drift["drifting"] is False and drift["lead"] is True
 
 
+async def test_thermal_drift_baseline_is_whole_lookback_not_newest_40(db):
+    # Regression: fit_sessions once kept only the newest 40 sessions, so the
+    # watch's baseline was whatever happened ~40 charges ago. A flat install
+    # with one low stretch sitting at that edge read as confirmed drift
+    # (seen live: +8 C over 34 days; flat over the 80 days since the anchor).
+    now = time.time()
+    rises = [36.0] * 12 + [29.0] * 6 + [36.0] * 34  # the dip lands at the 40th-newest
+    for i, rise in enumerate(rises):
+        _seed_thermal_session(db, now - (len(rises) - i) * 7200, ambient_c=25.0,
+                              rise_ref_c=rise + (0.3 if i % 2 else -0.3))
+    fits = thermal.fit_sessions(db, now)
+    assert len(fits) == len(rises), "every session in the lookback is fitted"
+    # The forecast still learns from the newest FORECAST_SESSIONS only.
+    params = thermal.fit_history(db, now, fits=fits)
+    assert params.tau_fits == thermal.FORECAST_SESSIONS
+    assert thermal.forecast_fits(fits) == fits[-thermal.FORECAST_SESSIONS:]
+    drift = thermal.detect_drift(fits)
+    assert drift is not None and drift["drifting"] is False
+    assert abs(drift["delta_c"]) < thermal.DRIFT_WARN_C
+    # The window the cap used to impose does alarm on the same data.
+    assert thermal.detect_drift(fits[-40:])["drifting"] is True
+
+
 async def test_thermal_baseline_anchor(db):
     now = time.time()
     rises = [36.0, 36.5, 35.8, 36.2, 42.0, 41.5, 42.3]

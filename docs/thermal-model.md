@@ -285,6 +285,11 @@ row. More sessions either confirm it or dissolve it.
 
 ### What it compares
 
+- **Every session in the lookback.** The forecast learns from the newest
+  40 sessions; the watch does not. A count window makes the baseline
+  whatever happened ~40 charges ago. On one install a single odd week at
+  that edge read as +8 °C of "confirmed" drift, while the 80 days since
+  the verified anchor were flat (−0.04 °C).
 - **Only free-running fits.** Windows the charger was regulating are
   excluded outright — their plateau is a setpoint, not an equilibrium.
   `regulated_n` says how many sat out, and the Alerts page says so too,

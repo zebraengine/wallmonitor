@@ -499,6 +499,7 @@ def main(argv: list[str] | None = None) -> int:
     now = time.time()
     fits = thermal.fit_sessions(db, now, lookback_days=args.lookback_days)
     params = thermal.fit_history(db, now, fits=fits)
+    fits = thermal.forecast_fits(fits)  # what the deployed forecast learns from
     idle_model = thermal.load_idle_offset(db)
     sessions = [
         sess for sess in db.sessions_range(now - args.lookback_days * 86400, now)
